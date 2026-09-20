@@ -1,0 +1,14 @@
+# Runtime data / logs / local settings (generated locally, not for version control)
+/data/
+/log/
+/cfg/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# OS
+.DS_Store
