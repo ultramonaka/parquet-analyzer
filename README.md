@@ -1,7 +1,14 @@
 # Parquet Analyzer
 
+**[English](#english)** | **[日本語](#japanese)**
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Version](https://img.shields.io/badge/version-0.1.0-informational.svg)
+![Author](https://img.shields.io/badge/author-ultramonaka-lightgrey.svg)
+
 ---
 
+<a name="english"></a>
 ## English
 
 A viewer and time-series analysis tool for Parquet files. Supports automatic
@@ -208,8 +215,15 @@ Exercising the app headlessly (no real display):
 QT_QPA_PLATFORM=offscreen bash tools/run.sh
 ```
 
+### License
+
+Licensed under the **[MIT License](LICENSE)**.
+
+**Author**: [ultramonaka](https://github.com/ultramonaka)
+
 ---
 
+<a name="japanese"></a>
 ## 日本語
 
 Parquetファイルのビューワー・時系列解析ツール。大量データの自動ダウンサンプリング表示、
@@ -390,3 +404,9 @@ uv run pytest         # テスト実行
 ```sh
 QT_QPA_PLATFORM=offscreen bash tools/run.sh
 ```
+
+### ライセンス
+
+**[MIT License](LICENSE)** の下で公開しています。
+
+**作者**: [ultramonaka](https://github.com/ultramonaka)
