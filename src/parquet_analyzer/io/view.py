@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -61,6 +62,18 @@ def list_views() -> list[str]:
     if not data_dir.exists():
         return []
     return sorted(p.stem for p in data_dir.glob("*.json"))
+
+
+def delete_view(view_name: str) -> None:
+    """Remove a saved view's JSON (detailed_specification.md 20.1). Same name validation
+    as `view_path`; raises FileNotFoundError if it doesn't exist."""
+    view_path(view_name).unlink()
+
+
+def view_saved_at(view_name: str) -> datetime:
+    """When the view file was last written (mtime, local time). The schema has no
+    saved-at field (detailed_specification.md 20.1)."""
+    return datetime.fromtimestamp(view_path(view_name).stat().st_mtime)
 
 
 def save_view(view: View) -> Path:

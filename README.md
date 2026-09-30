@@ -3,7 +3,7 @@
 **[English](#english)** | **[日本語](#japanese)**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-0.1.0-informational.svg)
+![Version](https://img.shields.io/badge/version-0.2.0-informational.svg)
 ![Author](https://img.shields.io/badge/author-ultramonaka-lightgrey.svg)
 
 ---
@@ -13,7 +13,7 @@
 
 A viewer and time-series analysis tool for Parquet files. Supports automatic
 downsampling for large datasets, multiple plots, inter-variable expressions,
-frequency (FFT) and delta analysis, summary statistics, and saved views.
+delta analysis, summary statistics, cursors, saved views, and image export.
 
 For requirements-level detail see
 [`src/parquet_analyzer/docs/specification.md`](src/parquet_analyzer/docs/specification.md),
@@ -34,7 +34,10 @@ tools\run.bat          # Windows
 ```
 
 On first launch `uv` automatically installs the dependencies (PySide6, pyqtgraph,
-polars, pyarrow, numpy).
+polars, pyarrow, numpy, matplotlib).
+
+The UI is in English by default; switch to Japanese in "Settings" (takes effect after
+a restart). Button names below are the English ones.
 
 On macOS, double-clicking a `.sh` file just opens it in a text editor by default and
 doesn't run it (that's Finder's standard behavior). To launch by double-clicking, use
@@ -57,18 +60,17 @@ environment variable. The window title gets a `[DEBUG]` suffix while this is act
 
 ### Basic usage
 
-1. Choose "開く" (Open) on the toolbar to select a Parquet file. The dialog starts in
+1. Choose "Open" on the toolbar to select a Parquet file. The dialog starts in
    the last folder you opened, with the 5 most recent folders available in a sidebar.
    The currently open file's name is shown in the window title and in the status bar
    at the bottom left (hover it for the full path).
-2. The loaded columns are listed in the "変数" (Variables) panel on the right.
+2. The loaded columns are listed in the "Variables" panel (on the left by default).
    Drag one onto a plot to overlay it there (the legend updates automatically).
-3. "＋ プロット追加" (Add plot) on the toolbar adds a new plot pane. Right-clicking a
-   plot offers "上に移動"/"下に移動" (move up/down, to reorder the stacked panes —
-   a frequency-domain (FFT) plot can't be reordered past a time-domain one or vice
-   versa), "このプロットから削除" (remove this plot pane entirely), and
-   "新規プロットとして分離" (split all but the first overlaid series off into a new
-   plot pane).
+3. "+ Add plot" on the toolbar adds a new plot pane. Right-clicking a plot offers
+   "Move up"/"Move down" (reorder the stacked panes — a frequency-domain (FFT) plot
+   can't be reordered past a time-domain one or vice versa), "Remove from this plot"
+   (remove this plot pane entirely), and "Separate into new plot" (split all but the
+   first overlaid series off into a new plot pane).
 4. The navigator at the top of the window lets you quickly move the visible time
    range. It shows an overview of whichever variable is overlaid first on the topmost
    plot pane (falling back to an arbitrary column if nothing has been plotted yet).
@@ -76,7 +78,7 @@ environment variable. The window title gets a `[DEBUG]` suffix while this is act
 #### Changing which column is used as the time (X) axis
 
 By default the file's **first column** is used as the time (X) axis. Change it via the
-"時間軸:" (Time axis) combo box on the toolbar. Switching axes returns the previous
+"Time axis:" combo box on the toolbar. Switching axes returns the previous
 time column to the variable panel as an ordinary variable, and every already-plotted
 series is re-fit to the new time axis.
 
@@ -91,7 +93,7 @@ series is re-fit to the new time axis.
 | R key / Redraw button | Recompute downsampling for the current view |
 
 Which action each of plain/Ctrl+/Shift+scroll performs is configurable in the
-"設定" (Settings) dialog's "スクロール操作" (Scroll operations) section — reassigning
+"Settings" dialog's "Scroll controls" section — reassigning
 an action already used by another modifier swaps the two, so every action always
 stays reachable by exactly one modifier. The table above is just the default.
 
@@ -103,13 +105,22 @@ Large datasets are automatically decimated for display based on pixel count (the
 algorithm, which preserves a waveform's peaks/troughs while reducing point count).
 This recompute runs asynchronously on a background thread — a progress indicator
 appears in the status bar while it's running, but the UI itself never blocks.
+"Allow coarse preview" on the toolbar can be turned off to always draw the real,
+per-sample data (slower on very large files).
+
+#### Cursors
+
+Turn on "Cursor" on the toolbar, then click a plot to place a vertical cursor showing
+the time and each series' value there. Cursors can be dragged, are shared by every
+time-domain plot, and are removed by clicking them. Turning "Cursor" off hides them
+without deleting them.
 
 #### Inter-variable expressions and analysis
 
 - Typing an expression that references variable names (e.g. `abs(A) - sqrt(B)`,
   `delta(rpm)`, `rolling_mean(rpm, 20)`, `clip(rpm, 0, 3000)`) into the expression bar
-  at the bottom of the window and clicking "追加" (Add) creates a new derived
-  variable in the variable panel.
+  at the bottom of the window and clicking "Add" creates a new derived variable in
+  the variable panel (shown in italics; hover it to see its expression).
   - Operators: `+ - * / ** % //`
   - Functions (all elementwise): `abs`, `sqrt`, `delta` (first-order difference),
     `rolling_mean(a, window)` (moving average), `sin`, `cos`, `tan`, `exp`, `log`,
@@ -117,15 +128,19 @@ appears in the status bar while it's running, but the UI itself never blocks.
     `clip(a, lo, hi)` (`min`/`max` are elementwise comparisons here, unlike Python's
     built-ins — they don't reduce to a single scalar).
 - Defining a derived variable with the same name as an existing column is an error
-  (to prevent accidentally shadowing real data). Redefining an existing derived
-  variable's formula under the same name is allowed.
-- Double-clicking a variable in the panel inserts its name at the cursor position in
-  the expression bar.
+  (to prevent accidentally shadowing real data).
+- Right-click a derived variable in the panel for "Edit expression..." or "Delete".
+  Editing happens in the expression bar ("Update" applies, "Cancel" or Esc aborts);
+  derived variables built on it and its plotted curves are recomputed. A derived
+  variable still used by another one can't be deleted, and an expression that refers
+  back to itself (circularly) is rejected.
+- Double-clicking a variable in the panel — or dragging it onto the expression bar —
+  inserts its name at the cursor position, also while editing.
 - Frequency analysis (FFT) exists internally (adds an FFT spectrum of the *currently
   visible time range* as a new plot) but its toolbar button and settings-dialog
   shortcut row are currently hidden pending further debugging
   (`io/settings.py`'s `FFT_ENABLED`) — not reachable from the GUI right now.
-- Clicking "統計" (Statistics) computes count, missing-value count, min, max, mean,
+- Clicking "Stats" computes count, missing-value count, min, max, mean,
   standard deviation, and median over every raw sample in the currently visible time
   range (not the downsampled curve actually drawn on screen) and shows the results in
   a separate window, for one row per variable. Targets whichever variable(s) are
@@ -136,8 +151,8 @@ appears in the status bar while it's running, but the UI itself never blocks.
 
 #### Saving and loading views
 
-The current plot layout, overlaid variables, and expressions can be saved as a "view"
-(JSON, under `data/parquet_analyzer/`). Derived variables are saved as their defining
+"Save view" saves the current plot layout, overlaid variables, and expressions as a
+"view" (JSON, under `data/parquet_analyzer/`). Derived variables are saved as their defining
 formula rather than computed values, so they're recomputed from the source columns
 whenever the view is loaded — including after the underlying data has changed. If any
 file is already open when you load a view — whether it's a different file, or
@@ -149,9 +164,22 @@ layout references that doesn't exist in the currently open file is simply skippe
 match is still applied, so a view saved against one file works as expected when
 reused against another that only shares *some* of its column names, not all of them.
 
+"View..." opens the view manager: pick a saved view to see what it contains before
+loading it — source file, each plot's channels with their colors, derived variables
+and their expressions, the saved time range, and when it was saved. With a file open,
+channels that file doesn't have (and would be skipped) are shown in red. Views can be
+loaded (button or double-click) or deleted (after a confirmation) from there.
+
+#### Saving an image of the plots
+
+"Save image" saves the plots currently shown as PNG, JPEG, TIFF, SVG, or PDF. The
+plots are re-drawn (not screen-captured) with aligned time axes and a legend per plot,
+and the bottom-right corner records the source file (and view name), the displayed
+time range, the export date/time, and the app version.
+
 #### Settings menu
 
-"設定" (Settings) on the toolbar lets you change the following (saved to
+"Settings" on the toolbar lets you change the following (saved to
 `cfg/parquet_analyzer/settings.json` and restored on next launch):
 
 - Auto-redraw on/off (manual redraw via the R button/shortcut always works even when
@@ -161,15 +189,16 @@ reused against another that only shares *some* of its column names, not all of t
   range only) instead of being fully loaded once and kept resident — only affects
   files opened after the change
 - Which action (X zoom / Y zoom / pan) each of plain/Ctrl+/Shift+scroll performs
-- Keyboard shortcuts for each action (home, redraw, open, add plot, statistics,
-  save/load view — frequency analysis is omitted here while its toolbar button is
-  hidden, see above)
+- Keyboard shortcuts for each toolbar action (home, redraw, open, add plot,
+  statistics, save view, view manager, save image, coarse-preview toggle, cursor —
+  frequency analysis is omitted here while its toolbar button is hidden, see above)
+- UI language (English / 日本語; takes effect after a restart)
 
 #### Layout persistence
 
 Window size, the variable panel's dock position, and similar screen layout are saved
 automatically on exit and restored on next launch. The variable panel defaults to the
-left side of the window. "レイアウトをリセット" (Reset layout) on the toolbar discards
+left side of the window. "Reset layout" on the toolbar discards
 the saved layout and restores the default arrangement at any time.
 
 ### Converting MDF/MATLAB files
@@ -215,6 +244,13 @@ Exercising the app headlessly (no real display):
 QT_QPA_PLATFORM=offscreen bash tools/run.sh
 ```
 
+A small synthetic file for trying features out (columns with known relationships, e.g.
+`sine**2 + cosine**2` is 1 everywhere; written to `data/raw/feature_test.parquet`):
+
+```sh
+uv run python tests/parquet_analyzer/generate_feature_test_parquet.py
+```
+
 ### License
 
 Licensed under the **[MIT License](LICENSE)**.
@@ -227,7 +263,7 @@ Licensed under the **[MIT License](LICENSE)**.
 ## 日本語
 
 Parquetファイルのビューワー・時系列解析ツール。大量データの自動ダウンサンプリング表示、
-マルチプロット、変数間演算、周波数解析・Δ解析、統計表示、ビュー保存などに対応する。
+マルチプロット、変数間演算、Δ解析、統計表示、カーソル、ビュー保存、画像保存などに対応する。
 
 仕様の詳細は [`src/parquet_analyzer/docs/specification.md`](src/parquet_analyzer/docs/specification.md)
 （要求仕様）と
@@ -246,8 +282,11 @@ tools/run.sh          # macOS/Linux
 tools\run.bat          # Windows
 ```
 
-初回起動時に `uv` が依存パッケージ（PySide6, pyqtgraph, polars, pyarrow, numpy）を
+初回起動時に `uv` が依存パッケージ（PySide6, pyqtgraph, polars, pyarrow, numpy, matplotlib）を
 自動でインストールする。
+
+画面の表示言語は既定で英語。「Settings」（設定）で日本語に切り替えられる（再起動後に反映）。
+以下のボタン名は日本語表示時のもの。
 
 macOSでは `.sh` はダブルクリックしても既定でテキストエディタが開くだけで実行されない
 （Finderの標準動作）。ダブルクリックで起動したい場合は `tools/run.command` を使う
@@ -271,7 +310,7 @@ tools\run_debug.bat     # Windows
 1. ツールバーの「開く」からParquetファイルを選択する。ダイアログは最後に開いたフォルダを
    初期表示し、直近5件のフォルダをサイドバーから選べる。現在開いているファイル名は
    ウィンドウタイトルと画面左下のステータスバーに表示される（ホバーするとフルパスを確認できる）。
-2. 右側の「変数」パネルに読み込んだ列が一覧表示される。プロットへドラッグ&ドロップすると
+2. 「変数」パネル（既定では画面左側）に読み込んだ列が一覧表示される。プロットへドラッグ&ドロップすると
    その変数が重ね合わせ表示される（凡例が自動更新される）。
 3. ツールバーの「＋ プロット追加」で新しいプロットを追加できる。プロットを右クリックすると
    「上に移動」「下に移動」（プロット段の並び替え。周波数解析(FFT)プロットは時間軸プロット
@@ -309,20 +348,32 @@ tools\run_debug.bat     # Windows
 大量データはピクセル数に応じて自動的に間引いて（ダウンサンプリング）表示される
 （LTTBアルゴリズム、波形のピーク・谷を保ったまま点数を削減）。この再計算は別スレッドで
 非同期に実行されるため、実行中はステータスバーに進捗バーが表示されるがUI操作はブロックされない。
+ツールバーの「簡易表示を許可」をオフにすると、常に間引かない実データで描画する（非常に大きな
+ファイルでは遅くなる）。
+
+#### カーソル
+
+ツールバーの「カーソル」をオンにしてプロットをクリックすると、縦線のカーソルを置ける。
+その位置の時刻と各系列の値が表示される。カーソルはドラッグで動かせ、全時間軸プロットで共有され、
+クリックで削除できる。「カーソル」をオフにすると、削除せずに非表示にする。
 
 #### 変数間演算・解析
 
 - 画面下部の演算式入力欄に、変数名を使った式（例: `abs(A) - sqrt(B)`, `delta(rpm)`,
   `rolling_mean(rpm, 20)`, `clip(rpm, 0, 3000)`）を入力し「追加」すると、新しい変数
-  （仮想変数）として変数パネルに追加される。
+  （仮想変数）として変数パネルに追加される（斜体で表示。ホバーすると式を確認できる）。
   - 演算子: `+ - * / ** % //`
   - 関数（いずれも要素ごとの演算）: `abs`, `sqrt`, `delta`（1階差分）,
     `rolling_mean(a, window)`（移動平均）, `sin`, `cos`, `tan`, `exp`, `log`, `log10`,
     `sign`, `floor`, `ceil`, `round`, `min(a, b)`, `max(a, b)`, `clip(a, lo, hi)`
     （`min`/`max`はPython組み込みと違い要素ごとの比較で、スカラー1つを返す集約関数ではない）
 - 演算変数名が既存の列名と同じ場合はエラーになる（列データの意図しない上書きを防ぐため）。
-  同じ名前の演算変数を式だけ変えて再定義することは可能。
-- 変数パネルの変数をダブルクリックすると、カーソル位置に変数名が挿入される（入力補助）。
+- 変数パネルで仮想変数を右クリックすると「式を編集...」「削除」を選べる。編集は演算式入力欄で
+  行い（「更新」で適用、「キャンセル」またはEscで中止）、それを使う他の仮想変数や表示中の曲線も
+  再計算される。他の仮想変数から使われている仮想変数は削除できず、自分自身を（循環して）参照する
+  式はエラーになる。
+- 変数パネルの変数をダブルクリックする、または演算式入力欄へドラッグすると、カーソル位置に
+  変数名が挿入される（入力補助。編集中も使える）。
 - 周波数解析（FFT）機能は内部的には存在する（現在表示中の時間範囲についてFFTスペクトルを
   新しいプロットとして追加する）が、デバッグが完了するまでツールバーのボタンと設定ダイアログの
   ショートカット欄を一時的に非表示にしている（`io/settings.py`の`FFT_ENABLED`）。
@@ -336,7 +387,7 @@ tools\run_debug.bat     # Windows
 
 #### ビューの保存・読込
 
-現在のプロット配置・重ね合わせ変数・演算式を「ビュー」としてJSON保存できる
+「ビュー保存」で、現在のプロット配置・重ね合わせ変数・演算式を「ビュー」としてJSON保存できる
 （`data/parquet_analyzer/`）。演算変数は計算結果ではなく定義式として保存されるため、
 元データが更新されても読み込み時に再計算される。ビュー読込時、**何らかのファイルが既に
 開かれている場合**（ビュー保存時のファイルとは別のファイルでも、まさにそのファイル自身でも）
@@ -345,6 +396,18 @@ tools\run_debug.bat     # Windows
 参照する変数のうち現在開いているファイルに存在しないものはスキップされる（どの変数を復元
 できなかったかを警告として表示）が、一致する変数は問題なく適用される——同じ列名を持つ
 複数ファイルに同一レイアウトを使い回す用途で、列名が完全一致していなくても機能する。
+
+「ビュー...」でビューの管理画面を開く。保存済みビューを選ぶと、読み込む前に中身を確認できる——
+元ファイル、プロットごとのチャンネルとその色、仮想変数とその式、保存時の時間範囲、保存日時。
+ファイルを開いている場合、そのファイルに無い（読み込むとスキップされる）チャンネルは赤字で
+示される。ここからビューを読み込む（ボタンまたはダブルクリック）ことも、削除する（確認あり）
+こともできる。
+
+#### プロットの画像保存
+
+「画像を保存」で、表示中のプロットをPNG・JPEG・TIFF・SVG・PDFで保存できる。画面キャプチャでは
+なく描き直すため、時間軸が揃い、各プロットに凡例が付く。右下には元ファイル（とビュー名）、
+表示中の時間範囲、出力日時、アプリのバージョンが記載される。
 
 #### 設定メニュー
 
@@ -356,8 +419,10 @@ tools\run_debug.bat     # Windows
 - 列を開いた時点で全体を読み込まず表示範囲だけを都度読み込むようにする容量しきい値
   （変更後に開いたファイルから反映）
 - 無印/Ctrl+/Shift+スクロールそれぞれの動作（X軸ズーム/Y軸ズーム/パン）
-- 各操作（ホーム、再描画、開く、プロット追加、統計、ビュー保存/読込）のショートカットキー
+- ツールバーの各操作（ホーム、再描画、開く、プロット追加、統計、ビュー保存、ビュー管理、
+  画像を保存、簡易表示の切替、カーソル）のショートカットキー
   （周波数解析はツールバーボタンが非表示の間、ここにも表示されない。上記参照）
+- 表示言語（English / 日本語。再起動後に反映）
 
 #### レイアウトの永続化
 
@@ -403,6 +468,13 @@ uv run pytest         # テスト実行
 
 ```sh
 QT_QPA_PLATFORM=offscreen bash tools/run.sh
+```
+
+機能を試すための小さな合成データ（関係が既知の列を持つ。例: `sine**2 + cosine**2` はどこでも1。
+`data/raw/feature_test.parquet` に出力）:
+
+```sh
+uv run python tests/parquet_analyzer/generate_feature_test_parquet.py
 ```
 
 ### ライセンス

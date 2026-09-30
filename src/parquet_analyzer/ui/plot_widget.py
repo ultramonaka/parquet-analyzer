@@ -252,6 +252,18 @@ class TimePlotWidget(pg.PlotWidget):
             self._set_series_coarse(name, False)
             self.refresh_cursor_labels()  # drop this series from any existing cursor's label
 
+    def replace_series_y(self, name: str, y: np.ndarray) -> None:
+        """Swap a fully-resident series' Y array in place (a derived variable was
+        redefined — detailed_specification.md 18.2), keeping its curve, color and
+        legend position rather than remove_series()+add_series() re-adding it last.
+        """
+        entry = self._series.get(name)
+        if entry is None or entry["y_source"] is not None:
+            return
+        entry["y"] = y
+        self._redraw_series(name)
+        self.refresh_cursor_labels()
+
     def transfer_series(self, name: str, target: "TimePlotWidget") -> None:
         """Move a series to another plot (PlotGridWidget's "separate into a new
         plot"), preserving whether it's windowed or fully resident. series_data()'s
@@ -312,6 +324,20 @@ class TimePlotWidget(pg.PlotWidget):
         if entry["y_source"] is None:
             return None
         return entry["y_source"], entry["y_bounds"]
+
+    def export_snapshot(self):
+        """Pure-data copy of what is drawn now, for image export (detailed_specification.md 19.1)."""
+        from .image_export import PlotSnapshot, SeriesSnapshot
+
+        series = []
+        for name, entry in self._series.items():
+            x, y = entry["curve"].getData()
+            x = np.array([] if x is None else x, dtype=float)
+            y = np.array([] if y is None else y, dtype=float)
+            series.append(SeriesSnapshot(name, str(entry["color"]), x, y))
+        x_range, y_range = self.getViewBox().viewRange()
+        cursors = [c["line"].value() for c in self._cursors.values() if c["line"].isVisible()]
+        return PlotSnapshot(self.x_axis_datetime, tuple(x_range), tuple(y_range), series, cursors)
 
     def is_empty(self) -> bool:
         return not self._series
@@ -431,7 +457,8 @@ class TimePlotWidget(pg.PlotWidget):
         self._update_cursor_label(cursor_id)
         self.cursorMoveRequested.emit(self, cursor_id, x)
 
-    def _format_cursor_x(self, x: float) -> str:
+    def format_x(self, x: float) -> str:
+        """An X value as shown in cursor labels / the image-export stamp."""
         if self.x_axis_datetime:
             try:
                 return datetime.fromtimestamp(x).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -466,7 +493,7 @@ class TimePlotWidget(pg.PlotWidget):
         if entry is None:
             return
         x = entry["line"].value()
-        lines = [self._format_cursor_x(x)]
+        lines = [self.format_x(x)]
         for name, series_entry in self._series.items():
             value = self._series_value_at(series_entry, x)
             if value is not None:

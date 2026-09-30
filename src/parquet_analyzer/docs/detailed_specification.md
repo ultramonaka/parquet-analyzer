@@ -1,7 +1,6 @@
 # Parquet Analyzer Detailed Specification / 詳細仕様書
 
-- Version / 版数: v0.6 (updated 2026-09-19: §13.5.1 corrected and extended with a second
-  independent Opus/Fable re-investigation)
+- Version / 版数: v0.9 (updated 2026-10-01: §20 view management window added)
 - Role / 位置づけ: fleshes out `specification.md` (the requirements spec) to
   implementation level. Resolves items 11.1, 11.5, 11.6 of `specification.md` §11 and
   details 11.3/11.4/11.7 to an implementable level. See `specification.md` for the
@@ -20,40 +19,53 @@ English first, 日本語 below — see the note at the top of `specification.md`
 | Plotting library (11.1) | `pyqtgraph` | The draft's `Pygraph` is interpreted as a variant spelling of `pyqtgraph`. Finalized for its PySide6 compatibility and track record rendering large point counts. |
 | Parquet reading (11.6) | `polars` | Lazy evaluation via `pl.scan_parquet` reads only the needed columns/row range. A naturally columnar API, more memory-efficient than `pandas`. Lightweight operations like schema inspection also use `pyarrow` internally. |
 | Packaging as an .exe (11.5) | `PyInstaller` | Well-proven for PySide6 apps. Distributed as `--onedir` to avoid slower startup. |
+| Image export (§19) | `matplotlib` | Plots are re-drawn for export rather than screen-captured: aligned shared X axes, proper legends, and an SVG backend that writes device coordinates (Qt's SVG writer loses precision on epoch-second X values; §19.0). Used only for export, imported lazily. |
 
 ### 2. Module Structure
 
 ```
 src/parquet_analyzer/
+├── __init__.py               # __version__ (§17)
 ├── __main__.py               # GUI entry point
 ├── convert_cli.py            # CLI entry point for the MDF/MATLAB -> Parquet converter (argparse; touches no Qt)
 ├── config.py                 # shared path-definitions module (stdlib-only; importable from other projects)
 ├── ui/
-│   ├── main_window.py        # MainWindow: menus, toolbar (H/R buttons), overall layout
+│   ├── main_window.py        # MainWindow: toolbar, overall layout, wires everything together
 │   ├── plot_grid.py          # PlotGridWidget: arranges/adds/removes the stacked multi-plot area
-│   ├── plot_widget.py        # TimePlotWidget: wraps pyqtgraph.PlotWidget, zoom/pan handling
+│   ├── plot_widget.py        # TimePlotWidget: wraps pyqtgraph.PlotWidget, zoom/pan, cursors,
+│   │                          # export_snapshot() for image export (§19.1)
 │   ├── navigator.py          # NavigatorWidget: the shared, single overview + selection rectangle
-│   ├── variable_panel.py     # VariablePanel: variable list, drag-and-drop, right-click menu
-│   ├── expression_bar.py     # ExpressionBar: the expression input field
+│   ├── variable_panel.py     # VariablePanel: variable list, drag-and-drop, derived-variable
+│   │                          # edit/delete context menu (§18.3)
+│   ├── expression_bar.py     # ExpressionBar: expression input field, incl. edit mode (§18.3)
 │   ├── stats_dialog.py       # StatsDialog: non-modal window showing statistics results
 │   ├── settings_dialog.py    # SettingsDialog: the settings menu dialog
-│   └── folder_picker.py      # FolderPickerDialog: data folder selection + recent-folder history
+│   ├── view_manager.py       # ViewManagerDialog: saved-view list/details/load/delete (§20)
+│   ├── image_export.py       # plot image export via matplotlib (§19.2)
+│   ├── i18n.py               # tr(): every UI string in en/ja (Settings.language)
+│   └── folder_picker.py      # pick_parquet_file(): file dialog + recent-folder sidebar
 ├── core/
-│   ├── data_source.py        # ParquetDataSource: wraps a polars LazyFrame, schema/range reads
+│   ├── data_source.py        # ParquetDataSource: wraps a polars LazyFrame, schema/range reads,
+│   │                          # footer-only metadata, block-cached read_window() (§13.5.1)
+│   ├── column.py             # Column / MaterializedColumn / LazyColumn / WindowedColumn /
+│   │                          # LazyVariables: on-demand column materialization (§13.5.1 C/D)
+│   ├── numeric.py            # to_numeric(): any column dtype -> float64 (datetime -> epoch s)
+│   ├── pyramid.py            # build_pyramid(): coarse min/max envelope of a too-large column
 │   ├── downsample.py         # lttb(x, y, n_out) -> (x_ds, y_ds), called from a QThreadPool worker
 │   ├── background_worker.py  # BackgroundWorker(QRunnable): runs an arbitrary callable off the UI
 │   │                          # thread and returns its result via a signal (shared by downsample
 │   │                          # recompute/FFT/statistics; the caller in plot_widget.py is
 │   │                          # responsible for including a generation number in its own result
 │   │                          # tuple and checking it, for stale-result discarding)
-│   ├── expression.py         # evaluate_expression(expr, variables): restricted evaluation
+│   ├── expression.py         # evaluate_expression(expr, variables): restricted evaluation;
+│   │                          # referenced_names(expr)
 │   ├── analysis.py           # fft(x, y), delta(y), rolling_mean(y, window), basic_stats(y)
-│   ├── variable.py           # Variable / DerivedVariable data structures
+│   ├── variable.py           # Variable / DerivedVariable; dependency_order(), dependents_of() (§18.1)
 │   ├── convert.py            # MDF/MATLAB -> Parquet conversion (see §15); GUI-independent, only
 │   │                          # reachable via convert_cli.py, not the GUI app
 │   └── oplog.py              # debug-mode operation-log helper, log_op()
 └── io/
-    ├── view.py               # View data structure, save_view()/load_view()
+    ├── view.py               # View data structure, save_view()/load_view()/delete_view()
     └── settings.py           # Settings data structure, load_settings()/save_settings()
 ```
 
@@ -298,7 +310,8 @@ future CLI/other UI).
 - **Defining a derived variable whose name collides with an existing column is an
   error** (`MainWindow._on_add_derived_variable`). It used to silently overwrite
   (found and fixed in review). Redefining an existing derived variable's formula
-  under the same name is allowed (treated as an intentional redefinition).
+  under the same name is allowed (treated as an intentional redefinition; it goes
+  through the same edit path as the context menu, see [§18](#18-editing-and-deleting-derived-variables-added-2026-09-30-user-requested)).
 - A generated derived variable appears in `VariablePanel` and can be plotted/saved
   just like any other variable (see `specification.md` §5.5).
 
@@ -454,12 +467,15 @@ Example of the format saved to `data/parquet_analyzer/<view_name>.json`.
     "stats": "",
     "save_view": "",
     "load_view": "",
-    "toggle_downsample": ""
+    "toggle_downsample": "",
+    "cursor": "",
+    "export_image": ""
   },
   "window_geometry": null,
   "window_state": null,
   "last_data_folder": null,
   "recent_data_folders": [],
+  "last_export_folder": null,
   "recent_files": [],
   "recent_views": [],
   "default_overlay": false
@@ -485,6 +501,8 @@ Example of the format saved to `data/parquet_analyzer/<view_name>.json`.
   list capped at 5 entries; `last_data_folder` is kept equal to
   `recent_data_folders[0]` (redundant with just reading the first element, but kept
   as an explicit field to make the intent clear to a reader).
+- `last_export_folder`: the folder the last plot image was exported to (§19.3), used
+  as the next export's default folder. `null` until the first export.
 
 #### 9.1 Settings Menu
 
@@ -820,7 +838,7 @@ columns from the middle of the 4GB file measured at just 14ms. In other words, t
 most important empirical finding from this re-investigation is that a "read only the
 visible range, from disk, each time" policy is entirely viable on latency grounds.
 
-##### Design Adopted (Opus's proposal as the base, incorporating Fable's points)
+###### Design Adopted (Opus's proposal as the base, incorporating Fable's points)
 
 The previously-written Stage A/B/C split is replaced, for these reasons: Stage A's
 "read only the time column, fully, up front" portion is unnecessary — it can be
@@ -886,7 +904,7 @@ New step breakdown:
   concept once a pyramid exists — can reasonably be judged as "delete rather than
   wire up" if this design is adopted.
 
-##### Points Needing Individual Judgment/Care From Step 3 Onward
+###### Points Needing Individual Judgment/Care From Step 3 Onward
 
 - **View save/load (`io/view.py`)**: both models concluded "no change needed." A
   `View` only ever holds variable names/formulas/colors/ranges — it never saved data
@@ -1633,11 +1651,287 @@ copies produced by `tools/publish_to_public.sh`, so a bug report against a copie
 repo can be tied back to a specific version without asking the reporter to check
 `pyproject.toml` by hand.
 
+**Every place the version number is written** — update all of them together on a bump
+(`uv.lock` also records it, via `uv lock`):
+- `pyproject.toml` `version` (canonical)
+- `src/parquet_analyzer/__init__.py` `__version__`
+- `README.md`'s version badge (`version-X.Y.Z-informational`) — added to this list
+  after the 0.2.0 bump missed it (found 2026-10-01).
+
+### 18. Editing and Deleting Derived Variables (added 2026-09-30, user-requested)
+
+Requirements: `specification.md` §5.5. Background: a derived variable could already be
+saved/reloaded through a view (verified: save -> load -> add another -> save -> load keeps
+all of them), but there was no way to edit or delete one, and the only "edit" path —
+re-adding the same name in `ExpressionBar` — replaced the variable's cached array while
+leaving (a) derived variables built on top of it and (b) its already-plotted curves showing
+the *old* values.
+
+#### 18.1 Dependency tracking (`core/`)
+
+- `core/expression.py` `referenced_names(expr) -> set[str]`: the variable names an
+  expression refers to (every `ast.Name` except a `Call`'s function name), after the same
+  NFKC normalization `evaluate_expression` applies. Raises `ExpressionError` on a syntax
+  error.
+- `core/variable.py`:
+  - `dependency_order(exprs: Mapping[str, str]) -> list[str]` — `{name: expression}` in an
+    order where every derived variable comes after the derived variables it references
+    (names not in the mapping, i.e. file columns, are ignored). Stable: keeps the input
+    order wherever the dependencies allow it. On a cycle or an unparsable expression the
+    remaining names are appended in input order (the caller then gets a normal evaluation
+    error for them instead of a crash here).
+  - `dependents_of(name, exprs) -> list[str]` — every derived variable that depends on
+    `name` directly or transitively, in `dependency_order`.
+
+#### 18.2 `MainWindow` operations
+
+- `edit_derived_variable(name, expression)`:
+  1. `name` must be an existing derived variable.
+  2. Circular-definition check: if `referenced_names(expression)` contains `name` or any
+     of `dependents_of(name)`, raise `ExpressionError` (`error.circular_definition`).
+  3. Evaluate the new expression, then every dependent in dependency order, against an
+     overlay mapping (the new values shadow the cached ones). Nothing is committed until
+     all succeed — a failure anywhere leaves the old state fully intact.
+  4. Commit: update `_derived` and the cached `MaterializedColumn`s in `_raw_variables`,
+     then for every time-domain plot showing any of the recomputed names, call
+     `TimePlotWidget.replace_series_y(name, y)` (swaps the resident Y array, keeps the
+     curve/color/legend position, redraws, refreshes cursor labels). Refresh the
+     navigator if the anchor plot was affected.
+- `_on_add_derived_variable` (the `ExpressionBar` path) now delegates to
+  `edit_derived_variable` when the name already exists as a derived variable, so
+  redefining via the bar no longer leaves stale dependents/curves.
+- `delete_derived_variable(name)`:
+  - If any other derived variable references `name` directly, raise `ExpressionError`
+    (`error.derived_in_use`, listing them). No cascading delete.
+  - Otherwise remove the series from every time-domain plot (FFT plots are untouched —
+    their series are static results named `"<name> (FFT...)"`, not live references),
+    drop it from `_derived`/`_raw_variables`/`VariablePanel`, refresh the navigator.
+- Both log to the ops log (`edit_derived_variable`, `delete_derived_variable`).
+
+#### 18.3 UI
+
+- `VariablePanel` knows which entries are derived (`set_variables(names, derived=
+  {name: expression})`, `add_variable(name, expression=None)`, `remove_variable(name)`).
+  Derived entries are italic with tooltip `name = expression`. Right-click on a derived
+  entry shows a context menu: "Edit expression..." (`editDerivedRequested(str)`) and
+  "Delete" (`deleteDerivedRequested(str)`); no menu on a file column.
+- Edit happens in `ExpressionBar`, not a dialog: `MainWindow` calls
+  `ExpressionBar.start_edit(name, expression)`, which puts the bar in edit mode (name
+  field read-only, current expression filled in, "Add" relabeled "Update", a "Cancel"
+  button shown). "Update" goes through the same callback as "Add" —
+  `_on_add_derived_variable` already delegates to `edit_derived_variable` for an existing
+  derived name — so on `ExpressionError` the bar shows the error and stays in edit mode
+  with the user's text intact; on success it returns to add mode. `cancel_edit()` (the
+  Cancel button, or Esc in the expression field) returns to add mode without changes.
+  - Why not a dialog (first implementation, changed the same day on user feedback): a
+    modal `QInputDialog` blocks the variable list, so a variable name couldn't be
+    dragged/double-click-inserted while editing — the exact input assistance the bar
+    exists for (§6).
+  - `MainWindow` cancels edit mode whenever the variable being edited stops existing:
+    it's deleted, or the derived set is reset (`load_parquet`, `load_view`).
+- Delete asks `QMessageBox.question` first, then shows `error.derived_in_use` as a
+  warning if refused.
+- Every place that rebuilds the panel (`load_parquet`, `set_time_column`, `load_view`)
+  passes the current derived mapping so the markings survive.
+
+#### 18.4 Views
+
+- `save_view_dialog` writes `derived_variables` in `dependency_order` (insertion order
+  was not enough: editing `a` to reference a later-defined `b` would otherwise produce a
+  file whose first entry can't be evaluated on load).
+- `load_view` also applies the saved derived variables in `dependency_order`, so older
+  view files saved in a bad order still load.
+- No schema change (`schema_version` stays `"1"`).
+
+### 19. Plot Image Export (added 2026-09-30, user-requested)
+
+Requirements: `specification.md` §5.14.
+
+#### 19.0 History: screen capture -> matplotlib (same day)
+
+The first implementation captured the plot area as drawn on screen
+(`QWidget.render` into `QImage`/`QPdfWriter`). Dropped after user review because:
+(1) the stacked plots' X axes didn't line up — each pyqtgraph plot sizes its own Y
+axis to its tick-label width, so plot areas started at different X offsets;
+(2) pyqtgraph's on-screen legend (lines overlapping the text, no frame) doesn't
+read well in a saved figure; (3) SVG could not be produced correctly — Qt's
+`QSvgGenerator` writes coordinates with only 6 significant digits, so a time axis in
+epoch seconds (~1.7e9) collapsed every curve onto one vertical line, and pyqtgraph's
+own `SVGExporter` crashes on PySide6 6.11's path syntax (pyqtgraph 0.14.0).
+Re-drawing with matplotlib fixes all three (shared X axis with aligned axes,
+proper legends, and matplotlib's SVG backend writes device coordinates).
+
+#### 19.1 Snapshot of what's on screen (`ui/plot_widget.py`)
+
+- `TimePlotWidget.export_snapshot() -> PlotSnapshot` (dataclass in
+  `ui/image_export.py`, pure data, no Qt objects):
+  `x_axis_datetime: bool`, `x_range: (lo, hi)`, `y_range: (lo, hi)` (current
+  `viewRange()`), `series: list[SeriesSnapshot(name, color, x, y)]` in display order,
+  with `x`/`y` copied from each series' `curve.getData()` (the data currently drawn —
+  downsampled/pyramid envelope as on screen; empty arrays if nothing drawn yet), and
+  `cursors: list[float]` (X of each cursor line, only while cursor lines are visible,
+  i.e. cursor mode on).
+- `MainWindow` collects `export_snapshot()` from every plot in `plot_grid.plots` order
+  and drops plots with no series. No plot left -> `export.nothing_to_export` info
+  message, nothing saved.
+
+#### 19.2 Rendering (`ui/image_export.py`)
+
+- `build_figure(snapshots, stamp_lines, size_px) -> matplotlib.figure.Figure` and
+  `save_figure(fig, path, metadata)`, split so tests can inspect the figure without
+  writing files. `export_plots_image(snapshots, path, stamp_lines, metadata, size_px)`
+  calls both. Uses `matplotlib.figure.Figure` + the Agg canvas directly — never
+  `pyplot` (no global state, no GUI backend interaction with the running Qt app).
+  `matplotlib` is imported lazily inside these functions so app startup doesn't pay
+  for it.
+- Figure: size = `size_px` (the `plot_grid` widget's size) / 100 inches, white
+  background. One subplot per snapshot, vertically stacked, heights equal.
+  Time-domain subplots share X (`sharex`); a non-time (FFT, X in Hz) subplot keeps its
+  own X axis with an `Hz` label. Layout engine `constrained` so the left edges of all
+  subplot areas align regardless of Y tick-label widths; tick labels on the X axis
+  are shown only on the bottom-most subplot of the shared group.
+- Each subplot: every series as a line in its on-screen color (line width 0.8), X/Y
+  limits = the snapshot's ranges, light grid (alpha 0.3), legend (`loc="upper right"`,
+  semi-opaque frame, font size 8) with the series names, cursors as dashed vertical
+  lines in the on-screen cursor color (`#ffaa00`).
+- Time X axis: values are epoch seconds shown in **local time**, like on screen
+  (`DateAxisItem`/cursor labels use `datetime.fromtimestamp`). Convert to naive
+  local `datetime64` using the local UTC offset at the X range's start, and format
+  with `matplotlib.dates.ConciseDateFormatter` (adaptive granularity, like the
+  on-screen axis). A DST change inside the range shifts the later part by the
+  difference — acceptable, noted here.
+- Stamp: `stamp_lines` joined by newlines, right-aligned in the bottom-right corner
+  of the figure (font size 7, grey), with the constrained layout's `rect` reserving
+  enough height at the bottom that the stamp never overlaps any axes or tick labels.
+- `save_figure`: format from the path suffix (`EXPORT_FORMATS`: `.png`, `.jpg`/
+  `.jpeg`, `.tif`/`.tiff`, `.svg`, `.pdf`; anything else -> `ValueError`). Raster at
+  `dpi=200` (2x the on-screen pixel size, since the figure is sized at 100 dpi).
+  JPEG quality 95. Metadata: PNG — every key as a `tEXt` chunk; PDF — `Title`,
+  `Creator`, `Subject` (the range) and `Keywords` (the source path); SVG — `Title`,
+  `Description` (all keys as `key: value` lines), `Creator`; TIFF — the
+  ImageDescription tag (all keys as `key: value` lines); JPEG — a JPEG comment with
+  the same text. The file must exist afterwards or `OSError` is raised.
+- **Japanese text** (found in review): matplotlib's default font (DejaVu Sans) has no
+  CJK glyphs, so Japanese series names, file/view names, or the `ja` stamp labels
+  rendered as empty boxes. Figures are built inside
+  `matplotlib.rc_context({"font.family": ["DejaVu Sans", <cjk>]})`, using matplotlib's
+  per-glyph font fallback (Latin stays DejaVu Sans, only missing glyphs come from
+  `<cjk>`). `<cjk>` is the first of `_CJK_FONT_CANDIDATES` that is actually installed
+  (checked against `matplotlib.font_manager.fontManager.ttflist` names, once, cached):
+  `Hiragino Sans`, `Hiragino Kaku Gothic ProN` (macOS), `Yu Gothic`, `Meiryo`,
+  `MS Gothic` (Windows), `Noto Sans CJK JP`, `Noto Sans JP`, `IPAexGothic`,
+  `IPAGothic`, `TakaoGothic` (Linux), `Arial Unicode MS`. Only installed families
+  go into the list (an absent one makes matplotlib log a "font family not found"
+  warning on every draw). If none is installed, export still works with DejaVu Sans
+  only (a single `logger.warning`). The rc_context must cover `savefig` too, not just
+  figure construction (text is laid out at draw time). Verified on macOS: Hiragino Sans
+  renders Japanese without missing glyphs in PNG, PDF and SVG. Windows/Linux fonts
+  are untested here.
+- Dependency: `matplotlib` is added to the main dependencies (image export is a core
+  feature). It increases the PyInstaller bundle size.
+
+#### 19.3 `MainWindow.export_image_dialog()` / `export_image(path)`
+
+- Toolbar action `export_image` (shortcut-configurable, unbound by default; see §9).
+- No file open -> `error.open_file_first`. `plot_grid` busy (a downsample job in
+  flight, `"plot_grid" in _busy_sources`) -> `export.busy` info message, nothing saved.
+- `QFileDialog.getSaveFileName` with one filter per format. Default:
+  `<settings.last_export_folder or the Parquet file's folder>/<parquet stem>_<YYYYmmdd_HHMMSS>.png`.
+  If the chosen name has no recognized extension, the selected filter's extension
+  is appended. After a successful export the folder is stored in
+  `settings.last_export_folder` and saved.
+- Stamp lines (`_image_stamp()`):
+  1. `<file name>` or `<file name>  |  View: <view name>`. `MainWindow._view_name` is set
+     by `load_view` and `save_view_dialog`, cleared by `load_parquet` (a plain file
+     open means the layout no longer corresponds to any saved view).
+  2. `Range: <start> – <end>` — the shared X range of the time-domain plots, formatted
+     like cursor labels (`%Y-%m-%d %H:%M:%S.mmm`, `TimePlotWidget.format_x`). Omitted
+     if no time-domain plot has data.
+  3. `Exported: <YYYY-MM-DD HH:MM:SS>  |  Parquet Analyzer v<version>`.
+  Labels go through `tr()` (language setting applies).
+- Embedded metadata keys: `Title` (file name), `Source` (full Parquet path), `View`
+  (if any), `Range`, `CreationTime` (ISO 8601), `Software`.
+- Errors writing the file (`OSError`/`ValueError`) -> `export.failed` warning; success
+  -> status-bar message with the path (not a modal dialog: exporting is frequent and
+  the dialog would just be dismissed every time).
+- Ops log: `export_image` (path, format).
+
+### 20. View Management Window (added 2026-10-01, user-requested)
+
+Requirements: `specification.md` §5.8 ("View management"). Background: views could be
+saved and loaded but not deleted (only by removing the JSON by hand), and the load
+dialog (`QInputDialog.getItem`) showed nothing but names, so there was no way to see
+which channels a view contained before loading it.
+
+#### 20.1 `io/view.py`
+
+- `delete_view(view_name) -> None`: `view_path(view_name).unlink()` (so the same name
+  validation applies); `FileNotFoundError` if it doesn't exist.
+- `view_saved_at(view_name) -> datetime`: the JSON file's mtime (local time). The view
+  schema has no saved-at field; not adding one (no schema change).
+
+#### 20.2 `ui/view_manager.py` — `ViewManagerDialog(QDialog)`
+
+- Constructed with the `MainWindow`'s data needed for display only:
+  `available_columns: set[str] | None` — the open file's columns **excluding the
+  current time column** (`None` if no file is open). Excluded because `load_view`
+  resolves series and expressions against `_raw_variables`, which never contains the
+  time column, so a view plotting/referencing it gets that item skipped. (Corrected in
+  review: the first version of this spec said "including the time column".) It never touches `MainWindow` state
+  itself: loading/deleting are reported back via its result / signals (below).
+- Layout: left, a `QListWidget` of `view_io.list_views()` (sorted, as returned);
+  right, a read-only `QTreeWidget` with the selected view's details; bottom buttons
+  **Load**, **Delete**, **Close**. First view selected on open. Double-click on a view
+  = Load. Load/Delete disabled while nothing is selected. With no saved views: the
+  list shows nothing, details show `view.none_saved`, Load/Delete disabled.
+- Details tree (top-level rows, children indented), built from `view_io.load_view()`:
+  - `Source: <parquet_path>` (tooltip: path type).
+  - `Saved: <YYYY-MM-DD HH:MM:SS>` from `view_saved_at`.
+  - `Time range: <start> – <end>` if `x_axis_range` is set, formatted like cursor
+    labels (`%Y-%m-%d %H:%M:%S.mmm`, local time via `datetime.fromtimestamp`).
+  - One row per plot, `Plot <n> (<k> channels)`, expanded; children = one row per
+    series: the variable name with a small color swatch icon (its saved `color`).
+  - `Derived variables (<k>)` if any, expanded; children `name = expression`.
+  - `Downsampling: on/off`.
+- Missing-channel marking (only when `available_columns` is not `None`), computed
+  **transitively**, the way `load_view` actually cascades: walk the view's derived
+  variables in `core.variable.dependency_order`; one is *resolvable* if its
+  expression parses and every name it references (`core.expression.referenced_names`)
+  is in `available_columns` or is an already-resolvable derived variable — otherwise
+  it's "missing". A series is "missing" if its variable is neither in
+  `available_columns` nor a resolvable derived variable. So with `d1` missing,
+  `d2 = d1 + 1` and a series plotting `d1` or `d2` are all marked. (Corrected in
+  review: the first version only checked direct references, which under-reported what
+  a load would actually skip.) Missing rows: red text,
+  suffix ` — not in the open file`, tooltip explaining it will be skipped on load. A
+  summary row at the top, `<m> channel(s) not in the open file`, only if m > 0. This
+  mirrors `MainWindow.load_view`'s actual skip behavior (§8), not a stricter check.
+- Unreadable view (any exception from `view_io.load_view`): the details show a single
+  red row `Could not read this view: <error>`; Load disabled, Delete still enabled.
+- Delete: `QMessageBox.question` (`view.delete_confirm`, naming the view); on Yes,
+  `view_io.delete_view`, remove it from the list, select the next one (or previous if
+  it was last), emit `viewDeleted(str)`. `OSError` -> warning `view.delete_failed`,
+  list unchanged.
+- Load: `accept()` with `selected_view_name()` returning the name; `MainWindow` then
+  calls `load_view(name)` exactly as before (§8 behavior unchanged).
+
+#### 20.3 `MainWindow`
+
+- `load_view_dialog()` opens `ViewManagerDialog` (modal, `exec()`), passing the
+  names in `self._file_columns` minus the current time column, or `None`. On accept, `load_view(name)`. Toolbar label
+  becomes `View...` / `ビュー...` (i18n `toolbar.load_view`); the shortcut id stays
+  `load_view` (no settings migration). The old "no saved views" early-return
+  information box is removed — the dialog's own empty state covers it.
+- `viewDeleted(name)`: if `name == self._view_name`, clear `_view_name` (the image
+  export stamp must not name a view that no longer exists, §19.3). `log_op
+  ("delete_view", name=...)`.
+- i18n: every string above through `tr()` (en + ja).
+
 ---
 
 ## 日本語
 
-- 版数: v0.6（2026-09-19更新: 13.5.1章をOpus・Fableによる2回目の独立再調査で修正・拡張）
+- 版数: v0.9（2026-10-01更新: 20章 ビュー管理ウィンドウを追加）
 - 位置づけ: `specification.md`（要求仕様）を実装レベルまで具体化したもの。
   `specification.md` 第11章の未確定事項のうち 11.1, 11.5, 11.6 を確定し、11.3・11.4・11.7 を
   実装可能な形まで詳細化する。要求レベルの背景・理由は `specification.md` を参照。
@@ -1651,40 +1945,54 @@ repo can be tied back to a specific version without asking the reporter to check
 | プロットライブラリ（11.1） | `pyqtgraph` | ドラフト記載の `Pygraph` は `pyqtgraph` の表記ゆれと解釈。PySide6との親和性・大量点描画性能の実績から確定。 |
 | Parquet読み込み（11.6） | `polars` | `pl.scan_parquet` によるレイジー評価で、必要な列・行範囲のみ読み込める。列指向処理がAPIとして自然で、`pandas`よりメモリ効率が良い。スキーマ確認など軽量な操作には内部で`pyarrow`も利用する。 |
 | exe化（11.5） | `PyInstaller` | PySide6アプリでの実績が豊富。`--onedir`形式で配布し、起動時間の悪化を避ける。 |
+| 画像保存（19章） | `matplotlib` | 保存用には画面をキャプチャせず描き直す: X軸を共有して揃え、まともな凡例を付け、SVGをデバイス座標で書き出せる（QtのSVG出力はエポック秒のX値で精度が落ちる。19.0章）。保存時にのみ使い、遅延importする。 |
 
 ### 2. モジュール構成
 
 ```
 src/parquet_analyzer/
+├── __init__.py               # __version__（17章）
 ├── __main__.py               # GUIエントリポイント
 ├── convert_cli.py            # MDF/MATLAB→Parquet変換のCLIエントリポイント（argparse、Qt非依存）
 ├── config.py                 # パス定義の共有モジュール（stdlibのみ依存、他プロジェクトからもimport可能）
 ├── ui/
-│   ├── main_window.py       # MainWindow: メニュー、ツールバー(H/Rボタン)、全体レイアウト
-│   ├── plot_grid.py         # PlotGridWidget: マルチプロットの配置・追加/削除管理
-│   ├── plot_widget.py       # TimePlotWidget: pyqtgraph.PlotWidgetラッパー、ズーム/パン処理
-│   ├── navigator.py         # NavigatorWidget: 縮小全体表示 + 選択範囲矩形（共通・単一）
-│   ├── variable_panel.py    # VariablePanel: 変数一覧、D&D、右クリックメニュー
-│   ├── expression_bar.py    # ExpressionBar: 演算式入力欄
-│   ├── stats_dialog.py      # StatsDialog: 統計結果を表示する非モーダル別ウィンドウ
-│   ├── settings_dialog.py   # SettingsDialog: 設定メニューのダイアログ
-│   └── folder_picker.py     # FolderPickerDialog: データフォルダ選択 + 履歴表示
+│   ├── main_window.py        # MainWindow: ツールバー、全体レイアウト、各部品の結線
+│   ├── plot_grid.py          # PlotGridWidget: マルチプロットの配置・追加/削除管理
+│   ├── plot_widget.py        # TimePlotWidget: pyqtgraph.PlotWidgetラッパー、ズーム/パン、カーソル、
+│   │                          # 画像保存用のexport_snapshot()（19.1章）
+│   ├── navigator.py          # NavigatorWidget: 縮小全体表示 + 選択範囲矩形（共通・単一）
+│   ├── variable_panel.py     # VariablePanel: 変数一覧、D&D、仮想変数の編集/削除の
+│   │                          # 右クリックメニュー（18.3章）
+│   ├── expression_bar.py     # ExpressionBar: 演算式入力欄（編集モードを含む。18.3章）
+│   ├── stats_dialog.py       # StatsDialog: 統計結果を表示する非モーダル別ウィンドウ
+│   ├── settings_dialog.py    # SettingsDialog: 設定メニューのダイアログ
+│   ├── view_manager.py       # ViewManagerDialog: 保存済みビューの一覧・詳細・読込・削除（20章）
+│   ├── image_export.py       # matplotlibによるプロットの画像保存（19.2章）
+│   ├── i18n.py               # tr(): UI文字列をen/jaで一元管理（Settings.language）
+│   └── folder_picker.py      # pick_parquet_file(): ファイル選択ダイアログ + 最近のフォルダ
 ├── core/
-│   ├── data_source.py       # ParquetDataSource: polars LazyFrameラップ、スキーマ/範囲読み込み
-│   ├── downsample.py        # lttb(x, y, n_out) -> (x_ds, y_ds)。QThreadPool上のワーカーから呼ばれる
-│   ├── background_worker.py # BackgroundWorker(QRunnable): 任意の関数をUIスレッド外で実行し
-│   │                         # 結果をシグナルで返す共通ワーカー（ダウンサンプリング再計算/
-│   │                         # FFT/統計が共用。世代番号による陳腐化破棄はダウンサンプリング側の
-│   │                         # 呼び出し元（plot_widget.py）が結果タプルに含めて自前で判定する）
-│   ├── expression.py        # evaluate_expression(expr, variables): 制限付き評価
-│   ├── analysis.py          # fft(x, y), delta(y), rolling_mean(y, window), basic_stats(y)
-│   ├── variable.py          # Variable / DerivedVariable データ構造
-│   ├── convert.py           # MDF/MATLAB→Parquet変換（15章参照）。GUI非依存で、
-│   │                         # convert_cli.py経由でのみ到達し、GUI本体からは使われない
-│   └── oplog.py             # デバッグモードの操作ログヘルパー、log_op()
+│   ├── data_source.py        # ParquetDataSource: polars LazyFrameラップ、スキーマ/範囲読み込み、
+│   │                          # フッターのみのメタデータ、ブロックキャッシュ付きread_window()（13.5.1章）
+│   ├── column.py             # Column / MaterializedColumn / LazyColumn / WindowedColumn /
+│   │                          # LazyVariables: 列の必要時読み込み（13.5.1章 Phase C/D）
+│   ├── numeric.py            # to_numeric(): 任意の列型 → float64（日時 → エポック秒）
+│   ├── pyramid.py            # build_pyramid(): 大きすぎる列の粗いmin/max包絡
+│   ├── downsample.py         # lttb(x, y, n_out) -> (x_ds, y_ds)。QThreadPool上のワーカーから呼ばれる
+│   ├── background_worker.py  # BackgroundWorker(QRunnable): 任意の関数をUIスレッド外で実行し
+│   │                          # 結果をシグナルで返す共通ワーカー（ダウンサンプリング再計算/
+│   │                          # FFT/統計が共用。世代番号による陳腐化破棄はダウンサンプリング側の
+│   │                          # 呼び出し元（plot_widget.py）が結果タプルに含めて自前で判定する。
+│   │                          # 陳腐化した結果の破棄のため）
+│   ├── expression.py         # evaluate_expression(expr, variables): 制限付き評価;
+│   │                          # referenced_names(expr)
+│   ├── analysis.py           # fft(x, y), delta(y), rolling_mean(y, window), basic_stats(y)
+│   ├── variable.py           # Variable / DerivedVariable; dependency_order(), dependents_of()（18.1章）
+│   ├── convert.py            # MDF/MATLAB→Parquet変換（15章参照）。GUI非依存で、
+│   │                          # convert_cli.py経由でのみ到達し、GUI本体からは使われない
+│   └── oplog.py              # デバッグモードの操作ログヘルパー、log_op()
 └── io/
-    ├── view.py              # View データ構造、save_view()/load_view()
-    └── settings.py          # Settings データ構造、load_settings()/save_settings()
+    ├── view.py               # View データ構造、save_view()/load_view()/delete_view()
+    └── settings.py           # Settings データ構造、load_settings()/save_settings()
 ```
 
 各モジュールの責務は上記コメントの通り。`ui/` はPySide6/pyqtgraphに依存し、`core/`・`io/` は
@@ -1891,7 +2199,8 @@ GUI非依存（単体テスト容易性・将来のCLI化に備える）。
   （[13.4章](#134-演算式の既知の制限)）。
 - **演算変数名が既存の列名と衝突する場合はエラーにする**（`MainWindow._on_add_derived_variable`）。
   以前は無言で上書きしていた（レビューで発見・修正）。同名の演算変数を式だけ変えて再定義する
-  ことは許可している（意図的な再定義とみなす）。
+  ことは許可している（意図的な再定義とみなす。コンテキストメニューからの編集と同じ処理を通る。
+  [18章](#18-仮想変数の編集削除2026-09-30追加ユーザー要望)参照）。
 - 生成された仮想変数は通常の変数と同様に `VariablePanel` に表示され、プロット・保存が可能
   （`specification.md` 5.5参照）。
 
@@ -2031,12 +2340,15 @@ GUI非依存（単体テスト容易性・将来のCLI化に備える）。
     "stats": "",
     "save_view": "",
     "load_view": "",
-    "toggle_downsample": ""
+    "toggle_downsample": "",
+    "cursor": "",
+    "export_image": ""
   },
   "window_geometry": null,
   "window_state": null,
   "last_data_folder": null,
   "recent_data_folders": [],
+  "last_export_folder": null,
   "recent_files": [],
   "recent_views": [],
   "default_overlay": false
@@ -2058,6 +2370,8 @@ GUI非依存（単体テスト容易性・将来のCLI化に備える）。
   `recent_data_folders` は要素数5を上限としたMRUリスト、`last_data_folder` は
   `recent_data_folders[0]` と一致させる（先頭を読めば済むが、明示フィールドとして持たせて
   読み手にとっての意図を明確にする）。
+- `last_export_folder`: 最後にプロット画像を保存したフォルダ（19.3章）。次回保存時の既定
+  フォルダに使う。初回保存までは`null`。
 
 #### 9.1 設定メニュー
 
@@ -3092,3 +3406,251 @@ PySide6/pyqtgraph/polarsを引き込むものではないため。
 作られた公開/派生先のリポジトリでも同様に表示されるため、コピー先で不具合報告を受けた際に
 `pyproject.toml`を手動で確認してもらわなくても、どのバージョンかをタイトルバーだけで
 特定できる。
+
+**バージョン番号を書いている全箇所**——上げる際はすべて同時に更新する（`uv.lock`にも
+記録されるため`uv lock`を実行する）:
+- `pyproject.toml`の`version`（正）
+- `src/parquet_analyzer/__init__.py`の`__version__`
+- `README.md`のバージョンバッジ（`version-X.Y.Z-informational`）——0.2.0に上げた際に更新漏れが
+  あったため、この一覧に追加した（2026-10-01に発見）。
+
+### 18. 仮想変数の編集・削除（2026-09-30追加、ユーザー要望）
+
+要件: `specification.md` 5.5章。背景: 仮想変数はビュー経由で保存・再読込自体はできていた
+（検証済み: 保存→開く→式を追加→保存→開くで全て保持される）が、編集・削除の手段が無かった。
+また唯一の「編集」手段だった `ExpressionBar` での同名再追加は、その変数のキャッシュ配列は
+置き換えるものの、(a) それを参照する他の仮想変数、(b) 既にプロット済みの曲線が**古い値のまま**
+残るという不具合があった。
+
+#### 18.1 依存関係の追跡（`core/`）
+
+- `core/expression.py` `referenced_names(expr) -> set[str]`: 式が参照する変数名
+  （`Call`の関数名を除く全ての`ast.Name`）。`evaluate_expression`と同じNFKC正規化の後に解析する。
+  構文エラーは`ExpressionError`。
+- `core/variable.py`:
+  - `dependency_order(exprs: Mapping[str, str]) -> list[str]` — `{名前: 式}`を、各仮想変数が
+    自分の参照する仮想変数より後に来る順序で返す（マッピングに無い名前＝ファイル列は無視）。
+    依存関係が許す限り入力順を保つ安定ソート。循環や解析不能な式がある場合、残りは入力順で
+    末尾に付ける（ここでは例外にせず、呼び出し側で通常の評価エラーとして扱わせる）。
+  - `dependents_of(name, exprs) -> list[str]` — `name`に直接・間接に依存する全仮想変数を
+    `dependency_order`順で返す。
+
+#### 18.2 `MainWindow`の操作
+
+- `edit_derived_variable(name, expression)`:
+  1. `name`は既存の仮想変数であること。
+  2. 循環定義チェック: `referenced_names(expression)`に`name`自身または
+     `dependents_of(name)`のいずれかが含まれれば`ExpressionError`（`error.circular_definition`）。
+  3. 新しい式、続いて依存する仮想変数を依存順に、新しい値で古いキャッシュを上書きした
+     オーバーレイ上で評価する。全て成功するまで何も確定しない（途中で失敗すれば元の状態のまま）。
+  4. 確定: `_derived`と`_raw_variables`内の`MaterializedColumn`を更新し、再計算した名前を
+     表示している全時間軸プロットで`TimePlotWidget.replace_series_y(name, y)`を呼ぶ
+     （常駐Y配列を差し替え、曲線・色・凡例の位置は保ったまま再描画し、カーソルラベルも更新）。
+     アンカープロットが影響を受けた場合はナビゲータも更新する。
+- `_on_add_derived_variable`（`ExpressionBar`経由）は、名前が既存の仮想変数であれば
+  `edit_derived_variable`に委譲する。これによりバーからの再定義でも依存変数・曲線が
+  古いまま残らない。
+- `delete_derived_variable(name)`:
+  - 他の仮想変数が`name`を直接参照していれば`ExpressionError`（`error.derived_in_use`、
+    該当する変数名を列挙）。連鎖削除はしない。
+  - それ以外は全時間軸プロットから系列を取り除き（FFTプロットは対象外。その系列は
+    `"<name> (FFT...)"`という名前の計算済み結果で、変数への参照ではない）、
+    `_derived`/`_raw_variables`/`VariablePanel`から削除し、ナビゲータを更新する。
+- どちらも操作ログに記録する（`edit_derived_variable`, `delete_derived_variable`）。
+
+#### 18.3 UI
+
+- `VariablePanel`はどの項目が仮想変数かを把握する（`set_variables(names, derived=
+  {名前: 式})`, `add_variable(name, expression=None)`, `remove_variable(name)`）。仮想変数は
+  斜体で表示し、ツールチップに`名前 = 式`を出す。仮想変数を右クリックするとコンテキスト
+  メニュー「式を編集...」（`editDerivedRequested(str)`）・「削除」（`deleteDerivedRequested(str)`）
+  を表示する。ファイル列ではメニューを出さない。
+- 編集はダイアログではなく`ExpressionBar`で行う: `MainWindow`が
+  `ExpressionBar.start_edit(name, expression)`を呼ぶと、バーが編集モードになる（名前欄は
+  読み取り専用、現在の式を入力済み、「追加」ボタンが「更新」に変わり、「キャンセル」ボタンを
+  表示）。「更新」は「追加」と同じコールバックを通る（`_on_add_derived_variable`は既存の
+  仮想変数名に対しては`edit_derived_variable`へ委譲済み）ため、`ExpressionError`時はエラーを
+  表示して入力内容を保ったまま編集モードに留まり、成功時は追加モードに戻る。`cancel_edit()`
+  （キャンセルボタン、または式欄でEsc）は何も変更せず追加モードに戻す。
+  - ダイアログにしない理由（最初の実装はダイアログだったが、同日ユーザー指摘で変更）:
+    モーダルな`QInputDialog`は変数リストの操作を塞ぐため、編集中に変数名をドラッグ・
+    ダブルクリック挿入できない——これはまさに式入力バーが提供すべき入力補助（6章）である。
+  - 編集中の変数が存在しなくなった場合（削除された、または`load_parquet`/`load_view`で
+    仮想変数一式がリセットされた）、`MainWindow`は編集モードを解除する。
+- 削除はまず`QMessageBox.question`で確認し、拒否された場合は`error.derived_in_use`を警告表示する。
+- パネルを作り直す全ての箇所（`load_parquet`, `set_time_column`, `load_view`）で現在の仮想変数
+  マッピングを渡し、表示区別が失われないようにする。
+
+#### 18.4 ビュー
+
+- `save_view_dialog`は`derived_variables`を`dependency_order`順で書き出す（追加順では不十分:
+  `a`を後から定義した`b`を参照するよう編集すると、先頭要素を読み込み時に評価できない
+  ファイルになってしまう）。
+- `load_view`も保存済み仮想変数を`dependency_order`順で適用するため、順序の悪い古い
+  ビューファイルも読み込める。
+- スキーマ変更なし（`schema_version`は`"1"`のまま）。
+
+### 19. プロットの画像保存（2026-09-30追加、ユーザー要望）
+
+要件: `specification.md` 5.14章。
+
+#### 19.0 経緯: 画面キャプチャ → matplotlib（同日変更）
+
+最初の実装は画面に描かれたプロット領域をそのまま写していた（`QWidget.render`で`QImage`/
+`QPdfWriter`へ）。ユーザー確認の結果、次の理由で取り下げた: (1) 縦に並んだプロットのX軸が
+揃わない——pyqtgraphの各プロットはY軸の幅を自分の目盛りラベル幅に合わせるため、プロット
+領域の開始X位置がプロットごとにずれる; (2) pyqtgraphの画面用凡例（線と文字が重なり枠も
+無い）は保存した図では読みにくい; (3) SVGを正しく作れない——Qtの`QSvgGenerator`は座標を
+有効数字6桁でしか書き出さず、エポック秒（約1.7e9）の時間軸では全曲線が1本の縦線に潰れる。
+pyqtgraph自身の`SVGExporter`はPySide6 6.11のパス構文で例外になる（pyqtgraph 0.14.0）。
+matplotlibで描き直せば3点とも解決する（X軸共有で軸が揃う、まともな凡例、SVGバックエンドは
+デバイス座標で書き出す）。
+
+#### 19.1 画面内容のスナップショット（`ui/plot_widget.py`）
+
+- `TimePlotWidget.export_snapshot() -> PlotSnapshot`（`ui/image_export.py`のdataclass。
+  Qtオブジェクトを含まない純粋なデータ）: `x_axis_datetime: bool`、`x_range: (lo, hi)`、
+  `y_range: (lo, hi)`（現在の`viewRange()`）、`series: list[SeriesSnapshot(name, color, x, y)]`
+  （表示順。`x`/`y`は各系列の`curve.getData()`をコピーしたもの——画面と同じくダウンサンプリング
+  後/ピラミッド包絡のデータ。まだ何も描かれていなければ空配列）、`cursors: list[float]`
+  （各カーソル線のX。カーソル線が表示中、つまりカーソルモードがオンのときだけ）。
+- `MainWindow`は`plot_grid.plots`の順に全プロットの`export_snapshot()`を集め、系列の無い
+  プロットは除く。1つも残らなければ`export.nothing_to_export`を案内し、保存しない。
+
+#### 19.2 描画（`ui/image_export.py`）
+
+- `build_figure(snapshots, stamp_lines, size_px) -> matplotlib.figure.Figure`と
+  `save_figure(fig, path, metadata)`に分け、テストがファイルを書かずに図を検査できるようにする。
+  `export_plots_image(snapshots, path, stamp_lines, metadata, size_px)`が両方を呼ぶ。
+  `matplotlib.figure.Figure`とAggキャンバスを直接使い、`pyplot`は使わない（グローバル状態を
+  持たず、動作中のQtアプリとGUIバックエンドが干渉しない）。起動時間に影響しないよう、
+  `matplotlib`はこれらの関数内で遅延importする。
+- 図: 大きさは`size_px`（`plot_grid`ウィジェットの大きさ）/ 100 インチ、背景は白。
+  スナップショット1つにつきサブプロット1つを縦に並べ、高さは均等。時間軸サブプロットは
+  X軸を共有（`sharex`）。時間軸でない（FFT、XはHz）サブプロットは独自のX軸で`Hz`ラベルを
+  付ける。レイアウトエンジンは`constrained`で、Y目盛りラベル幅に関係なく全サブプロット領域の
+  左端を揃える。X軸の目盛りラベルは共有グループの一番下のサブプロットにだけ表示する。
+- 各サブプロット: 全系列を画面と同じ色の線で描く（線幅0.8）、X/Y範囲はスナップショットの
+  範囲、薄いグリッド（alpha 0.3）、系列名の凡例（`loc="upper right"`、半透明の枠、
+  文字サイズ8）、カーソルは画面と同じカーソル色（`#ffaa00`）の破線の縦線。
+- 時間X軸: 値はエポック秒で、画面と同じく**ローカル時刻**で表示する（`DateAxisItem`/
+  カーソルラベルは`datetime.fromtimestamp`を使う）。X範囲開始時点のローカルUTCオフセットで
+  naiveなローカル`datetime64`に変換し、`matplotlib.dates.ConciseDateFormatter`で書式化する
+  （画面の軸と同様、ズームに応じて粒度が変わる）。範囲内で夏時間が切り替わる場合は後半が
+  その差だけずれる——許容範囲としてここに明記する。
+- 記載: `stamp_lines`を改行で連結し、図の右下に右揃えで描く（文字サイズ7、グレー）。
+  constrainedレイアウトの`rect`で下端に十分な高さを確保し、どの軸・目盛りラベルとも
+  重ならないようにする。
+- `save_figure`: 形式はパスの拡張子で決まる（`EXPORT_FORMATS`: `.png`, `.jpg`/`.jpeg`,
+  `.tif`/`.tiff`, `.svg`, `.pdf`。それ以外は`ValueError`）。ラスタは`dpi=200`（図を100dpiで
+  作っているので画面上のピクセル数の2倍）。JPEGは品質95。メタデータ: PNG——全キーを`tEXt`
+  チャンクに; PDF——`Title`、`Creator`、`Subject`（範囲）、`Keywords`（元パス）; SVG——
+  `Title`、`Description`（全キーを`key: value`の行で）、`Creator`; TIFF——ImageDescription
+  タグ（全キーを`key: value`の行で）; JPEG——同じテキストをJPEGコメントに。保存後にファイルが
+  存在しなければ`OSError`。
+- **日本語の文字**（確認時に発見）: matplotlibの既定フォント（DejaVu Sans）にはCJKの字形が
+  無く、日本語の系列名・ファイル名/ビュー名・`ja`設定時の記載ラベルが空の四角（豆腐）になって
+  いた。図は`matplotlib.rc_context({"font.family": ["DejaVu Sans", <cjk>]})`の中で作り、
+  matplotlibの字形単位のフォントフォールバックを使う（英数字はDejaVu Sansのまま、足りない
+  字形だけ`<cjk>`から取る）。`<cjk>`は`_CJK_FONT_CANDIDATES`のうち実際にインストールされて
+  いる最初のもの（`matplotlib.font_manager.fontManager.ttflist`の名前と照合。1回だけ調べて
+  キャッシュ）: `Hiragino Sans`、`Hiragino Kaku Gothic ProN`（macOS）、`Yu Gothic`、`Meiryo`、
+  `MS Gothic`（Windows）、`Noto Sans CJK JP`、`Noto Sans JP`、`IPAexGothic`、`IPAGothic`、
+  `TakaoGothic`（Linux）、`Arial Unicode MS`。リストにはインストール済みのものだけを入れる
+  （存在しないフォント名があると、matplotlibが描画のたびに「font family not found」警告を
+  出すため）。どれも無ければDejaVu Sansだけで保存は続行する（`logger.warning`を1回）。
+  文字は描画時にレイアウトされるため、rc_contextは図の構築だけでなく`savefig`まで囲む。
+  macOSで確認済み: Hiragino SansはPNG・PDF・SVGのいずれでも字形欠けなく日本語を描ける。
+  Windows/Linuxのフォントはここでは未検証。
+- 依存関係: `matplotlib`を本体の依存に追加する（画像保存は中核機能のため）。PyInstallerの
+  配布サイズは増える。
+
+#### 19.3 `MainWindow.export_image_dialog()` / `export_image(path)`
+
+- ツールバーのアクション`export_image`（ショートカット設定可、既定は未割り当て。9章参照）。
+- ファイル未オープン → `error.open_file_first`。`plot_grid`が描画中（ダウンサンプリング
+  ジョブ実行中、`"plot_grid" in _busy_sources`）→ `export.busy`を案内し、保存しない。
+- `QFileDialog.getSaveFileName`で形式ごとのフィルタを出す。既定:
+  `<settings.last_export_folder または Parquetファイルのフォルダ>/<parquetのstem>_<YYYYmmdd_HHMMSS>.png`。
+  選んだ名前に対応する拡張子が無ければ、選択中フィルタの拡張子を付ける。保存に成功したら
+  そのフォルダを`settings.last_export_folder`に記録・保存する。
+- 記載行（`_image_stamp()`）:
+  1. `<ファイル名>` または `<ファイル名>  |  ビュー: <ビュー名>`。`MainWindow._view_name`は
+     `load_view`と`save_view_dialog`で設定し、`load_parquet`でクリアする（ファイルを直接
+     開いた時点で、レイアウトはどの保存済みビューとも対応しなくなるため）。
+  2. `表示範囲: <開始> – <終了>` — 時間軸プロットで共有しているX範囲。カーソルラベルと同じ
+     書式（`%Y-%m-%d %H:%M:%S.mmm`、`TimePlotWidget.format_x`）。データのある時間軸プロットが
+     無ければ省略。
+  3. `出力日時: <YYYY-MM-DD HH:MM:SS>  |  Parquet Analyzer v<version>`。
+  ラベルは`tr()`を通す（言語設定が反映される）。
+- 埋め込みメタデータのキー: `Title`（ファイル名）、`Source`（Parquetのフルパス）、`View`
+  （あれば）、`Range`、`CreationTime`（ISO 8601）、`Software`。
+- 書き込み失敗（`OSError`/`ValueError`）→ `export.failed`を警告表示。成功時はステータスバーに
+  パスを表示する（モーダルダイアログにはしない: 頻繁に使う操作で、毎回閉じるだけのダイアログ
+  になるため）。
+- 操作ログ: `export_image`（パス、形式）。
+
+### 20. ビュー管理ウィンドウ（2026-10-01追加、ユーザー要望）
+
+要件: `specification.md` 5.8章（「ビューの管理」）。背景: ビューは保存・読み込みはできたが
+削除はできず（JSONを手で消すしかなかった）、読み込みダイアログ（`QInputDialog.getItem`）は
+名前しか表示しないため、読み込む前にそのビューにどのチャンネルが含まれるか知る手段が無かった。
+
+#### 20.1 `io/view.py`
+
+- `delete_view(view_name) -> None`: `view_path(view_name).unlink()`（同じ名前検証が効く）。
+  存在しなければ`FileNotFoundError`。
+- `view_saved_at(view_name) -> datetime`: JSONファイルの更新日時（ローカル時刻）。ビューの
+  スキーマには保存日時の項目が無いが、追加はしない（スキーマ変更なし）。
+
+#### 20.2 `ui/view_manager.py` — `ViewManagerDialog(QDialog)`
+
+- 表示に必要なデータだけを受け取って作る: `available_columns: set[str] | None`（開いている
+  ファイルの列から**現在の時間軸列を除いたもの**。ファイル未オープンなら`None`）。時間軸列を
+  除くのは、`load_view`が系列・式を時間軸列を含まない`_raw_variables`に対して解決するため、
+  時間軸列を表示・参照するビューではその項目がスキップされるから（確認時に修正: 当初の仕様は
+  「時間軸列を含む」としていた）。`MainWindow`の状態には
+  自分では触れない: 読み込み・削除は戻り値/シグナルで伝える（後述）。
+- レイアウト: 左に`view_io.list_views()`の`QListWidget`（返り値のままソート済み）、右に
+  選択中ビューの詳細を表示する読み取り専用の`QTreeWidget`、下に**読み込む**・**削除**・
+  **閉じる**ボタン。開いた時点で先頭のビューを選択。ビューをダブルクリック＝読み込む。
+  未選択時は読み込む/削除を無効化。保存済みビューが無い場合: 一覧は空、詳細に
+  `view.none_saved`、読み込む/削除は無効。
+- 詳細ツリー（トップレベル行と、インデントされた子行）。`view_io.load_view()`から作る:
+  - `元ファイル: <parquet_path>`（ツールチップ: パス種別）。
+  - `保存日時: <YYYY-MM-DD HH:MM:SS>`（`view_saved_at`から）。
+  - `x_axis_range`があれば`時間範囲: <開始> – <終了>`。カーソルラベルと同じ書式
+    （`%Y-%m-%d %H:%M:%S.mmm`、`datetime.fromtimestamp`でローカル時刻）。
+  - プロットごとに1行`プロット<n>（<k>チャンネル）`、展開状態。子行は系列ごとに1行:
+    変数名と、保存された`color`の小さな色見本アイコン。
+  - 演算変数があれば`演算変数（<k>）`、展開状態。子行は`名前 = 式`。
+  - `ダウンサンプリング: 有効/無効`。
+- 欠けているチャンネルの印（`available_columns`が`None`でないときだけ）。`load_view`の実際の
+  連鎖と同じく**推移的に**判定する: ビューの演算変数を`core.variable.dependency_order`順に
+  見ていき、式が解析でき、参照する名前（`core.expression.referenced_names`）がすべて
+  `available_columns`にあるか、既に解決可能と判定された演算変数であれば*解決可能*、そうで
+  なければ「欠けている」。系列は、その変数が`available_columns`にも解決可能な演算変数にも
+  無ければ「欠けている」。つまり`d1`が欠けていれば、`d2 = d1 + 1`も、`d1`や`d2`を表示する系列も
+  すべて印が付く（確認時に修正: 当初の仕様は直接の参照しか見ておらず、読み込み時に実際に
+  スキップされるものを過少に示していた）。欠けている行: 赤字、末尾に
+  ` — 開いているファイルに無い`、読み込み時にスキップされる旨のツールチップ。m > 0 のときだけ
+  先頭に要約行`開いているファイルに無いチャンネル: <m>件`。`MainWindow.load_view`の実際の
+  スキップ動作（8章）をそのまま反映するもので、それより厳しい判定はしない。
+- 読めないビュー（`view_io.load_view`が何らかの例外）: 詳細は赤字の1行
+  `このビューを読み込めません: <エラー>`のみ。読み込むは無効、削除は有効のまま。
+- 削除: `QMessageBox.question`（`view.delete_confirm`、ビュー名を含む）。はいなら
+  `view_io.delete_view`、一覧から除き、次のビュー（最後だったなら前のビュー）を選択し、
+  `viewDeleted(str)`を発行。`OSError` → 警告`view.delete_failed`、一覧は変更しない。
+- 読み込む: `accept()`し、`selected_view_name()`がその名前を返す。`MainWindow`はこれまで通り
+  `load_view(name)`を呼ぶ（8章の動作は変更なし）。
+
+#### 20.3 `MainWindow`
+
+- `load_view_dialog()`は`ViewManagerDialog`を開く（モーダル、`exec()`）。
+  時間軸列を除いた`self._file_columns`の列名集合、または`None`を渡す。acceptされたら`load_view(name)`。ツールバーの
+  表記は`View...` / `ビュー...`（i18n `toolbar.load_view`）。ショートカットIDは`load_view`の
+  まま（設定の移行は不要）。従来の「保存済みビューが無い」ときの情報ダイアログでの早期
+  リターンは削除する——ダイアログ自身の空状態表示で足りる。
+- `viewDeleted(name)`: `name == self._view_name`なら`_view_name`をクリアする（画像保存の
+  記載に、もう存在しないビュー名を出さないため。19.3章）。`log_op("delete_view", name=...)`。
+- i18n: 上記の文字列はすべて`tr()`を通す（en + ja）。

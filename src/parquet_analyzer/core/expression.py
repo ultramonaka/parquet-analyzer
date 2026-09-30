@@ -59,17 +59,29 @@ class ExpressionError(ValueError):
     """
 
 
-def evaluate_expression(expr: str, variables: Mapping[str, np.ndarray]) -> np.ndarray:
+def _parse(expr: str) -> ast.Expression:
     # Japanese IME full-width input mode turns "+" into "＋" (U+FF0B) etc. without the
     # user noticing — ast.parse rejects those as invalid characters. NFKC normalization
     # maps the full-width Latin/digit/symbol/space block back to their ASCII equivalents
     # (e.g. "＋" -> "+", "（" -> "(", U+3000 -> " ") before parsing.
     expr = unicodedata.normalize("NFKC", expr)
     try:
-        tree = ast.parse(expr, mode="eval")
+        return ast.parse(expr, mode="eval")
     except SyntaxError as e:
         raise ExpressionError(f"invalid syntax: {e}") from e
-    return _eval_node(tree.body, variables)
+
+
+def evaluate_expression(expr: str, variables: Mapping[str, np.ndarray]) -> np.ndarray:
+    return _eval_node(_parse(expr).body, variables)
+
+
+def referenced_names(expr: str) -> set[str]:
+    """Variable names `expr` refers to — every ast.Name except a call's function name
+    (detailed_specification.md 18.1). Used for derived-variable dependency tracking.
+    """
+    tree = _parse(expr)
+    func_names = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and id(n) not in func_names}
 
 
 def _eval_node(node: ast.AST, variables: Mapping[str, np.ndarray]):

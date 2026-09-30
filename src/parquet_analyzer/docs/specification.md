@@ -1,6 +1,6 @@
 # Parquet Analyzer Specification / 仕様書
 
-- Version / 版数: v0.3 (updated 2026-09-18 to reflect the current implementation; see
+- Version / 版数: v0.6 (updated 2026-10-01: view management (§5.8) added; see
   `detailed_specification.md` for the history)
 - Audience / 対象読者: implementers / 実装担当者
 - Status / ステータス: core technical choices and controls are finalized (see
@@ -33,7 +33,7 @@ from a GUI.
 | Language | Python |
 | Package management | uv |
 | GUI framework | PySide6 |
-| Plotting library | pyqtgraph |
+| Plotting library | pyqtgraph (interactive plots); matplotlib (image export only, §5.14) |
 | Distribution | a Windows `.exe` (built with PyInstaller or similar; see [11.5](#115-packaging-as-an-exe-resolved)) |
 
 ### 3. Directory Structure
@@ -41,12 +41,12 @@ from a GUI.
 ```
 parquet-analyzer/
 ├── cfg/                        # app settings files
-│   └── parquet_analyzer/
+│   └── parquet_analyzer/        # where the app settings file lives
 ├── data/
 │   ├── parquet_analyzer/        # saved views (screen layouts)
 │   └── raw/                    # source Parquet data to analyze (incl. sample/test data)
 ├── log/                        # logs / debug output
-│   └── parquet_analyzer/
+│   └── parquet_analyzer/        # where log files are written
 ├── src/
 │   ├── common/                  # code shared with other projects (currently empty)
 │   └── parquet_analyzer/         # this app's own source
@@ -195,6 +195,30 @@ parquet-analyzer/
   string plus its input variable names), not as computed raw data, and recomputed
   from the source columns whenever the view is loaded. Reasoning: this tracks changes
   to the underlying source data via recomputation, and keeps the saved file small.
+- **Editing and deleting derived variables** (added 2026-09-30, user-requested; see
+  [detailed_specification.md §18](./detailed_specification.md#18-editing-and-deleting-derived-variables-added-2026-09-30-user-requested)):
+  right-clicking a derived variable in the variable list offers "Edit expression..." and
+  "Delete". Raw file columns offer neither (they are real data, not formulas).
+  - Editing happens in the same expression input bar used for adding (not a separate
+    dialog): the bar switches to edit mode with the name fixed and the current formula
+    filled in, so variable names can still be dragged in or double-click-inserted from
+    the variable list while editing; "Update" applies, "Cancel" returns to add mode.
+  - Editing changes only the formula; the name stays the same (renaming is out of scope,
+    since other expressions refer to a variable by name). The new formula is validated
+    exactly like a new one; on error nothing changes. On success the variable **and every
+    derived variable that depends on it** are recomputed, and every plotted curve of
+    those variables is updated in place (same plot, same color).
+  - Deleting asks for confirmation, then removes the variable from the list and from every
+    plot it is shown on. A derived variable that other derived variables still reference
+    cannot be deleted — the dependents are listed so the user can delete/edit those first
+    (no silent cascading delete).
+  - An expression that would reference itself, directly or through other derived
+    variables (a circular definition), is an error.
+  - Derived variables in the variable list are visually distinguished from file columns
+    (italic, tooltip shows `name = expression`).
+  - Edits/deletions affect the current session; like any other layout change they are
+    persisted by saving the view (overwriting a view of the same name). Derived variables
+    are always written in dependency order so the view reloads correctly.
 
 #### 5.6 Frequency Analysis
 - Runs an FFT on the selected variable and displays the spectrum as a separate plot.
@@ -227,6 +251,17 @@ parquet-analyzer/
   ranges) is applied to the file that's already open (changed 2026-09-17; see
   `detailed_specification.md` §8 for the reasoning). Intended use case: reusing one
   layout across several files that share the same column names.
+- **View management** (added 2026-10-01, user-requested): "Load view" opens a view
+  management window instead of a bare name list. It lists the saved views and, for
+  the selected one, shows **what it contains** before loading: source file, each plot
+  with the channels (variables) shown on it and their colors, derived variables with
+  their expressions, the saved time range, and when it was saved. If a file is open,
+  channels that the open file doesn't have (and would therefore be skipped on load)
+  are marked. From the same window a view can be **loaded** or **deleted** (after a
+  confirmation; deletion removes its JSON file and cannot be undone). A view file that
+  can't be read (corrupt/hand-edited) is still listed, shows the error instead of its
+  contents, and can be deleted. See
+  [detailed_specification.md §20](./detailed_specification.md#20-view-management-window-added-2026-10-01-user-requested).
 
 #### 5.9 Data Folder Selection
 - When opening a Parquet file, the user can choose which folder to browse (a folder
@@ -242,8 +277,11 @@ parquet-analyzer/
   following in one place:
   - Auto-redraw on/off (`auto_redraw`)
   - Downsampling density (`downsample_pixel_ratio`)
-  - Keyboard shortcuts for each action (home, redraw, open, add plot, frequency
-    analysis, statistics, save/load view)
+  - The size above which a column is read on demand instead of kept fully resident
+    (`eager_load_limit_mb`; applies to files opened afterwards)
+  - Keyboard shortcuts for each toolbar action (home, redraw, open, add plot,
+    statistics, save view, view manager, save image, coarse-preview toggle, cursor;
+    plus frequency analysis while it is enabled)
   - Which scroll-wheel modifier performs which action (`scroll_bindings`)
   - **UI language** (`language`; `English`/`日本語`, default `English` for a fresh
     install — added 2026-09-19, user-requested. Takes effect after restarting the
@@ -299,6 +337,36 @@ parquet-analyzer/
   position referred to a position on the previous time axis, which is meaningless on
   the new one).
 - See `detailed_specification.md` §16 for detail.
+
+#### 5.14 Plot Image Export (added 2026-09-30, user-requested; redesigned the same day)
+- "Save image" on the toolbar saves **the plots currently shown** to an image file,
+  **re-drawn with matplotlib** for a clean, publication-style figure — not a screen
+  capture. Plots are stacked in the same order as on screen; the navigator, variable
+  list and toolbar are not included.
+- What each plot shows is exactly what is on screen: same series, same colors, same
+  X range (shared by all time-domain plots) and Y range, and the cursors if cursor
+  mode is on. The data drawn is the same (downsampled) data as on screen.
+- **X axes are aligned**: all time-domain plots share one X axis and their plot areas
+  line up exactly, with date/time tick labels only under the bottom one. (On screen
+  the plot areas can be offset by differing Y tick-label widths; the image is not.)
+- **Every plot has a legend** listing its series.
+- Formats: **PNG** (default), **JPEG**, **TIFF** (raster, 2x the on-screen size in
+  pixels), **SVG** and **PDF** (vector). The format follows the file extension.
+- **Metadata stamp** in the bottom-right corner of the image, below the plots (never
+  overlapping them):
+  1. the source Parquet file name (plus the view name, if the current layout came from
+     or was saved as a view),
+  2. the displayed time range (start – end),
+  3. the export date/time and the app version.
+  The same information is also embedded in the file's own metadata where the format
+  supports it.
+- The default file name is `<parquet file name>_<export date-time>.png`, in the folder
+  last exported to (or the Parquet file's folder the first time).
+- Requires an open file and at least one plot with data. If plots are still being
+  redrawn, the user is asked to retry once drawing finishes, so a half-drawn state is
+  never saved.
+- See [detailed_specification.md §19](./detailed_specification.md#19-plot-image-export-added-2026-09-30-user-requested)
+  for detail.
 
 ### 6. Data Processing
 
@@ -387,7 +455,7 @@ separate/remove/reorder, and a toolbar "+" to add a plot pane (see
 
 ## 日本語
 
-- 版数: v0.3（2026-09-18、現在の実装に合わせて更新。経緯は
+- 版数: v0.6（2026-10-01、5.8章にビューの管理を追加。経緯は
   `detailed_specification.md`参照）
 - 対象読者: 実装担当者
 - ステータス: 主要な技術選定・操作仕様は確定（`## 11. 未確定事項` 参照）。実装レベルの詳細は
@@ -409,7 +477,7 @@ GUI上で行えるようにする。
 | 言語 | Python |
 | パッケージ管理 | uv |
 | GUIフレームワーク | PySide6 |
-| プロットライブラリ | pyqtgraph |
+| プロットライブラリ | pyqtgraph（操作するプロット）、matplotlib（画像保存のみ、5.14章） |
 | 配布形態 | exe（PyInstaller等でWindows向けにビルド。詳細は [11.5](#115-exeの方式解決済み) 参照） |
 
 ### 3. ディレクトリ構成
@@ -546,6 +614,26 @@ parquet-analyzer/
 - 演算で作成した変数（仮想変数）も、生データではなく**定義式（式の文字列と入力元変数名）**として
   ビューに保存する。ビュー読み込み時に元の列から再計算して復元する。
   理由: 元データが更新された場合も再計算で追従でき、保存ファイルも軽量に保てるため。
+- **仮想変数の編集・削除**（2026-09-30追加、ユーザー要望。詳細は
+  [detailed_specification.md 18章](./detailed_specification.md#18-仮想変数の編集削除2026-09-30追加ユーザー要望)）:
+  変数リストで仮想変数を右クリックすると「式を編集...」「削除」を選べる。ファイル由来の列には
+  どちらも表示しない（式ではなく実データのため）。
+  - 編集は別ダイアログではなく、追加に使うのと同じ式入力バーで行う: バーが編集モードに
+    切り替わり、名前は固定、現在の式が入った状態になる。編集中も変数リストからのドラッグや
+    ダブルクリックで変数名を挿入できる。「更新」で適用、「キャンセル」で追加モードに戻る。
+  - 編集で変更できるのは式のみで、名前は変わらない（他の式が名前で参照しているため、改名は
+    対象外）。新しい式は新規作成時と同じく検証し、エラー時は何も変更しない。成功時は、その変数
+    **およびそれに依存する全ての仮想変数**を再計算し、それらを表示中の曲線をその場で更新する
+    （同じプロット・同じ色のまま）。
+  - 削除は確認ダイアログの後、変数リストと、その変数を表示している全プロットから取り除く。
+    他の仮想変数から参照されている仮想変数は削除できず、依存している変数名を一覧表示する
+    （先にそちらを削除・編集してもらう。無言での連鎖削除はしない）。
+  - 直接・間接を問わず自分自身を参照する式（循環定義）はエラーとする。
+  - 変数リスト上で仮想変数はファイル由来の列と見分けがつくよう表示する（斜体、ツールチップに
+    `名前 = 式`を表示）。
+  - 編集・削除は現在のセッションに対して行われ、他のレイアウト変更と同様にビューを保存
+    （同名ビューへの上書き）することで永続化される。仮想変数は常に依存順に書き出すため、
+    保存したビューは正しく再読み込みできる。
 
 #### 5.6 周波数解析
 - 選択した変数に対しFFTを実行し、周波数スペクトルを別プロットとして表示する。
@@ -572,6 +660,15 @@ parquet-analyzer/
   開き直さず、現在開いているファイルに対してプロット配置（表示変数・演算式・軸範囲）だけを
   適用する（2026-09-17変更、経緯は`detailed_specification.md` 8章参照）。同じ列名を持つ
   複数ファイルに同一レイアウトを使い回すユースケースを想定している。
+- **ビューの管理**（2026-10-01追加、ユーザー要望）: 「ビュー読込」は、名前だけの一覧ではなく
+  ビュー管理ウィンドウを開く。保存済みビューを一覧表示し、選択したビューについて読み込む前に
+  **中身**を表示する: 元ファイル、各プロットとそこに表示するチャンネル（変数）とその色、
+  演算変数とその式、保存時の時間範囲、保存日時。ファイルを開いている場合は、開いている
+  ファイルに無い（＝読み込み時にスキップされる）チャンネルに印を付ける。同じウィンドウから
+  ビューを**読み込む**ことも**削除**することもできる（削除は確認の後、JSONファイルを消す。
+  元に戻せない）。読めないビューファイル（破損・手編集など）も一覧に出し、中身の代わりに
+  エラー内容を表示し、削除できる。詳細は
+  [detailed_specification.md 20章](./detailed_specification.md#20-ビュー管理ウィンドウ2026-10-01追加ユーザー要望)。
 
 #### 5.9 データフォルダ選択
 - Parquetファイルを開く際、参照先フォルダを選べるようにする（フォルダ選択ダイアログ）。
@@ -583,7 +680,10 @@ parquet-analyzer/
 - ツールバーから設定ダイアログを開き、以下をまとめて変更できる。
   - 自動再描画のON/OFF（`auto_redraw`）
   - ダウンサンプリング密度（`downsample_pixel_ratio`）
-  - 各操作（ホーム、再描画、開く、プロット追加、周波数解析、統計、ビュー保存/読込）のショートカットキー
+  - 列を常駐させずに必要時に読み込む切り替えサイズ（`eager_load_limit_mb`。変更後に開くファイルから
+    適用）
+  - ツールバーの各操作（ホーム、再描画、開く、プロット追加、統計、ビュー保存、ビュー管理、画像を保存、
+    簡易表示の切替、カーソル。周波数解析は有効な間のみ）のショートカットキー
   - どのスクロールホイール修飾キーがどの操作を行うか（`scroll_bindings`）
   - **UI言語**（`language`; `English`/`日本語`、新規インストール時の既定は`English`——
     2026-09-19追加、ユーザー要望。反映はアプリの次回起動時）
@@ -626,6 +726,31 @@ parquet-analyzer/
 - ファイルを新しく開く、または時間軸の列を切り替えると、全カーソルはクリアされる（以前の
   時間軸上のX位置は新しい時間軸では意味を持たないため）。
 - 詳細は `detailed_specification.md` 16章参照。
+
+#### 5.14 プロットの画像保存（2026-09-30追加、ユーザー要望。同日に方式を変更）
+- ツールバーの「画像を保存」で、**現在表示しているプロット**を画像ファイルに保存する。画面の
+  キャプチャではなく、**matplotlibで描き直した**論文・資料向けの見た目の図にする。プロットは
+  画面と同じ順に縦に並べる。ナビゲータ・変数リスト・ツールバーは含めない。
+- 各プロットの内容は画面と同じ: 同じ系列・同じ色・同じX範囲（全時間軸プロットで共通）と
+  Y範囲、カーソルモードがオンならカーソルも描く。描くデータも画面と同じ
+  （ダウンサンプリング後の）データ。
+- **X軸を揃える**: 全時間軸プロットは1本のX軸を共有し、プロット領域の左右端をぴったり
+  揃える。日時の目盛りラベルは一番下のプロットにだけ付ける（画面ではY軸目盛りラベルの幅の
+  違いでプロット領域がずれることがあるが、画像ではずれない）。
+- **各プロットに凡例**を入れ、そのプロットの系列名を示す。
+- 形式: **PNG**（既定）、**JPEG**、**TIFF**（ラスタ。画面上の大きさの2倍のピクセル数）、
+  **SVG**、**PDF**（ベクタ）。形式はファイルの拡張子で決まる。
+- **メタ情報の記載**: 画像の右下、プロットの下（プロットには重ねない）に次を記載する:
+  1. 元のParquetファイル名（現在のレイアウトがビューから読み込んだもの、またはビューとして
+     保存したものであればビュー名も）
+  2. 表示中の時間範囲（開始 – 終了）
+  3. 出力日時とアプリのバージョン
+  同じ情報を、形式が対応していればファイル自体のメタデータにも埋め込む。
+- 既定のファイル名は `<Parquetファイル名>_<出力日時>.png`。保存先の既定は前回保存したフォルダ
+  （初回はParquetファイルのあるフォルダ）。
+- ファイルが開かれていて、データのあるプロットが1つ以上あるときだけ実行できる。プロットの
+  再描画中の場合は、描画途中の状態を保存しないよう、描画完了後に再実行するよう案内する。
+- 詳細は [detailed_specification.md 19章](./detailed_specification.md#19-プロットの画像保存2026-09-30追加ユーザー要望)。
 
 ### 6. データ処理
 

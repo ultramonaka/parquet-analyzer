@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import logging
+from collections import ChainMap
 from pathlib import Path
 from typing import Mapping
 
@@ -12,6 +14,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDockWidget,
+    QFileDialog,
     QInputDialog,
     QLabel,
     QMainWindow,
@@ -26,19 +29,21 @@ from ..core.analysis import basic_stats, fft
 from ..core.background_worker import BackgroundWorker
 from ..core.column import Column, LazyColumn, LazyVariables, MaterializedColumn, WindowedColumn
 from ..core.data_source import ParquetDataSource
-from ..core.expression import ExpressionError, evaluate_expression
+from ..core.expression import ExpressionError, evaluate_expression, referenced_names
 from ..core.numeric import to_numeric
 from ..core.oplog import log_op
-from ..core.variable import DerivedVariable, Variable
+from ..core.variable import DerivedVariable, Variable, dependency_order, dependents_of
 from ..io import view as view_io
 from ..io.settings import FFT_ENABLED, Settings, load_settings, push_recent_folder, save_settings
 from .expression_bar import ExpressionBar
 from .folder_picker import pick_parquet_file
+from .image_export import EXPORT_FORMATS, export_plots_image
 from .i18n import set_language, tr
 from .navigator import NavigatorWidget
 from .plot_grid import PlotGridWidget
 from .settings_dialog import SettingsDialog
 from .stats_dialog import StatsDialog
+from .view_manager import ViewManagerDialog
 from .variable_panel import VariablePanel
 
 _APP_TITLE = f"Parquet Analyzer v{__version__}"
@@ -79,6 +84,9 @@ class MainWindow(QMainWindow):
         self._time_values: np.ndarray | None = None
         self._raw_variables: dict[str, Column] = {}  # _file_columns minus the current time column
         self._derived: dict[str, DerivedVariable] = {}
+        # Name of the view the current layout was loaded from / saved as, for the
+        # image-export stamp (detailed_specification.md 19.3); None after a plain open.
+        self._view_name: str | None = None
         self._fft_workers: set[BackgroundWorker] = set()  # strong refs; see BackgroundWorker for why
         self._stats_workers: set[BackgroundWorker] = set()  # strong refs; see BackgroundWorker for why
         # A separate pool from TimePlotWidget's (QThreadPool.globalInstance(), used for
@@ -194,6 +202,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         self._add_action("save_view", tr("toolbar.save_view"), toolbar, self.save_view_dialog)
         self._add_action("load_view", tr("toolbar.load_view"), toolbar, self.load_view_dialog)
+        self._add_action("export_image", tr("toolbar.export_image"), toolbar, self.export_image_dialog)
         toolbar.addSeparator()
         downsample_action = self._add_action(
             "toggle_downsample", tr("toolbar.toggle_downsample"), toolbar, self._on_toggle_downsample_enabled
@@ -217,6 +226,8 @@ class MainWindow(QMainWindow):
 
     def _wire_signals(self) -> None:
         self.variable_panel.variableDoubleClicked.connect(self.expression_bar.insert_variable_name)
+        self.variable_panel.editDerivedRequested.connect(self._on_edit_derived_requested)
+        self.variable_panel.deleteDerivedRequested.connect(self._on_delete_derived_requested)
         self.plot_grid.rangeChanged.connect(lambda r: self.navigator.set_selected_range(*r))
         self.navigator.rangeSelected.connect(lambda lo, hi: self.plot_grid.set_x_range(lo, hi))
         self.plot_grid.plotAdded.connect(self._wire_plot)
@@ -321,6 +332,8 @@ class MainWindow(QMainWindow):
         self._time_values = file_columns[time_column].values()  # already materialized above; free
         self._raw_variables = {k: v for k, v in file_columns.items() if k != time_column}
         self._derived = {}
+        self._view_name = None
+        self.expression_bar.cancel_edit()
         # downsample_enabled is per-view state (like x/y axis range), not a persisted
         # Setting — a plain file open (not via load_view, which applies the view's own
         # saved value right after this returns) resets to the default.
@@ -439,7 +452,7 @@ class MainWindow(QMainWindow):
         self._raw_variables = {k: v for k, v in self._file_columns.items() if k != name}
         self._raw_variables.update(derived_cache)
 
-        self.variable_panel.set_variables(list(self._raw_variables.keys()))
+        self.variable_panel.set_variables(list(self._raw_variables.keys()), self._derived_expressions())
         self._refresh_navigator_overview()
         self.plot_grid.set_time_axis_data(self._time_values)
 
@@ -502,11 +515,19 @@ class MainWindow(QMainWindow):
             arrays[name] = evaluate_expression(self._derived[name].expression, arrays)
         return arrays
 
+    def _derived_expressions(self) -> dict[str, str]:
+        return {n: d.expression for n, d in self._derived.items()}
+
     def _on_add_derived_variable(self, name: str, expression: str) -> None:
+        if name in self._derived:
+            # Redefinition via ExpressionBar: same path as the context-menu edit, so
+            # dependents and plotted curves don't keep showing stale values (18.2).
+            self.edit_derived_variable(name, expression)
+            return
         log_op("add_derived_variable", name=name, expression=expression)
         if self._time_values is None:
             raise ExpressionError(tr("error.open_file_first"))
-        if name in self._raw_variables and name not in self._derived:
+        if name in self._raw_variables:
             raise ExpressionError(tr("error.duplicate_variable_name", name=name))
         # Evaluate eagerly (via _all_arrays()'s lazy mapping, so this only
         # materializes the specific source columns the expression references, not
@@ -519,7 +540,91 @@ class MainWindow(QMainWindow):
         value = evaluate_expression(expression, self._all_arrays())
         self._derived[name] = DerivedVariable(name=name, expression=expression)
         self._raw_variables[name] = MaterializedColumn(np.asarray(value, dtype=np.float64))
-        self.variable_panel.add_variable(name)
+        self.variable_panel.add_variable(name, expression)
+
+    def edit_derived_variable(self, name: str, expression: str) -> None:
+        """Redefine a derived variable's formula, recomputing it and every derived
+        variable depending on it, and updating their plotted curves in place
+        (detailed_specification.md 18.2). All-or-nothing: any evaluation error
+        leaves the previous state untouched.
+        """
+        log_op("edit_derived_variable", name=name, expression=expression)
+        if name not in self._derived:
+            raise ExpressionError(tr("error.not_derived_variable", name=name))
+        exprs = self._derived_expressions()
+        dependents = dependents_of(name, exprs)
+        if referenced_names(expression) & ({name} | set(dependents)):
+            raise ExpressionError(tr("error.circular_definition", name=name))
+
+        exprs[name] = expression
+        overlay: dict[str, np.ndarray] = {}
+        arrays = ChainMap(overlay, self._all_arrays())  # new values shadow the cached (old) ones
+        for n in [name, *dependents]:
+            overlay[n] = np.asarray(evaluate_expression(exprs[n], arrays), dtype=np.float64)
+
+        self._derived[name] = DerivedVariable(name=name, expression=expression)
+        for n, value in overlay.items():
+            self._raw_variables[n] = MaterializedColumn(value)
+        self.variable_panel.add_variable(name, expression)
+        anchor = self.plot_grid.anchor_plot()
+        anchor_affected = False
+        for plot in self._time_plots():
+            for n in plot.series_names():
+                if n in overlay:
+                    plot.replace_series_y(n, overlay[n])
+                    anchor_affected |= plot is anchor
+        if anchor_affected:
+            self._refresh_navigator_overview()
+
+    def delete_derived_variable(self, name: str) -> None:
+        """Remove a derived variable from the list and every time-domain plot.
+        Refused if another derived variable still references it — no cascading
+        delete (detailed_specification.md 18.2).
+        """
+        log_op("delete_derived_variable", name=name)
+        if name not in self._derived:
+            raise ExpressionError(tr("error.not_derived_variable", name=name))
+        users = [
+            n for n, d in self._derived.items() if n != name and name in referenced_names(d.expression)
+        ]
+        if users:
+            raise ExpressionError(tr("error.derived_in_use", name=name, users=", ".join(users)))
+        anchor = self.plot_grid.anchor_plot()
+        anchor_affected = False
+        for plot in self._time_plots():
+            if name in plot.series_names():
+                plot.remove_series(name)
+                anchor_affected |= plot is anchor
+        del self._derived[name]
+        self._raw_variables.pop(name, None)
+        self.variable_panel.remove_variable(name)
+        if self.expression_bar.editing_name == name:
+            self.expression_bar.cancel_edit()
+        if anchor_affected:
+            self._refresh_navigator_overview()
+
+    def _time_plots(self) -> list:
+        # FFT plots hold static "<name> (FFT...)" results, never live variable references.
+        return [p for p in self.plot_grid.plots if p.x_axis_datetime]
+
+    def _on_edit_derived_requested(self, name: str) -> None:
+        # In the expression bar, not a modal dialog, so the variable list stays
+        # usable for drag/double-click insertion while editing (18.3).
+        if name in self._derived:
+            self.expression_bar.start_edit(name, self._derived[name].expression)
+
+    def _on_delete_derived_requested(self, name: str) -> None:
+        if name not in self._derived:
+            return
+        answer = QMessageBox.question(
+            self, tr("variable.delete_title"), tr("variable.delete_confirm", name=name)
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.delete_derived_variable(name)
+        except ExpressionError as e:
+            QMessageBox.warning(self, tr("variable.delete_title"), str(e))
 
     def _on_variable_dropped(self, plot, name: str) -> None:
         log_op("overlay_variable", plot=plot.plot_id, variable=name)
@@ -714,9 +819,11 @@ class MainWindow(QMainWindow):
             source=view_io.SourceDef(parquet_path=str(self._data_source.path), path_type="absolute"),
             plots=plots,
             x_axis_range=x_axis_range,
+            # Dependency order, not insertion order: an edit can make an earlier
+            # variable reference a later one (detailed_specification.md 18.4).
             derived_variables=[
-                view_io.DerivedVariableDef(name=d.name, expression=d.expression)
-                for d in self._derived.values()
+                view_io.DerivedVariableDef(name=n, expression=self._derived[n].expression)
+                for n in dependency_order(self._derived_expressions())
             ],
             downsample_enabled=self._downsample_enabled,
         )
@@ -726,17 +833,28 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, tr("toolbar.save_view"), tr("view.invalid_name", error=e))
             return
         log_op("save_view", name=view.view_name, path=str(path))
+        self._view_name = view.view_name
         QMessageBox.information(self, tr("toolbar.save_view"), tr("view.saved", path=path))
 
     def load_view_dialog(self) -> None:
-        names = view_io.list_views()
-        if not names:
-            QMessageBox.information(self, tr("toolbar.load_view"), tr("view.none_saved"))
+        """Open the view management window (detailed_specification.md 20.3)."""
+        # Minus the time column: load_view resolves against _raw_variables, which
+        # never holds it, so a view referencing it gets that item skipped (20.2).
+        available = (
+            {c for c in self._file_columns if c != self._time_column} if self._data_source is not None else None
+        )
+        dialog = ViewManagerDialog(available, self)
+        dialog.viewDeleted.connect(self._on_view_deleted)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        name, ok = QInputDialog.getItem(self, tr("toolbar.load_view"), tr("view.select_label"), names, editable=False)
-        if not ok:
-            return
-        self.load_view(name)
+        name = dialog.selected_view_name()
+        if name:
+            self.load_view(name)
+
+    def _on_view_deleted(self, name: str) -> None:
+        log_op("delete_view", name=name)
+        if name == self._view_name:
+            self._view_name = None
 
     def load_view(self, name: str) -> None:
         log_op("load_view", name=name)
@@ -768,10 +886,12 @@ class MainWindow(QMainWindow):
             self._clear_plot_grid()
             self._raw_variables = {k: v for k, v in self._file_columns.items() if k != self._time_column}
             self._derived = {}
+            self.expression_bar.cancel_edit()
             self.variable_panel.set_variables(list(self._raw_variables.keys()))
         elif not self.load_parquet(str(source_path)):
             return  # load_parquet already showed an error dialog
 
+        self._view_name = view.view_name
         # Each derived variable / series is applied independently below and a failure
         # (e.g. its source column doesn't exist in whichever file is actually open —
         # expected and common on the "reuse a layout across files that share *some*
@@ -785,7 +905,8 @@ class MainWindow(QMainWindow):
             # the loaded setting instead of drawing once and immediately redrawing.
             self._apply_downsample_enabled(view.downsample_enabled, update_action=True)
 
-            for derived in view.derived_variables:
+            saved = {d.name: d for d in view.derived_variables}
+            for derived in (saved[n] for n in dependency_order({n: d.expression for n, d in saved.items()})):
                 try:
                     self._on_add_derived_variable(derived.name, derived.expression)
                 except (ExpressionError, KeyError):
@@ -843,6 +964,79 @@ class MainWindow(QMainWindow):
             # Whatever ended up on plot 1 (fully applied, partially applied, or
             # untouched) is what the navigator should reflect.
             self._refresh_navigator_overview()
+
+    # -- image export ------------------------------------------------------------------
+
+    _EXPORT_FILTERS = (  # (i18n key, default suffix) in QFileDialog filter order
+        ("export.filter_png", ".png"),
+        ("export.filter_jpeg", ".jpg"),
+        ("export.filter_tiff", ".tif"),
+        ("export.filter_svg", ".svg"),
+        ("export.filter_pdf", ".pdf"),
+    )
+
+    def export_image_dialog(self) -> None:
+        """Save the plot area as an image (specification.md 5.14, detailed_specification.md 19.3)."""
+        if self._data_source is None:
+            QMessageBox.information(self, tr("toolbar.export_image"), tr("error.open_file_first"))
+            return
+        if "plot_grid" in self._busy_sources:
+            QMessageBox.information(self, tr("toolbar.export_image"), tr("export.busy"))
+            return
+        source = Path(self._data_source.path)
+        folder = self.settings.last_export_folder or str(source.parent)
+        default = Path(folder) / f"{source.stem}_{datetime.now():%Y%m%d_%H%M%S}.png"
+        filters = [tr(key) for key, _ in self._EXPORT_FILTERS]
+        path, selected = QFileDialog.getSaveFileName(
+            self, tr("toolbar.export_image"), str(default), ";;".join(filters)
+        )
+        if not path:
+            return
+        if Path(path).suffix.lower() not in EXPORT_FORMATS:
+            suffix = dict(zip(filters, (sfx for _, sfx in self._EXPORT_FILTERS))).get(selected, ".png")
+            path += suffix
+        self.export_image(path)
+
+    def export_image(self, path: str) -> bool:
+        log_op("export_image", path=path, format=Path(path).suffix.lower())
+        now = datetime.now()
+        lines, metadata = self._image_stamp(now)
+        snapshots = [s for s in (p.export_snapshot() for p in self.plot_grid.plots) if s.series]
+        if not snapshots:
+            QMessageBox.information(self, tr("toolbar.export_image"), tr("export.nothing_to_export"))
+            return False
+        size_px = (self.plot_grid.width(), self.plot_grid.height())
+        try:
+            export_plots_image(snapshots, path, lines, metadata, size_px)
+        except (OSError, ValueError) as e:
+            logger.exception("failed to export image: %s", path)
+            QMessageBox.warning(self, tr("toolbar.export_image"), tr("export.failed", error=e))
+            return False
+        self.settings.last_export_folder = str(Path(path).resolve().parent)
+        save_settings(self.settings)
+        self.statusBar().showMessage(tr("export.saved", path=path), 10_000)
+        return True
+
+    def _image_stamp(self, now: datetime) -> tuple[list[str], dict[str, str]]:
+        """(footer lines, embedded metadata) for export_image — detailed_specification.md 19.3."""
+        source = Path(self._data_source.path)
+        software = f"Parquet Analyzer v{__version__}"
+        metadata = {"Title": source.name, "Source": str(source)}
+        first = source.name
+        if self._view_name:
+            first += "  |  " + tr("export.stamp_view", name=self._view_name)
+            metadata["View"] = self._view_name
+        lines = [first]
+        time_plots = [p for p in self.plot_grid.plots if p.x_axis_datetime and not p.is_empty()]
+        if time_plots:
+            x_lo, x_hi = time_plots[0].getViewBox().viewRange()[0]
+            start, end = time_plots[0].format_x(x_lo), time_plots[0].format_x(x_hi)
+            lines.append(tr("export.stamp_range", start=start, end=end))
+            metadata["Range"] = f"{start} - {end}"
+        lines.append(tr("export.stamp_exported", when=f"{now:%Y-%m-%d %H:%M:%S}") + "  |  " + software)
+        metadata["CreationTime"] = now.isoformat(timespec="seconds")
+        metadata["Software"] = software
+        return lines, metadata
 
     # -- settings ----------------------------------------------------------------------
 

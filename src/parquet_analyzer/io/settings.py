@@ -35,6 +35,7 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "load_view": "",
     "toggle_downsample": "",
     "cursor": "",
+    "export_image": "",
 }
 
 # Display labels for these ids (shortcuts, scroll actions/modifiers) live in
@@ -90,6 +91,7 @@ class Settings:
     window_state: str | None = None  # base64 QMainWindow.saveState() (dock/toolbar layout)
     last_data_folder: str | None = None
     recent_data_folders: list[str] = field(default_factory=list)
+    last_export_folder: str | None = None  # detailed_specification.md 19.2
     recent_files: list[str] = field(default_factory=list)
     recent_views: list[str] = field(default_factory=list)
     default_overlay: bool = False
