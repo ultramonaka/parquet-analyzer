@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConversionError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    except FileNotFoundError as e:
+    except OSError as e:  # missing input, unwritable/invalid output path, ...
         print(f"error: {e}", file=sys.stderr)
         return 1
 

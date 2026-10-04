@@ -38,12 +38,13 @@ def test_noop_when_n_out_covers_all_points():
     np.testing.assert_array_equal(yd, y)
 
 
-def test_noop_when_n_out_at_or_below_two():
+def test_n_out_at_or_below_two_is_treated_as_three():
+    # data 29.5 (was: returned every point)
     x = np.arange(10, dtype=float)
     y = np.arange(10, dtype=float)
     xd, yd = lttb(x, y, 2)
-    np.testing.assert_array_equal(xd, x)
-    np.testing.assert_array_equal(yd, y)
+    assert len(xd) == len(yd) == 3
+    assert xd[0] == 0 and xd[-1] == 9
 
 
 def test_small_and_uneven_bucket_sizes_do_not_crash():

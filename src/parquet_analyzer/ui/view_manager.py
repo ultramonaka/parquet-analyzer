@@ -22,9 +22,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..core.expression import ExpressionError, referenced_names
+from ..core.expression import ExpressionError, referenced_functions, referenced_names
+from ..core.functions import check_expression_calls
+from ..core.expression import UnknownFunctionError
 from ..core.variable import dependency_order
 from ..io import view as view_io
+from . import messages
 from .i18n import tr
 
 _MISSING_COLOR = QColor("#d32f2f")
@@ -45,13 +48,50 @@ def _swatch(color: str) -> QIcon:
     return QIcon(pm)
 
 
+def view_error_text(e: BaseException) -> str:
+    """User-facing text for a view load failure (persistence 35): a `ViewFormatError` becomes
+    "<item path>: <expected type> required (<actual type>)" translated; anything else (bad
+    JSON, unreadable file, ...) keeps its own message."""
+    if not isinstance(e, view_io.ViewFormatError):
+        return str(e)
+    path = tr("view.type_top") if e.path == "(top level)" else e.path
+    if e.expected == "required":
+        return tr("view.format_required", path=path)
+    return tr(
+        "view.format_wrong_type", path=path, expected=tr(f"view.type_{e.expected}"), actual=_actual_text(e.actual)
+    )
+
+
+def _actual_text(kind: str) -> str:
+    key = f"view.type_{kind}"
+    return tr(key) if kind in ("object", "list", "string", "number", "bool", "null") else kind
+
+
 class ViewManagerDialog(QDialog):
     viewDeleted = Signal(str)
 
-    def __init__(self, available_columns: set[str] | None, parent=None) -> None:
+    def __init__(
+        self,
+        available_columns: set[str] | None,
+        parent=None,
+        all_columns: set[str] | None = None,
+        available_functions: set[str] | None = None,
+        registry=None,
+    ) -> None:
+        """`available_columns`: open file's columns minus the current time axis (None = no
+        file open). `all_columns`: every column of the open file, so a view's saved time axis
+        (persistence 33) can be checked and the available set recomputed for that axis.
+        `available_functions`/`registry`: user functions and maps that exist now, so derived
+        variables using a missing one (or a mismatched signature) are marked like load_view
+        skips them (expressions 26.5/27.5)."""
         super().__init__(parent)
+        self._registry = registry  # also enables the arity / keyword check of calls (26.5)
+        # Names of the callable user functions/maps; None = don't check (26.5, 27.5).
+        self._functions = available_functions
+        self._missing_function: dict[str, str] = {}  # derived name -> message for a call-related cause
         self.setWindowTitle(tr("view.manager_title"))
         self._available = available_columns
+        self._all_columns = all_columns
 
         self.view_list = QListWidget()
         self.details = QTreeWidget()
@@ -97,7 +137,7 @@ class ViewManagerDialog(QDialog):
         name = self.selected_view_name()
         if name is None:
             return
-        answer = QMessageBox.question(
+        answer = messages.question(
             self, tr("view.manager_title"), tr("view.delete_confirm", name=name)
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -105,7 +145,7 @@ class ViewManagerDialog(QDialog):
         try:
             view_io.delete_view(name)
         except OSError as e:
-            QMessageBox.warning(self, tr("view.manager_title"), tr("view.delete_failed", error=e))
+            messages.warning(self, tr("view.manager_title"), tr("view.delete_failed", error=e))
             return
         row = self.view_list.currentRow()
         self.view_list.takeItem(row)  # selection moves to a neighbour (next, else previous)
@@ -126,18 +166,22 @@ class ViewManagerDialog(QDialog):
             saved_at = view_io.view_saved_at(name)
             missing_series, missing_derived = self._missing(view)
         except Exception as e:  # noqa: BLE001 (shown in the details, not swallowed)
-            item = QTreeWidgetItem([tr("view.detail_unreadable", error=e)])
+            item = QTreeWidgetItem([tr("view.detail_unreadable", error=view_error_text(e))])
             item.setForeground(0, QBrush(_MISSING_COLOR))
             self.details.addTopLevelItem(item)
             return
         self.load_button.setEnabled(True)
 
-        n_missing = len(missing_series) + len(missing_derived)
+        n_missing = len(missing_series) + len(missing_derived) + (1 if self._time_column_missing(view) else 0)
         if n_missing:
             self._top(tr("view.detail_missing_summary", m=n_missing), red=True)
         src = self._top(tr("view.detail_source", path=view.source.parquet_path))
         src.setToolTip(0, tr("view.detail_source_tooltip", type=view.source.path_type))
         self._top(tr("view.detail_saved", time=saved_at.strftime("%Y-%m-%d %H:%M:%S")))
+        if view.time_column is not None:
+            tc = self._top(tr("view.detail_time_column", name=view.time_column))
+            if self._time_column_missing(view):
+                self._mark_missing(tc)
         if view.x_axis_range is not None:
             start, end = view.x_axis_range
             self._top(tr("view.detail_time_range", start=format_timestamp(start), end=format_timestamp(end)))
@@ -154,7 +198,7 @@ class ViewManagerDialog(QDialog):
             for d in view.derived_variables:
                 child = QTreeWidgetItem(parent, [f"{d.name} = {d.expression}"])
                 if d.name in missing_derived:
-                    self._mark_missing(child)
+                    self._mark_missing(child, self._missing_function.get(d.name))
             parent.setExpanded(True)
         state = tr("view.state_on") if view.downsample_enabled else tr("view.state_off")
         self._top(tr("view.detail_downsample", state=state))
@@ -167,10 +211,32 @@ class ViewManagerDialog(QDialog):
         return item
 
     @staticmethod
-    def _mark_missing(item: QTreeWidgetItem) -> None:
-        item.setText(0, item.text(0) + tr("view.detail_missing_suffix"))
+    def _mark_missing(item: QTreeWidgetItem, function: str | None = None) -> None:
+        if function is not None:  # the cause is a function/map absent from the registry (26.5)
+            item.setText(0, item.text(0) + " \u2014 " + function)
+        else:
+            item.setText(0, item.text(0) + tr("view.detail_missing_suffix"))
         item.setForeground(0, QBrush(_MISSING_COLOR))
         item.setToolTip(0, tr("view.detail_missing_tooltip"))
+
+    def _time_column_missing(self, view: view_io.View) -> bool:
+        """Same rule as `MainWindow.load_view`: a saved time column the open file lacks."""
+        return (
+            view.time_column is not None
+            and self._all_columns is not None
+            and view.time_column not in self._all_columns
+        )
+
+    def _effective_available(self, view: view_io.View) -> set[str]:
+        """Variables `load_view` resolves against: after switching to the view's time axis
+        that column is the axis (not a variable) and the current one is an ordinary variable."""
+        if (
+            view.time_column is not None
+            and self._all_columns is not None
+            and view.time_column in self._all_columns
+        ):
+            return self._all_columns - {view.time_column}
+        return self._available
 
     def _missing(self, view: view_io.View) -> tuple[set[str], set[str]]:
         """Series variables / derived names that `MainWindow.load_view` would skip,
@@ -178,19 +244,37 @@ class ViewManagerDialog(QDialog):
         is missing too (detailed_specification.md 20.2). Empty when no file is open."""
         if self._available is None:
             return set(), set()
+        available = self._effective_available(view)
         exprs = {d.name: d.expression for d in view.derived_variables}
+        self._missing_function = {}
         resolvable: set[str] = set()
         missing_derived: set[str] = set()
         for name in dependency_order(exprs):
             try:
-                refs = referenced_names(exprs[name])
+                refs = referenced_names(exprs[name])  # also the syntax check: plain "missing" if it fails
+                absent = sorted(referenced_functions(exprs[name]) - self._functions) if self._functions is not None else []
             except ExpressionError:
                 missing_derived.add(name)
                 continue
-            if all(r in self._available or r in resolvable for r in refs):
+            if self._registry is not None:  # unknown function / wrong arity / bad keyword (what evaluation rejects)
+                try:
+                    check_expression_calls(exprs[name], self._registry)
+                except UnknownFunctionError as e:
+                    missing_derived.add(name)
+                    self._missing_function[name] = tr("error.unknown_function", name=e.name)
+                    continue
+                except ExpressionError as e:
+                    missing_derived.add(name)
+                    self._missing_function[name] = str(e)
+                    continue
+            if absent:
+                missing_derived.add(name)
+                self._missing_function[name] = tr("error.unknown_function", name=absent[0])
+                continue
+            if all(r in available or r in resolvable for r in refs):
                 resolvable.add(name)
             else:
                 missing_derived.add(name)
-        known = self._available | resolvable
+        known = available | resolvable
         missing_series = {s.variable for p in view.plots for s in p.series if s.variable not in known}
         return missing_series, missing_derived

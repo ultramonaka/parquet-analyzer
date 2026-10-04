@@ -13,7 +13,7 @@ def test_adding_many_plots_and_waveforms_does_not_crash(qapp, isolated_config, s
     """Regression test: repeatedly adding plots and overlaying variables used to
     risk a crash from the background worker being garbage-collected (along with its
     QObject signal) before its queued cross-thread `finished` signal was
-    delivered — see BackgroundWorker.__init__ and TimePlotWidget._active_workers.
+    delivered — see WorkerHub (37.1) and TimePlotWidget._hub.
     """
     win = MainWindow()
     win.resize(800, 600)

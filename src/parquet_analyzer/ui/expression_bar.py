@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QMessageBox, QPushButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QWidget
 
 from ..core.expression import ExpressionError
+from . import messages
 from .i18n import tr
 
 
@@ -16,6 +17,8 @@ class ExpressionBar(QWidget):
     from the variable list while editing).
     """
 
+    reference_requested = Signal()  # the "Functions..." button (38)
+
     def __init__(self, evaluate_callback, parent: QWidget | None = None):
         super().__init__(parent)
         self._evaluate_callback = evaluate_callback
@@ -23,8 +26,12 @@ class ExpressionBar(QWidget):
 
         self.name_edit = QLineEdit(placeholderText=tr("expr.name_placeholder"))
         self.expr_edit = QLineEdit(placeholderText=tr("expr.expr_placeholder"))
+        self.expr_edit.setToolTip(tr("expr.expr_tooltip"))
         self.add_button = QPushButton(tr("expr.add_button"))
         self.add_button.clicked.connect(self._on_add_clicked)
+        self.reference_button = QPushButton(tr("fnref.button"))
+        self.reference_button.setToolTip(tr("fnref.button_tooltip"))
+        self.reference_button.clicked.connect(self.reference_requested)
         self.cancel_button = QPushButton(tr("expr.cancel_button"))
         self.cancel_button.clicked.connect(self.cancel_edit)
         self.cancel_button.hide()
@@ -37,6 +44,7 @@ class ExpressionBar(QWidget):
         layout.addWidget(self.name_edit, 1)
         layout.addWidget(self.expr_edit, 3)
         layout.addWidget(self.add_button)
+        layout.addWidget(self.reference_button)
         layout.addWidget(self.cancel_button)
 
     @property
@@ -73,11 +81,11 @@ class ExpressionBar(QWidget):
         name = self.name_edit.text().strip()
         expr = self.expr_edit.text().strip()
         if not name or not expr:
-            QMessageBox.warning(self, tr("expr.warning_title"), tr("expr.warning_body"))
+            messages.warning(self, tr("expr.warning_title"), tr("expr.warning_body"))
             return
         try:
             self._evaluate_callback(name, expr)
         except ExpressionError as e:
-            QMessageBox.warning(self, tr("expr.error_title"), str(e))
+            messages.warning(self, tr("expr.error_title"), str(e))
             return  # stays in edit mode (if editing) with the user's text intact
         self._reset()

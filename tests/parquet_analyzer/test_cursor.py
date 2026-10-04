@@ -24,6 +24,9 @@ class _FakeClickEvent:
     def button(self):
         return self._button
 
+    def isAccepted(self):  # noqa: N802 (mirrors pyqtgraph's event API)
+        return False
+
     def scenePos(self):
         return self._scene_pos
 

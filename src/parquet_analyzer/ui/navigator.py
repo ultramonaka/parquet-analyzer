@@ -30,17 +30,37 @@ class NavigatorWidget(pg.PlotWidget):
         self._x_full: np.ndarray | None = None
 
     def set_overview_data(self, x: np.ndarray, y: np.ndarray) -> None:
+        """Overview curve + region bounds. Only points whose x and y are both finite are
+        used, and the bounds/initial selection are the finite min/max of x (not x[0]/x[-1],
+        which may be NaN or not the extremes); no finite x -> empty overview, range left
+        alone (detailed_specification.md 29.4)."""
+        x = np.asarray(x)
+        y = np.asarray(y)
         self._x_full = x
-        x_ds, y_ds = lttb(x, y, _OVERVIEW_POINTS)
+        n = min(len(x), len(y))
+        x_c, y_c = x[:n], y[:n]
+        finite = np.isfinite(x_c) & np.isfinite(y_c)
+        if not finite.all():
+            x_c, y_c = x_c[finite], y_c[finite]
+        x_ds, y_ds = lttb(x_c, y_c, _OVERVIEW_POINTS)
         self._curve.setData(x_ds, y_ds)
-        if len(x):
-            self._region.setBounds([x[0], x[-1]])
-            self.set_selected_range(x[0], x[-1])
+        x_ok = x[np.isfinite(x)]
+        if len(x_ok):
+            lo, hi = float(x_ok.min()), float(x_ok.max())
+            self._region.setBounds([lo, hi])
+            self.set_selected_range(lo, hi)
 
     def set_selected_range(self, x_min: float, x_max: float) -> None:
+        if not (np.isfinite(x_min) and np.isfinite(x_max)):
+            return  # never hand pyqtgraph a non-finite region bound (data 29.4)
         self._region.blockSignals(True)
         self._region.setRegion((x_min, x_max))
         self._region.blockSignals(False)
+
+    def selected_range(self) -> tuple[float, float]:
+        """The selection window's current (x_min, x_max) (read by the operation log, 30.2)."""
+        lo, hi = self._region.getRegion()
+        return float(lo), float(hi)
 
     def _on_region_changed(self) -> None:
         x_min, x_max = self._region.getRegion()

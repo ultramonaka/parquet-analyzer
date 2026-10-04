@@ -44,6 +44,13 @@ class StatsDialog(QDialog):
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         for row, (name, stats) in enumerate(results.items()):
+            if "error" in stats:
+                # One variable's computation failed (28.2): say so in its row; the
+                # other rows are unaffected.
+                table.setItem(row, 0, QTableWidgetItem(name))
+                table.setItem(row, 1, QTableWidgetItem(tr("stats.failed", message=stats["error"])))
+                table.setSpan(row, 1, 1, len(columns) - 1)
+                continue
             values = [
                 name,
                 str(stats["count"]),

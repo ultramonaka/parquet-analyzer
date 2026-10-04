@@ -9,10 +9,14 @@ def lttb(x: np.ndarray, y: np.ndarray, n_out: int) -> tuple[np.ndarray, np.ndarr
     """Largest-Triangle-Three-Buckets downsampling (specification.md 5.4).
 
     Reduces (x, y) to at most n_out points while keeping the visual shape
-    (peaks/troughs) intact, unlike naive stride sampling.
+    (peaks/troughs) intact, unlike naive stride sampling. An n_out below 3 (e.g. a
+    zero-width plot) is treated as 3 -- first point, one selected point, last point
+    (detailed_specification.md data 29.5); an input of 3 points or fewer is returned
+    unchanged.
     """
     n = len(x)
-    if n_out >= n or n_out <= 2:
+    n_out = max(n_out, 3)
+    if n_out >= n:
         return x, y
 
     sampled_x = np.empty(n_out, dtype=x.dtype)

@@ -18,7 +18,7 @@ def test_remove_plot_defers_deletion_until_pending_jobs_finish(qapp):
     """Regression test: deleting a plot immediately (deleteLater()) while it still had
     in-flight downsample workers risked the worker's queued `finished` signal arriving
     after the C++ widget was actually destroyed, crashing when the slot touched it (the
-    same class of bug fixed for BackgroundWorker's own lifetime — see its __init__).
+    same class of bug fixed for the old BackgroundWorker lifetime — see WorkerHub).
     remove_plot must not call deleteLater() until pending_downsample_count() is 0.
     """
     grid = PlotGridWidget()
@@ -30,7 +30,9 @@ def test_remove_plot_defers_deletion_until_pending_jobs_finish(qapp):
     assert plot.pending_downsample_count() > 0
 
     delete_calls = []
-    plot.deleteLater = lambda: delete_calls.append(1)
+    # The pane owns the plot (detailed_specification.md 22.1), so it is the pane that
+    # must not be deleted while jobs are in flight.
+    grid._panes[plot].deleteLater = lambda: delete_calls.append(1)
 
     grid.remove_plot(plot)
     assert not delete_calls, "deleteLater() must not fire while jobs are still in flight"

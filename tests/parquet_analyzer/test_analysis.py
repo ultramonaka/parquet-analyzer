@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from parquet_analyzer.core.analysis import basic_stats, delta, fft, rolling_mean
+from parquet_analyzer.core.analysis import basic_stats, delta, fft, rolling_mean, rolling_nanmean
 
 
 def test_delta_first_value_zero_and_length_matches():
@@ -110,3 +110,56 @@ def test_basic_stats_on_empty_array_does_not_crash():
     assert stats["count"] == 0
     assert stats["nan_count"] == 0
     assert np.isnan(stats["min"])
+
+
+# --- rolling_nanmean (expressions.ja.md 31) ---
+_NAN = float("nan")
+
+
+def test_rolling_nanmean_equals_rolling_mean_without_nan():
+    y = np.random.default_rng(0).normal(size=50)
+    for w in (1, 3, 4, 10):
+        np.testing.assert_allclose(rolling_nanmean(y, w), rolling_mean(y, w))
+
+
+def test_rolling_nanmean_nan_in_middle_ignored_and_rolling_mean_propagates():
+    y = np.array([1.0, 2.0, _NAN, 4.0, 5.0])
+    np.testing.assert_allclose(rolling_nanmean(y, 3), [1.5, 1.5, 3.0, 4.5, 4.5])
+    assert np.isnan(rolling_mean(y, 3)[1:4]).all()
+
+
+def test_rolling_nanmean_nan_at_start_and_end():
+    y = np.array([_NAN, 2.0, 4.0, 6.0, _NAN])
+    np.testing.assert_allclose(rolling_nanmean(y, 3), [2.0, 3.0, 4.0, 5.0, 6.0])
+
+
+def test_rolling_nanmean_all_nan_window_is_nan():
+    y = np.array([1.0, _NAN, _NAN, _NAN, 5.0])
+    r = rolling_nanmean(y, 3)
+    assert np.isnan(r[2])
+    np.testing.assert_allclose(r[[0, 1, 3, 4]], [1.0, 1.0, 5.0, 5.0])
+    assert np.isnan(rolling_nanmean(np.array([_NAN, _NAN]), 2)).all()
+
+
+def test_rolling_nanmean_window_one():
+    r = rolling_nanmean(np.array([1.0, _NAN, 3.0]), 1)
+    np.testing.assert_allclose(r[[0, 2]], [1.0, 3.0])
+    assert np.isnan(r[1])
+
+
+def test_rolling_nanmean_window_longer_than_data():
+    y = np.array([1.0, _NAN, 3.0])
+    # Window is clamped to len(y) like rolling_mean (edges see only part of it).
+    np.testing.assert_allclose(rolling_nanmean(y, 100), [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(rolling_nanmean(y, 100), rolling_nanmean(y, 3))
+
+
+def test_rolling_nanmean_integer_array_and_empty():
+    a = np.array([1, 2, 3, 4])
+    np.testing.assert_allclose(rolling_nanmean(a, 3), rolling_mean(a, 3))
+    assert len(rolling_nanmean(np.array([]), 5)) == 0
+
+
+def test_rolling_nanmean_rejects_non_positive_window():
+    with pytest.raises(ValueError):
+        rolling_nanmean(np.array([1.0, 2.0]), 0)

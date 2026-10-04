@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import itertools
+import time
 from datetime import datetime
 
 import numpy as np
@@ -8,16 +10,26 @@ import pyqtgraph as pg
 from PySide6.QtCore import QThreadPool, Qt, QTimer, Signal
 from PySide6.QtWidgets import QMenu, QWidget
 
-from ..core.background_worker import BackgroundWorker
+from ..core.background_worker import WorkerHub
+from ..core.column import DerivedColumn
 from ..core.downsample import lttb
 from ..core.oplog import log_op
+from .. import features
 from ..io.settings import DEFAULT_SCROLL_BINDINGS, normalize_scroll_bindings
 from .i18n import tr
+
+# MIME type of a plot-reorder drag (detailed_specification.md 22.3). Deliberately carries no
+# text: the variable drop above accepts anything with hasText().
+PLOT_MIME = "application/x-parquet-analyzer-plot"
 
 _COLOR_CYCLE = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
 ]
+
+_HOVER_COLOR = "#bbbbbb"  # hover line (39.1): light grey (visible on the dark plot background), dotted -- unlike the orange dashed placed cursors
+_HOVER_THROTTLE_MS = 16  # ~60 Hz cap on mouse-move handling (39.1)
+_HOVER_SETTLE_MS = 100  # mouse idle this long -> replace the approximate values with real samples (39.2)
 
 _CURSOR_COLOR = "#ffaa00"  # distinct from _COLOR_CYCLE so a cursor never blends into a series
 
@@ -54,6 +66,91 @@ _PYRAMID_PREFERRED_ROW_THRESHOLD = 5_000_000
 # pool (self._thread_pool, same as real fetches) as a result — no separate pool.
 
 
+# Legend label of a hidden series (23.1). Clearly dimmer than pyqtgraph's default label
+# foreground (#969696), or a hidden series would not look any different.
+_HIDDEN_LABEL_COLOR = "#505050"
+_SELECTED_PEN_WIDTH = 2.5  # curve width of the selected series (23.2)
+_NORMAL_PEN_WIDTH = 1
+
+
+class _SeriesSample(pg.ItemSample):
+    """Legend line sample whose click toggles the series through the plot's own state
+    (detailed_specification.md 23.1). pyqtgraph's default ItemSample.mouseClickEvent flips
+    the curve's visibility directly, which would bypass TimePlotWidget's `visible` flag
+    (the single source of truth) -- so it is overridden to route through it instead."""
+
+    def mouseClickEvent(self, event):  # noqa: N802 (pyqtgraph override)
+        if event.button() == Qt.MouseButton.LeftButton:
+            owner = getattr(self.item, "_pa_owner", None)
+            if owner is not None:
+                plot, name = owner
+                plot.set_series_visible(name, not plot.is_series_visible(name))
+        event.accept()
+        self.update()
+
+
+class _SeriesLegend(pg.LegendItem):
+    """LegendItem whose name labels are clickable (-> series selection, 23.2)."""
+
+    def addItem(self, item, name):  # noqa: N802 (pyqtgraph override)
+        super().addItem(item, name)
+        _sample, label = self.items[-1]
+
+        def on_click(event, item=item):
+            if event.button() == Qt.MouseButton.LeftButton:
+                owner = getattr(item, "_pa_owner", None)
+                if owner is not None:
+                    plot, series_name = owner
+                    plot.seriesLabelClicked.emit(plot, series_name)
+            event.accept()
+
+        label.mouseClickEvent = on_click  # found by the scene's click dispatch via hasattr
+
+
+class AlignedAxisItem(pg.AxisItem):
+    """Left axis whose actual width is set from outside (detailed_specification.md 22.6).
+
+    pyqtgraph sizes an AxisItem to its own tick text, so stacked plots' plot areas start
+    at different x. This records that natural width (``_updateWidth`` override), notifies
+    when it changes, and takes its real width from ``set_aligned_width`` so
+    ``PlotGridWidget`` can give every plot the widest one.
+    """
+
+    naturalWidthChanged = Signal()
+
+    # Class-level defaults: pyqtgraph calls _updateWidth from AxisItem.__init__, before
+    # our own __init__ body runs.
+    _natural_width: float = 0.0
+    _aligned_width: float | None = None
+
+    def natural_width(self) -> float:
+        return self._natural_width
+
+    def set_aligned_width(self, width: float | None) -> None:
+        if width == self._aligned_width:
+            return
+        self._aligned_width = width
+        self._updateWidth()
+
+    def _updateWidth(self) -> None:  # noqa: N802 (pyqtgraph override)
+        fixed = self.fixedWidth
+        self.fixedWidth = None  # let pyqtgraph compute its own tick-text-based width
+        try:
+            super()._updateWidth()
+        finally:
+            self.fixedWidth = fixed
+        natural = float(self.maximumWidth())
+        if fixed is not None:
+            natural = float(fixed)
+        changed = natural != self._natural_width
+        self._natural_width = natural
+        width = natural if self._aligned_width is None else max(natural, self._aligned_width)
+        self.setMaximumWidth(width)
+        self.setMinimumWidth(width)
+        if changed:
+            self.naturalWidthChanged.emit()
+
+
 class TimePlotWidget(pg.PlotWidget):
     """A single time-series plot (specification.md 5.1/5.3/5.4).
 
@@ -72,10 +169,21 @@ class TimePlotWidget(pg.PlotWidget):
     variableDropped = Signal(object, str)  # self, variable_name
     downsampleStarted = Signal()
     downsampleFinished = Signal()
+    renderFailed = Signal(object, str, str)  # self, series name, message (detailed_specification.md 28.2)
     coarseRenderingChanged = Signal(object, bool)  # self, True while >=1 series shows a pyramid envelope
     cursorAddRequested = Signal(object, float)  # self, x -- background click while cursor mode is on
     cursorMoveRequested = Signal(object, str, float)  # self, cursor_id, new x -- dragged in this plot
     cursorRemoveRequested = Signal(object, str)  # self, cursor_id -- clicked (not dragged) in this plot
+    # Per-series operations (detailed_specification.md 23)
+    seriesVisibilityChanged = Signal(object, str, bool)  # self, name, visible
+    seriesLabelClicked = Signal(object, str)  # self, name -- legend name label clicked
+    seriesRemoved = Signal(object, str)  # self, name -- left this plot (removed or transferred)
+    removeSeriesRequested = Signal(object, str)  # context menu "Delete series"
+    separateSeriesRequested = Signal(object, str)  # context menu "Separate series into new plot"
+    backgroundClicked = Signal(object)  # self -- left click on empty plot area
+    linkXRequested = Signal(object, bool)  # self, desired linked state -- context menu "Link X axis" (24.3)
+    statsForRangeRequested = Signal(object)  # self -- context menu "Stats for this range" (24.2)
+    hoverXChanged = Signal(object, object)  # self, x (float) or None -- mouse moved/left (39.1)
 
     def __init__(
         self,
@@ -90,10 +198,21 @@ class TimePlotWidget(pg.PlotWidget):
         # granularity with zoom level (year/month when zoomed out, down to
         # hour:minute:second.millisecond when zoomed into a few seconds). Not used for
         # non-time X axes (e.g. FFT plots, whose X is frequency in Hz).
-        axis_items = {"bottom": pg.DateAxisItem()} if x_axis_datetime else None
+        # The left axis is an AlignedAxisItem for every plot (time and FFT) so the grid
+        # can line up all plot areas (22.6).
+        axis_items = {"left": AlignedAxisItem("left")}
+        if x_axis_datetime:
+            axis_items["bottom"] = pg.DateAxisItem()
         super().__init__(parent, axisItems=axis_items)
         self.plot_id = plot_id
         self.x_axis_datetime = x_axis_datetime
+        # Independent X axis (detailed_specification.md 24.1): owned/mutated by PlotGridWidget
+        # (set_plot_x_linked); a frequency-domain plot is never part of the linked group.
+        self.x_linked = x_axis_datetime
+        # UI hints, refreshed by PlotGridWidget._refresh_x_link_ui (24.3): whether the menu
+        # shows "Link X axis" at all (feature flag) and whether toggling it is allowed now.
+        self.x_link_menu_visible = False
+        self.x_link_toggle_allowed = False
         self.auto_redraw = auto_redraw
         self.downsample_pixel_ratio = downsample_pixel_ratio
         self._downsample_enabled = True
@@ -103,20 +222,39 @@ class TimePlotWidget(pg.PlotWidget):
         self.scroll_bindings = normalize_scroll_bindings(scroll_bindings)
 
         self._series: dict[str, dict] = {}  # name -> {x, y, curve, color, generation}
+        self._seed_x_range: tuple[float, float] | None = None  # consumed by the next first-series install
         self._coarse_series: set[str] = set()  # names currently shown via a pyramid envelope
         self._color_cycle = itertools.cycle(_COLOR_CYCLE)
         self._cursor_mode_enabled = False
         self._cursors: dict[str, dict] = {}  # cursor_id -> {"line": InfiniteLine, "label": TextItem}
         self.scene().sigMouseClicked.connect(self._on_scene_mouse_clicked)
-        self._thread_pool = QThreadPool.globalInstance()
-        self._active_workers: set[BackgroundWorker] = set()  # keep alive until `finished` is handled
+        # Hover value readout (detailed_specification.md 39): items are created lazily.
+        self._hover_enabled = False
+        self._hover_x: float | None = None
+        self._hover_line: pg.InfiniteLine | None = None
+        self._hover_label: pg.TextItem | None = None
+        self._hover_last_move = 0.0
+        self._hover_pending = None
+        self._hover_throttle = QTimer(self)
+        self._hover_throttle.setSingleShot(True)
+        self._hover_throttle.timeout.connect(self._flush_hover_move)
+        self._hover_settle = QTimer(self)
+        self._hover_settle.setSingleShot(True)
+        self._hover_settle.setInterval(_HOVER_SETTLE_MS)
+        self._hover_settle.timeout.connect(self._settle_hover)
+        # One hub per plot on the global pool (detailed_specification.md 37.1); its `pending`
+        # dict is the in-flight bookkeeping (`_active_workers`).
+        self._hub = WorkerHub(QThreadPool.globalInstance())
         self._last_redraw_x_range: tuple[float, float] | None = None
         self._redraw_debounce = QTimer(self)
         self._redraw_debounce.setSingleShot(True)
         self._redraw_debounce.timeout.connect(self._redraw_all_series)
 
         self.showGrid(x=True, y=True, alpha=0.3)
-        self.addLegend()
+        # Custom legend (23.1/23.2): sample click goes through our visible flag, label click selects.
+        legend = _SeriesLegend(offset=(30, 30), sampleType=_SeriesSample)
+        self.getPlotItem().legend = legend
+        legend.setParentItem(self.getViewBox())
         self.setMenuEnabled(False)  # replaced by our own context menu
         self.setAcceptDrops(True)
         # We render only the visible window's data for performance (_redraw_series), which
@@ -131,12 +269,31 @@ class TimePlotWidget(pg.PlotWidget):
     # -- drag & drop (overlay a variable from VariablePanel) --------------------
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        if self._is_plot_drag(event):
+            event.ignore()  # a pane reorder drag belongs to PlotGridWidget (22.3)
+            return
         if event.mimeData().hasText():
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        if self._is_plot_drag(event):
+            event.ignore()
+            return
         if event.mimeData().hasText():
             event.acceptProposedAction()
+
+    @staticmethod
+    def _is_plot_drag(event) -> bool:
+        return event.mimeData().hasFormat(PLOT_MIME)
+
+    def set_x_tick_labels_visible(self, visible: bool) -> None:
+        """Show/hide the bottom axis' tick label text, keeping tick marks and the grid
+        (detailed_specification.md 22.4). pyqtgraph shrinks the axis height itself when
+        showValues is off, so no explicit setHeight is needed."""
+        self.getAxis("bottom").setStyle(showValues=bool(visible))
+
+    def x_tick_labels_visible(self) -> bool:
+        return bool(self.getAxis("bottom").style["showValues"])
 
     def dropEvent(self, event) -> None:  # noqa: N802 (Qt override)
         name = event.mimeData().text()
@@ -179,22 +336,40 @@ class TimePlotWidget(pg.PlotWidget):
         was_empty = not self._series
         color = color or next(self._color_cycle)
         curve = self.plot([], [], pen=pg.mkPen(color=color, width=1), name=name)
-        entry = {**data, "curve": curve, "color": color, "generation": 0}
+        curve._pa_owner = (self, name)  # lets the legend sample/label find their series
+        visible = bool(data.get("visible", True))
+        entry = {
+            **{k: v for k, v in data.items() if k != "visible"},
+            "curve": curve, "color": color, "generation": 0, "visible": visible, "selected": False,
+        }
         self._series[name] = entry
+        if not visible:
+            curve.setVisible(False)
+            self._refresh_legend_entry(name)
         x = entry["x"]
         if was_empty and len(x):
             # First series in this plot: show its full extent. (Later overlays keep
             # whatever range the user is currently looking at.) This also triggers
             # sigRangeChanged, mainly so the navigator picks up the initial range.
-            x_lo, x_hi = self._finite_bounds(x)
+            x_lo, x_hi = self._finite_bounds_raw(x)
             y_lo, y_hi = self._series_y_bounds(entry)
             if y_lo > y_hi:  # this one series had no finite data at all
                 y_lo, y_hi = 0.0, 1.0
-            self.getViewBox().setRange(xRange=(x_lo, x_hi), yRange=(y_lo, y_hi), padding=0.02)
+            seed = self._seed_x_range
+            self._seed_x_range = None
+            if x_lo > x_hi and seed is None:
+                pass  # no finite time value at all: leave the range alone (29.4)
+            elif seed is not None:
+                # A series separated out of another plot (23.4): keep the user's current X
+                # range instead of resetting every X-linked plot to the full extent.
+                pad = 0.02 * (y_hi - y_lo)
+                self.getViewBox().setRange(xRange=seed, yRange=(y_lo - pad, y_hi + pad), padding=0)
+            else:
+                self.getViewBox().setRange(xRange=(x_lo, x_hi), yRange=(y_lo, y_hi), padding=0.02)
         # Always draw explicitly (not just via the sigRangeChanged cascade above):
         # this is the initial display of newly added data, not a pan/zoom-triggered
         # recompute, so it must happen even when auto_redraw is off.
-        self._redraw_series(name)
+        self._redraw_series(name)  # no-op for a hidden series (23.1)
         self.refresh_cursor_labels()  # an existing cursor's label should now list this series too
 
     def _series_y_bounds(self, entry: dict) -> tuple[float, float]:
@@ -226,6 +401,10 @@ class TimePlotWidget(pg.PlotWidget):
         for a in arrays:
             if len(a) == 0:
                 continue
+            if hasattr(a, "finite_min_max"):  # TimeIndex: ascending and finite, no data read (36.6 D)
+                a_lo, a_hi = a.finite_min_max()
+                lo, hi = min(lo, a_lo), max(hi, a_hi)
+                continue
             mask = np.isfinite(a)
             if not mask.any():
                 continue
@@ -251,6 +430,7 @@ class TimePlotWidget(pg.PlotWidget):
             self.removeItem(entry["curve"])
             self._set_series_coarse(name, False)
             self.refresh_cursor_labels()  # drop this series from any existing cursor's label
+            self.seriesRemoved.emit(self, name)
 
     def replace_series_y(self, name: str, y: np.ndarray) -> None:
         """Swap a fully-resident series' Y array in place (a derived variable was
@@ -258,9 +438,24 @@ class TimePlotWidget(pg.PlotWidget):
         legend position rather than remove_series()+add_series() re-adding it last.
         """
         entry = self._series.get(name)
-        if entry is None or entry["y_source"] is not None:
+        if entry is None or (entry["y_source"] is not None and not isinstance(entry["y_source"], DerivedColumn)):
             return
+        entry["y_source"] = None  # a formerly windowed derived series (36.6 C) becomes resident
+        entry["y_bounds"] = None
         entry["y"] = y
+        self._redraw_series(name)
+        self.refresh_cursor_labels()
+
+    def replace_series_source(self, name: str, y_source, y_bounds: tuple[float, float] | None) -> None:
+        """Like replace_series_y() but the new data is a windowed source (a DerivedColumn,
+        detailed_specification.md 36.6 C): the series becomes windowed whatever it was before."""
+        entry = self._series.get(name)
+        if entry is None:
+            return
+        entry["y"] = None
+        entry["y_source"] = y_source
+        entry["y_bounds"] = y_bounds
+        self._set_series_coarse(name, False)
         self._redraw_series(name)
         self.refresh_cursor_labels()
 
@@ -277,8 +472,13 @@ class TimePlotWidget(pg.PlotWidget):
         was_coarse = name in self._coarse_series
         self._set_series_coarse(name, False)
         self.refresh_cursor_labels()  # drop this series from this plot's cursor labels
+        self.seriesRemoved.emit(self, name)
         target._install_series(
-            name, {"x": entry["x"], "y": entry["y"], "y_source": entry["y_source"], "y_bounds": entry["y_bounds"]},
+            name,
+            {
+                "x": entry["x"], "y": entry["y"], "y_source": entry["y_source"], "y_bounds": entry["y_bounds"],
+                "visible": entry["visible"],  # hidden stays hidden (23.4)
+            },
             entry["color"],
         )
         if was_coarse:
@@ -301,6 +501,66 @@ class TimePlotWidget(pg.PlotWidget):
 
     def series_names(self) -> list[str]:
         return list(self._series.keys())
+
+    # -- per-series visibility / selection (detailed_specification.md 23.1 / 23.2) --------
+
+    def is_series_visible(self, name: str) -> bool:
+        entry = self._series.get(name)
+        return bool(entry and entry["visible"])
+
+    def visible_series_names(self) -> list[str]:
+        return [n for n, e in self._series.items() if e["visible"]]
+
+    def set_series_visible(self, name: str, visible: bool) -> None:
+        """The one place a series' visibility changes: `entry["visible"]` is the source of
+        truth, the curve/legend just follow it. A hidden series is skipped by
+        _redraw_series (no downsample job); showing it again redraws it for the current range."""
+        entry = self._series.get(name)
+        visible = bool(visible)
+        if entry is None or entry["visible"] == visible:
+            return
+        log_op("series_visible", plot=self.plot_id, name=name, visible=visible)
+        entry["visible"] = visible
+        entry["curve"].setVisible(visible)
+        self._refresh_legend_entry(name)
+        self.refresh_cursor_labels()
+        if visible:
+            self._redraw_series(name)
+        self.seriesVisibilityChanged.emit(self, name, visible)
+
+    def is_series_selected(self, name: str) -> bool:
+        entry = self._series.get(name)
+        return bool(entry and entry["selected"])
+
+    def set_series_selected(self, name: str, selected: bool) -> None:
+        """Selected = thicker curve + bold legend label. Both are derived from
+        `entry["selected"]`, so they survive any later redraw."""
+        entry = self._series.get(name)
+        if entry is None or entry["selected"] == bool(selected):
+            return
+        entry["selected"] = bool(selected)
+        entry["curve"].setPen(self._series_pen(entry))
+        self._refresh_legend_entry(name)
+
+    @staticmethod
+    def _series_pen(entry: dict):
+        width = _SELECTED_PEN_WIDTH if entry["selected"] else _NORMAL_PEN_WIDTH
+        return pg.mkPen(color=entry["color"], width=width)
+
+    def _refresh_legend_entry(self, name: str) -> None:
+        """Legend label style from the entry's state: grey when hidden, bold when selected;
+        and repaint the sample (pyqtgraph draws an eye icon for a hidden curve)."""
+        entry = self._series.get(name)
+        legend = self.getPlotItem().legend
+        if entry is None or legend is None:
+            return
+        for sample, label in legend.items:
+            if sample.item is entry["curve"]:
+                color = None if entry["visible"] else _HIDDEN_LABEL_COLOR
+                label.setText(name, color=color, bold=bool(entry["selected"]))
+                sample.update()
+                legend.updateSize()
+                return
 
     def series_data(self, name: str) -> tuple[np.ndarray, np.ndarray | None, str]:
         """The series' resident backing arrays — (x, y, color) — not what's
@@ -331,13 +591,17 @@ class TimePlotWidget(pg.PlotWidget):
 
         series = []
         for name, entry in self._series.items():
+            if not entry["visible"]:
+                continue  # hidden series are not exported (23.1)
             x, y = entry["curve"].getData()
             x = np.array([] if x is None else x, dtype=float)
             y = np.array([] if y is None else y, dtype=float)
             series.append(SeriesSnapshot(name, str(entry["color"]), x, y))
         x_range, y_range = self.getViewBox().viewRange()
         cursors = [c["line"].value() for c in self._cursors.values() if c["line"].isVisible()]
-        return PlotSnapshot(self.x_axis_datetime, tuple(x_range), tuple(y_range), series, cursors)
+        return PlotSnapshot(
+            self.x_axis_datetime, tuple(x_range), tuple(y_range), series, cursors, x_linked=self.x_linked
+        )
 
     def is_empty(self) -> bool:
         return not self._series
@@ -357,6 +621,7 @@ class TimePlotWidget(pg.PlotWidget):
         # entirely) once the axis itself changes, so drop them rather than leave
         # stale/nonsensical cursors sitting at the old numeric position.
         self.clear_cursors()
+        self.set_hover_x(None)
         for entry in self._series.values():
             entry["x"] = x
         if self._series:
@@ -364,7 +629,11 @@ class TimePlotWidget(pg.PlotWidget):
 
     def pending_downsample_count(self) -> int:
         """Number of in-flight background downsample jobs (for tests/debugging)."""
-        return len(self._active_workers)
+        return len(self._hub.pending)
+
+    @property
+    def _active_workers(self) -> dict:
+        return self._hub.pending
 
     # -- cursors -----------------------------------------------------------------
 
@@ -383,7 +652,14 @@ class TimePlotWidget(pg.PlotWidget):
             entry["label"].setVisible(enabled)
 
     def _on_scene_mouse_clicked(self, ev) -> None:
-        if not self._cursor_mode_enabled or ev.button() != Qt.MouseButton.LeftButton:
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+        if ev.isAccepted():
+            return  # a legend sample/label (or a cursor line) already handled it
+        if not self._cursor_mode_enabled:
+            # Empty-area click clears the series selection (23.2). Not in cursor mode,
+            # where the same click places a cursor instead and must leave selection alone.
+            self.backgroundClicked.emit(self)
             return
         # A click that landed on one of our own cursor lines is handled by that
         # line's own sigClicked (-> _on_cursor_line_clicked, removal) instead; only a
@@ -466,6 +742,11 @@ class TimePlotWidget(pg.PlotWidget):
                 return f"{x:.6g}"
         return f"{x:.6g}"
 
+    @staticmethod
+    def format_value(value: float) -> str:
+        """A series value as shown in cursor labels and the hover readout (39.2)."""
+        return f"{value:.6g}"
+
     def _nearest_row(self, x_array: np.ndarray, x: float) -> int | None:
         if len(x_array) == 0:
             return None
@@ -483,7 +764,7 @@ class TimePlotWidget(pg.PlotWidget):
         if entry["y_source"] is not None:
             # A single-row window read (Phase D): cheap enough (a handful of bytes)
             # to do synchronously here rather than round-tripping through a
-            # BackgroundWorker like a real visible-range fetch does.
+            # WorkerHub job like a real visible-range fetch does.
             values = entry["y_source"].window(row, row + 1)
             return float(values[0]) if len(values) else None
         return float(entry["y"][row])
@@ -495,9 +776,11 @@ class TimePlotWidget(pg.PlotWidget):
         x = entry["line"].value()
         lines = [self.format_x(x)]
         for name, series_entry in self._series.items():
+            if not series_entry["visible"]:
+                continue  # hidden series get no value line (23.1)
             value = self._series_value_at(series_entry, x)
             if value is not None:
-                lines.append(f"{name}: {value:.6g}")
+                lines.append(f"{name}: {self.format_value(value)}")
         entry["label"].setText("\n".join(lines))
         self._reposition_cursor_overlays()
 
@@ -525,6 +808,167 @@ class TimePlotWidget(pg.PlotWidget):
             x = entry["line"].value()
             entry["label"].setPos(x, y_hi)
             entry["label"].setAnchor((0, 1) if x < x_lo + (x_hi - x_lo) * 0.85 else (1, 1))
+
+
+    # -- hover value readout (detailed_specification.md 39) ---------------------------
+
+    def set_hover_enabled(self, enabled: bool) -> None:
+        """Toggle (39.3). Off: no line, no label, and mouseMoveEvent returns before doing
+        any work."""
+        enabled = bool(enabled)
+        if enabled == self._hover_enabled:
+            return
+        self._hover_enabled = enabled
+        if not enabled:
+            self._hover_pending = None
+            self._hover_throttle.stop()
+            self.set_hover_x(None)
+
+    def hover_enabled(self) -> bool:
+        return self._hover_enabled
+
+    def hover_x(self) -> float | None:
+        """X of the visible hover line, or None."""
+        return self._hover_x
+
+    def hover_text(self) -> str:
+        """Plain text of the readout ('' while hidden) -- for tests / debugging."""
+        if self._hover_x is None or self._hover_label is None:
+            return ""
+        return self._hover_label.toPlainText()
+
+    def _ensure_hover_items(self) -> None:
+        if self._hover_line is not None:
+            return
+        line = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen(color=_HOVER_COLOR, width=1, style=Qt.PenStyle.DotLine),
+        )
+        line.setZValue(50)
+        line.setVisible(False)
+        self.addItem(line, ignoreBounds=True)  # never part of the data bounds / autorange
+        # Child of the ViewBox itself (like the legend): pixel coordinates, pinned top-right.
+        label = pg.TextItem(anchor=(1, 0), color="#000000", fill=pg.mkBrush(255, 255, 255, 200))
+        label.setParentItem(self.getViewBox())
+        label.setZValue(60)
+        label.setVisible(False)
+        self._hover_line, self._hover_label = line, label
+        self.getViewBox().sigResized.connect(self._position_hover_label)
+
+    def mouseMoveEvent(self, ev) -> None:  # noqa: N802 (Qt override)
+        # Not scene().sigMouseMoved: pyqtgraph drops moves closer together than its
+        # `mouseRateLimit` (so the final resting position could be lost); this view gets every
+        # move and applies its own ~60 Hz throttle, with a trailing flush.
+        super().mouseMoveEvent(ev)
+        if self._hover_enabled:
+            self._on_scene_mouse_moved(self.mapToScene(ev.position().toPoint()))
+
+    def _on_scene_mouse_moved(self, scene_pos) -> None:
+        """Throttled (~60 Hz) hover update for a mouse position in scene coordinates."""
+        self._hover_pending = scene_pos
+        now = time.monotonic()
+        wait_ms = _HOVER_THROTTLE_MS - (now - self._hover_last_move) * 1000.0
+        if wait_ms <= 0:
+            self._hover_throttle.stop()
+            self._flush_hover_move()
+        elif not self._hover_throttle.isActive():
+            self._hover_throttle.start(int(wait_ms) + 1)
+
+    def _flush_hover_move(self) -> None:
+        pos, self._hover_pending = self._hover_pending, None
+        if pos is None or not self._hover_enabled:
+            return
+        self._hover_last_move = time.monotonic()
+        vb = self.getViewBox()
+        if not vb.sceneBoundingRect().contains(pos):
+            self._hover_leave()  # over an axis / outside the plot area
+            return
+        x = vb.mapSceneToView(pos).x()
+        if not np.isfinite(x):
+            return
+        self.set_hover_x(x)
+        self.hoverXChanged.emit(self, x)
+
+    def leaveEvent(self, ev) -> None:  # noqa: N802 (Qt override)
+        super().leaveEvent(ev)
+        self._hover_leave()
+
+    def _hover_leave(self) -> None:
+        self._hover_pending = None
+        self._hover_throttle.stop()
+        if self._hover_x is not None:
+            self.set_hover_x(None)
+            self.hoverXChanged.emit(self, None)
+
+    def set_hover_x(self, x: float | None) -> None:
+        """Show the hover line + readout at time `x` (None hides). Called for the plot under
+        the mouse and, via PlotGridWidget, for every X-linked plot (39.1). Never raises on a
+        non-finite X or a non-ascending / NaN-containing time axis (data 29)."""
+        if not self._hover_enabled or x is None or not np.isfinite(x):
+            self._hover_settle.stop()
+            self._hover_x = None
+            if self._hover_line is not None:
+                self._hover_line.setVisible(False)
+                self._hover_label.setVisible(False)
+            return
+        self._ensure_hover_items()
+        self._hover_x = float(x)
+        self._hover_line.setValue(self._hover_x)
+        self._hover_line.setVisible(True)
+        self._render_hover(settled=False)
+        self._hover_settle.start()  # restarted by every move
+
+    def _settle_hover(self) -> None:
+        if self._hover_x is not None:
+            self._render_hover(settled=True)
+
+    def _approx_value(self, entry: dict, x: float) -> float | None:
+        """Nearest point of the curve as drawn (downsampled) -- no disk read (39.2)."""
+        cx, cy = entry["curve"].getData()
+        if cx is None or cy is None or len(cx) == 0 or len(cx) != len(cy):
+            return None
+        row = self._nearest_row(np.asarray(cx), x)
+        return None if row is None else float(cy[row])
+
+    def _render_hover(self, settled: bool) -> None:
+        x = self._hover_x
+        header = self.format_x(x) + ("" if self.x_axis_datetime else " Hz")
+        rows = [f'<span style="color:#000">{html.escape(header)}</span>']
+        for name, entry in self._series.items():
+            if not entry["visible"]:
+                continue  # hidden series get no line (23.1)
+            approx = False
+            try:
+                lazy_axis = hasattr(entry["x"], "finite_min_max")  # TimeIndex: a lookup can read the file
+                if settled or (entry["y_source"] is None and not lazy_axis):
+                    value = self._series_value_at(entry, x)  # real sample (resident: no I/O)
+                else:
+                    value, approx = self._approx_value(entry, x), True
+            except Exception:  # a failed single-row read must not break mouse handling
+                value, approx = None, False
+            if value is None:
+                text = "\u2014"
+            else:
+                text = ("\u2248" if approx else "") + self.format_value(value)
+            row = f'<span style="color:{entry["color"]}">{html.escape(name)}</span>: {text}'
+            rows.append(f"<b>{row}</b>" if entry["selected"] else row)
+        self._hover_label.setHtml("<br>".join(rows))
+        self._position_hover_label()
+
+    def _position_hover_label(self) -> None:
+        label = self._hover_label
+        if label is None or self._hover_x is None:
+            return
+        vb = self.getViewBox()
+        label.setPos(vb.width() - 6, 6)
+        label.setVisible(True)
+        # Don't sit on a placed cursor's label (16): move down just below it.
+        rect = label.sceneBoundingRect()
+        for entry in self._cursors.values():
+            other = entry["label"]
+            if other.isVisible() and rect.intersects(other.sceneBoundingRect()):
+                label.setPos(vb.width() - 6, 6 + other.sceneBoundingRect().bottom() - rect.top() + 4)
+                break
 
     # -- zoom / pan ------------------------------------------------------------
 
@@ -572,9 +1016,41 @@ class TimePlotWidget(pg.PlotWidget):
         move_up_action = menu.addAction(tr("plot.move_up"))
         move_down_action = menu.addAction(tr("plot.move_down"))
         menu.addSeparator()
+        # Per-series submenus (detailed_specification.md 23.4); disabled with no series.
+        names = self.series_names()
+        delete_menu = menu.addMenu(tr("plot.delete_series"))
+        visible_menu = menu.addMenu(tr("plot.toggle_series_visible"))
+        separate_series_menu = menu.addMenu(tr("plot.separate_series"))
+        delete_actions: dict = {}
+        visible_actions: dict = {}
+        separate_series_actions: dict = {}
+        for n in names:
+            delete_actions[delete_menu.addAction(n)] = n
+            a = visible_menu.addAction(n)
+            a.setCheckable(True)
+            a.setChecked(self.is_series_visible(n))
+            visible_actions[a] = n
+            separate_series_actions[separate_series_menu.addAction(n)] = n
+        for m in (delete_menu, visible_menu):
+            m.setEnabled(bool(names))
+        separate_series_menu.setEnabled(len(names) > 1)  # separating the only series is a no-op
+        menu.addSeparator()
+        link_x_action = None
+        if self.x_axis_datetime and self.x_link_menu_visible:  # feature-flagged (24.3)
+            link_x_action = menu.addAction(tr("plot.link_x"))
+            link_x_action.setCheckable(True)
+            link_x_action.setChecked(self.x_linked)
+            link_x_action.setEnabled(self.x_link_toggle_allowed)  # the last linked plot can't be unlinked
+        stats_range_action = None
+        if self.x_axis_datetime and not self.x_linked:
+            stats_range_action = menu.addAction(tr("plot.stats_this_range"))
+        if link_x_action is not None or stats_range_action is not None:
+            menu.addSeparator()
         remove_action = menu.addAction(tr("plot.remove"))
         separate_action = menu.addAction(tr("plot.separate"))
         chosen = menu.exec(event.globalPos())
+        if chosen is None:
+            return
         if chosen == remove_action:
             log_op("remove_plot_requested", plot=self.plot_id)
             self.removeRequested.emit(self)
@@ -587,6 +1063,20 @@ class TimePlotWidget(pg.PlotWidget):
         elif chosen == move_down_action:
             log_op("move_plot_down_requested", plot=self.plot_id)
             self.moveDownRequested.emit(self)
+        elif link_x_action is not None and chosen == link_x_action:
+            self.linkXRequested.emit(self, not self.x_linked)
+        elif stats_range_action is not None and chosen == stats_range_action:
+            log_op("stats_this_range_requested", plot=self.plot_id)
+            self.statsForRangeRequested.emit(self)
+        elif chosen in delete_actions:
+            log_op("remove_series_requested", plot=self.plot_id, name=delete_actions[chosen])
+            self.removeSeriesRequested.emit(self, delete_actions[chosen])
+        elif chosen in visible_actions:
+            n = visible_actions[chosen]
+            self.set_series_visible(n, not self.is_series_visible(n))
+        elif chosen in separate_series_actions:
+            log_op("separate_series_requested", plot=self.plot_id, name=separate_series_actions[chosen])
+            self.separateSeriesRequested.emit(self, separate_series_actions[chosen])
 
     def go_home(self) -> None:
         """H button/key: reset to full data range (specification.md 5.3).
@@ -599,8 +1089,13 @@ class TimePlotWidget(pg.PlotWidget):
         log_op("home", plot=self.plot_id)
         if not self._series:
             return
-        x_lo, x_hi = self._finite_bounds(*(entry["x"] for entry in self._series.values()))
-        y_bounds = [self._series_y_bounds(entry) for entry in self._series.values()]
+        x_lo, x_hi = self._finite_bounds_raw(*(entry["x"] for entry in self._series.values()))
+        if x_lo > x_hi:
+            return  # no finite time value at all: leave the range alone (29.4)
+        # Y from the visible series only (23.1) -- all hidden falls back to all, so the
+        # range is never empty.
+        y_entries = [e for e in self._series.values() if e["visible"]] or list(self._series.values())
+        y_bounds = [self._series_y_bounds(entry) for entry in y_entries]
         y_lo = min(b[0] for b in y_bounds)
         y_hi = max(b[1] for b in y_bounds)
         if y_lo > y_hi:  # no series had any finite data at all
@@ -647,16 +1142,29 @@ class TimePlotWidget(pg.PlotWidget):
 
     def _redraw_series(self, name: str) -> None:
         entry = self._series.get(name)
-        if entry is None:
-            return
+        if entry is None or not entry["visible"]:
+            return  # hidden: no recompute until shown again (23.1)
         x = entry["x"]
         if len(x) == 0:
             return
 
         x_min, x_max = self.getViewBox().viewRange()[0]
-        lo = max(0, np.searchsorted(x, x_min, side="left") - 1)
-        hi = min(len(x), np.searchsorted(x, x_max, side="right") + 1)
-        x_visible = x[lo:hi]
+        try:
+            lo = max(0, np.searchsorted(x, x_min, side="left") - 1)
+            hi = min(len(x), np.searchsorted(x, x_max, side="right") + 1)
+        except Exception as e:  # noqa: BLE001
+            if not hasattr(x, "finite_min_max"):
+                raise
+            # A lazy TimeIndex axis (36.6 D) reads a few rows from the file to locate the range;
+            # a file that vanished/broke must be a reported render failure, not an exception on
+            # the UI thread (28.2, data 29.5).
+            self.renderFailed.emit(self, name, f"{type(e).__name__}: {e}")
+            return
+        # A lazy TimeIndex axis (36.6 D) is read inside the worker job, never on the UI thread;
+        # a resident array is sliced here as before (a free view).
+        lazy_x = hasattr(x, "finite_min_max")
+        x_visible = None if lazy_x else x[lo:hi]
+        x_lazy = x if lazy_x else None  # jobs capture the axis only when lazy (a job must not pin a resident one)
 
         pixel_width = max(int(self.width()), 1)
         n_out = pixel_width * self.downsample_pixel_ratio
@@ -681,11 +1189,26 @@ class TimePlotWidget(pg.PlotWidget):
                     self._render_from_pyramid(name, entry, pyramid, lo, hi, n_out)
                     return
                 self._maybe_start_pyramid_build(name, y_source)
+                if isinstance(y_source, DerivedColumn) and not y_source.pyramid_given_up:
+                    # 36.6 C: a computed column this wide would be computed in full just to be
+                    # thinned; the (chunked) pyramid build just started/running -- by this plot or
+                    # by the navigator -- redraws us when it completes (or fails).
+                    y_source.add_pyramid_listener(
+                        (id(self), name), lambda ok, n=name, src=y_source: self._on_waited_pyramid(n, src, ok)
+                    )
+                    return
+                if features.is_enabled("big_a_thin_first_draw") and hasattr(y_source, "thin_job"):
+                    # 36.6 A: draw ~n_out strided points now instead of reading the whole
+                    # visible range; the pyramid replaces this when built.
+                    self._start_thin_draw(name, entry, y_source, lo, hi, n_out)
+                    return
                 # No pyramid yet: fall through to the real (expensive but
                 # correct) fetch below for this redraw; the background build
                 # just kicked off will make the next one at this zoom level cheap.
 
-            def job(y_source=y_source, lo=lo, hi=hi, x_visible=x_visible):
+            def job(y_source=y_source, lo=lo, hi=hi, x_visible=x_visible, x_lazy=x_lazy):
+                if x_visible is None:
+                    x_visible = x_lazy[lo:hi]
                 y_visible = y_source.window(lo, hi)
                 if not downsample_enabled or len(x_visible) <= n_out:
                     return x_visible, y_visible
@@ -695,10 +1218,81 @@ class TimePlotWidget(pg.PlotWidget):
             return
 
         y_visible = entry["y"][lo:hi]
+        if x_visible is None:  # lazy axis with a resident y (e.g. a derived variable)
+            def lazy_job(x_lazy=x_lazy, y_visible=y_visible, lo=lo, hi=hi):
+                xv = x_lazy[lo:hi]
+                if not downsample_enabled or len(xv) <= n_out:
+                    return xv, y_visible
+                return lttb(xv, y_visible, n_out)
+
+            self._start_series_worker(name, entry, lazy_job)
+            return
         if not downsample_enabled or len(x_visible) <= n_out:
-            entry["curve"].setData(x_visible, y_visible)
+            self._set_curve_data(entry, x_visible, y_visible)
             return
         self._start_series_worker(name, entry, lambda: lttb(x_visible, y_visible, n_out))
+
+    def _start_thin_draw(self, name: str, entry: dict, y_source, lo: int, hi: int, n_out: int) -> None:
+        """First draw of a big windowed column without a pyramid (36.6 A): a strided read over
+        rows [lo, hi) in the background; the result is marked coarse. With a resident time axis
+        X is looked up on the UI thread (a free fancy index, so the job closure holds no array,
+        37.3); with a lazy TimeIndex axis the job reads the time values at the same stride grid
+        itself (36.8: no per-point reads on the UI thread)."""
+        entry["generation"] += 1
+        generation = entry["generation"]
+        self.downsampleStarted.emit()
+        job = y_source.thin_job(lo, hi, n_out)
+        x = entry["x"]
+        if hasattr(x, "finite_min_max"):
+            job = self._with_lazy_x(job, x, lo, hi, n_out)
+        self._hub.submit(
+            job,
+            lambda result, n=name, g=generation: self._on_thin_drawn(n, g, *result),
+            lambda msg, n=name, g=generation: self._on_series_worker_failed(n, g, msg),
+            job="downsample",
+            target=f"{self.plot_id}/{name}",
+        )
+
+    @staticmethod
+    def _with_lazy_x(job, x, lo: int, hi: int, n_out: int):
+        """Wrap a thin job so it also returns the X values of its rows: the time column is
+        strided over the same grid by `thin_column` (one pass over the overlapping row groups);
+        should the grids ever differ the rows are looked up one by one -- still in the worker."""
+        from ..core.pyramid import thin_column
+
+        path, column = x.path, x.column
+
+        def with_x():
+            idx, y = job()
+            idx = np.clip(idx, 0, len(x) - 1)
+            tidx, tx = thin_column(path, column, n_out, lo, hi)
+            if not np.array_equal(tidx, idx):
+                tx = x.take(idx)
+            return idx, y, tx
+
+        return with_x
+
+    def _on_thin_drawn(self, name: str, generation: int, idx: np.ndarray, y: np.ndarray, x_values=None) -> None:
+        self.downsampleFinished.emit()
+        entry = self._series.get(name)
+        if entry is None or generation != entry["generation"]:
+            return  # removed, or superseded (e.g. by the pyramid render)
+        if x_values is None:  # resident axis: a plain fancy index, no I/O
+            x = entry["x"]
+            x_values = x[np.clip(idx, 0, len(x) - 1)]
+        self._set_curve_data(entry, x_values, y)  # drops non-finite X (29.4)
+        self._set_series_coarse(name, True)
+
+    @staticmethod
+    def _set_curve_data(entry: dict, x: np.ndarray, y: np.ndarray) -> None:
+        """curve.setData without non-finite X points: pyqtgraph/Qt can hang painting a
+        path with NaN/Inf X coordinates (detailed_specification.md 29.4)."""
+        x = np.asarray(x)
+        if x.dtype.kind == "f":
+            ok = np.isfinite(x)
+            if not ok.all():
+                x, y = x[ok], np.asarray(y)[ok]
+        entry["curve"].setData(x, y)
 
     def _start_series_worker(self, name: str, entry: dict, job) -> None:
         # Generation is tracked per series (not per plot): with 2+ overlaid series,
@@ -709,26 +1303,34 @@ class TimePlotWidget(pg.PlotWidget):
         # the windowed-fetch job below, not just LTTB recompute.
         entry["generation"] += 1
         generation = entry["generation"]
-        worker = BackgroundWorker(job)
-        self._active_workers.add(worker)  # see BackgroundWorker for why
-        worker.signals.finished.connect(
-            lambda result, n=name, g=generation, w=worker: self._on_downsampled(n, g, *result, w)
-        )
         self.downsampleStarted.emit()  # drives the main-window progress indicator
-        self._thread_pool.start(worker)
+        self._hub.submit(
+            job,
+            lambda result, n=name, g=generation: self._on_downsampled(n, g, *result),
+            lambda msg, n=name, g=generation: self._on_series_worker_failed(n, g, msg),
+            job="downsample",
+            target=f"{self.plot_id}/{name}",
+        )
 
-    def _on_downsampled(
-        self, name: str, generation: int, x_ds: np.ndarray, y_ds: np.ndarray, worker: BackgroundWorker
-    ) -> None:
-        self._active_workers.discard(worker)
+    def _on_downsampled(self, name: str, generation: int, x_ds: np.ndarray, y_ds: np.ndarray) -> None:
         self.downsampleFinished.emit()
         entry = self._series.get(name)
         if entry is None:
             return  # series was removed while this job was in flight
         if generation != entry["generation"]:
             return  # stale result superseded by a newer zoom/pan for *this* series
-        entry["curve"].setData(x_ds, y_ds)
+        self._set_curve_data(entry, x_ds, y_ds)
         self._set_series_coarse(name, False)  # a real/precise result, whichever path produced it
+
+    def _on_series_worker_failed(self, name: str, generation: int, message: str) -> None:
+        """A downsample/fetch job raised (detailed_specification.md 28.2): release
+        the job and balance downsampleStarted so the busy indicator clears;
+        the series keeps its previous curve."""
+        self.downsampleFinished.emit()
+        entry = self._series.get(name)
+        if entry is None or generation != entry["generation"]:
+            return  # series removed, or superseded by a newer job: nothing to report
+        self.renderFailed.emit(self, name, message)
 
     def _render_from_pyramid(self, name: str, entry: dict, pyramid, lo: int, hi: int, n_out: int) -> None:
         """Coarse, synchronous redraw from an already-built pyramid (core.pyramid,
@@ -762,25 +1364,47 @@ class TimePlotWidget(pg.PlotWidget):
         xs, ys = xs[finite], ys[finite]
         if len(xs) > n_out:
             xs, ys = lttb(xs, ys, n_out)
-        entry["curve"].setData(xs, ys)
+        self._set_curve_data(entry, xs, ys)
 
     def _maybe_start_pyramid_build(self, name: str, y_source) -> None:
         job = y_source.request_pyramid()
         if job is None:
             return  # already built, or a build is already in flight
-        worker = BackgroundWorker(job)
-        self._active_workers.add(worker)  # see BackgroundWorker for why
-        worker.signals.finished.connect(
-            lambda pyramid, n=name, src=y_source, w=worker: self._on_pyramid_ready(n, src, pyramid, w)
-        )
         self.downsampleStarted.emit()  # drives the main-window progress indicator
-        # Shares the same pool as real fetches/LTTB (self._thread_pool) — a
-        # dedicated pool for this job was tried and measured not to help; see the
-        # comment on _PYRAMID_PREFERRED_ROW_THRESHOLD above.
-        self._thread_pool.start(worker)
+        # Shares the same pool as real fetches/LTTB — a dedicated pool for this job was
+        # tried and measured not to help; see the comment on _PYRAMID_PREFERRED_ROW_THRESHOLD.
+        self._hub.submit(
+            job,
+            lambda pyramid, n=name, src=y_source: self._on_pyramid_ready(n, src, pyramid),
+            lambda msg, src=y_source: self._on_pyramid_failed(src, msg),
+            job="pyramid",
+            target=f"{self.plot_id}/{name}",
+        )
 
-    def _on_pyramid_ready(self, name: str, y_source, pyramid, worker: BackgroundWorker) -> None:
-        self._active_workers.discard(worker)
+    def _on_pyramid_failed(self, y_source, message: str) -> None:
+        """Envelope build raised (detailed_specification.md 28.2): clear the
+        in-flight mark (retried on a later redraw, up to the column's failure
+        limit) and balance the busy indicator. A series waiting for this build
+        (a DerivedColumn) is told by pyramid_failed() -> _on_waited_pyramid."""
+        y_source.pyramid_failed()
+        self.downsampleFinished.emit()
+
+    def _on_waited_pyramid(self, name: str, y_source, ok: bool) -> None:
+        """A pyramid build this series was waiting for (36.6 C) completed, started by this plot,
+        another plot or the navigator. Success: redraw from it. Failure: report it (the series
+        must not stay silently blank), and once the column gave up pyramids redraw anyway --
+        that now takes the real-fetch path."""
+        entry = self._series.get(name)
+        if entry is None or entry["y_source"] is not y_source:
+            return
+        if ok:
+            self._redraw_series(name)
+            return
+        self.renderFailed.emit(self, name, tr("render.pyramid_failed"))
+        if y_source.pyramid_given_up:
+            self._redraw_series(name)
+
+    def _on_pyramid_ready(self, name: str, y_source, pyramid) -> None:
         self.downsampleFinished.emit()
         y_source.set_pyramid(pyramid)
         entry = self._series.get(name)

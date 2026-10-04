@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -10,15 +12,18 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QKeySequenceEdit,
     QLabel,
+    QPushButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from .. import config, features
+from ..core.oplog import log_op
 from ..io.settings import (
     DEFAULT_SHORTCUTS,
-    FFT_ENABLED,
     LANGUAGES,
+    normalize_log_retention_days,
     SCROLL_ACTIONS,
     SCROLL_MODIFIERS,
     Settings,
@@ -49,6 +54,12 @@ class SettingsDialog(QDialog):
         self.eager_load_limit_spin.setValue(settings.eager_load_limit_mb)
         self.eager_load_limit_spin.setToolTip(tr("settings.eager_load_limit_tooltip"))
 
+        self.log_retention_spin = QSpinBox()
+        self.log_retention_spin.setRange(1, 365)
+        self.log_retention_spin.setSuffix(" d")
+        self.log_retention_spin.setValue(normalize_log_retention_days(settings.log_retention_days))
+        self.log_retention_spin.setToolTip(tr("settings.log_retention_tooltip"))
+
         self.language_combo = QComboBox()
         for language in LANGUAGES:
             self.language_combo.addItem(LANGUAGE_LABELS[language], language)
@@ -59,6 +70,7 @@ class SettingsDialog(QDialog):
         general_form.addRow(self.auto_redraw_check)
         general_form.addRow(tr("settings.downsample_density_label"), self.downsample_spin)
         general_form.addRow(tr("settings.eager_load_limit_label"), self.eager_load_limit_spin)
+        general_form.addRow(tr("settings.log_retention"), self.log_retention_spin)
         general_form.addRow(tr("settings.language_label"), self.language_combo)
 
         # scroll_bindings is a modifier -> action permutation ({"none", "ctrl",
@@ -82,8 +94,10 @@ class SettingsDialog(QDialog):
         self._shortcut_edits: dict[str, QKeySequenceEdit] = {}
         shortcuts_form = QFormLayout()
         for key in DEFAULT_SHORTCUTS:
-            if key == "fft" and not FFT_ENABLED:
-                continue  # hidden from the GUI while still under debugging
+            if key == "fft" and not features.is_enabled("fft"):
+                continue  # developer feature flag, detailed_specification.md 21
+            if key in ("user_functions", "maps", "xy_plot") and not features.is_enabled(key):
+                continue
             edit = QKeySequenceEdit()
             seq = settings.shortcuts.get(key, "")
             if seq:
@@ -104,6 +118,11 @@ class SettingsDialog(QDialog):
         layout.addLayout(scroll_form)
         layout.addWidget(QLabel(tr("settings.section_shortcuts")))
         layout.addLayout(shortcuts_form)
+        # Support: where the always-on operation log lives (detailed_specification.md 30.4).
+        self.open_log_folder_button = QPushButton(tr("settings.open_log_folder"))
+        self.open_log_folder_button.setToolTip(tr("settings.open_log_folder_tooltip"))
+        self.open_log_folder_button.clicked.connect(open_log_folder)
+        layout.addWidget(self.open_log_folder_button)
         layout.addWidget(buttons)
 
     def _on_scroll_binding_changed(self, modifier: str) -> None:
@@ -130,7 +149,19 @@ class SettingsDialog(QDialog):
             auto_redraw=self.auto_redraw_check.isChecked(),
             downsample_pixel_ratio=self.downsample_spin.value(),
             eager_load_limit_mb=self.eager_load_limit_spin.value(),
+            log_retention_days=self.log_retention_spin.value(),
             scroll_bindings=dict(self._scroll_bindings),
             shortcuts=shortcuts,
             language=self.language_combo.currentData(),
         )
+
+
+def open_log_folder() -> bool:
+    """Open the log directory in the OS file manager (detailed_specification.md 30.4)."""
+    log_op("open_log_folder")
+    folder = config.PARQUET_ANALYZER_LOG_DIR
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))

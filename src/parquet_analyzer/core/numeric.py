@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 _DATETIME_UNIT_TO_SECONDS_DIVISOR = {"s": 1.0, "ms": 1e3, "us": 1e6}
+
+
+class NonNumericColumnError(ValueError):
+    """A file column cannot be used as a 1-D float64 series (a string/binary/time-of-day
+    column, or a list/struct column that numpy turns into a 2-D or object array). A
+    ValueError subclass so older `except ValueError` callers keep working; callers that
+    take a column from the user (drop on a plot, time-axis switch, view load) catch this
+    one specifically and report it instead of leaking a raw numpy/polars exception
+    (data 29.5: nothing may be left half-switched)."""
 
 
 def to_numeric(values: np.ndarray) -> np.ndarray:
@@ -24,6 +35,23 @@ def to_numeric(values: np.ndarray) -> np.ndarray:
     old chain's intermediates immediately either way) — only the transient peak
     during conversion (detailed_specification.md 13.5.1's 2026-09-19 addendum).
     """
+    try:
+        result = _to_numeric(values)
+        if values.dtype.kind in "mM" and values.ndim == 1:
+            # A null timestamp/duration is NaT = int64 minimum; unconverted it became a
+            # huge finite negative number (e.g. -9.2e15 s) that blew up Y ranges and slipped
+            # past the time-order/non-finite check. Missing values are NaN (data 29.5).
+            nat = np.isnat(values)
+            if nat.any():
+                result[nat] = np.nan
+    except (ValueError, TypeError) as e:
+        raise NonNumericColumnError(str(e)) from e
+    if result.ndim != 1:
+        raise NonNumericColumnError(f"expected a 1-D column, got shape {result.shape}")
+    return result
+
+
+def _to_numeric(values: np.ndarray) -> np.ndarray:
     if np.issubdtype(values.dtype, np.datetime64):
         unit = np.datetime_data(values.dtype)[0]
         divisor = _DATETIME_UNIT_TO_SECONDS_DIVISOR.get(unit)
@@ -41,3 +69,74 @@ def to_numeric(values: np.ndarray) -> np.ndarray:
     if values.dtype == np.float64:
         return values
     return values.astype(np.float64)
+
+
+@dataclass(frozen=True)
+class TimeOrderReport:
+    """Result of check_time_order (detailed_specification.md 29.1)."""
+
+    nan_count: int  # non-finite values (NaN / +-Inf)
+    decreasing_count: int  # places where a finite value is smaller than the previous finite one
+    first_decreasing_index: int | None  # original row index of the first such value, if any
+
+    @property
+    def ok(self) -> bool:
+        return self.nan_count == 0 and self.decreasing_count == 0
+
+
+_TIME_ORDER_CHUNK_ROWS = 2_000_000  # chunked so a 100M-row axis needs only a small temporary
+
+
+class TimeOrderScanner:
+    """Incremental form of check_time_order: feed consecutive chunks (with the row index
+    of each chunk's first element) and read `report()`. Carries the last finite value
+    across chunk boundaries, so the result equals a one-shot check (29.1). Also used by
+    the streaming TimeIndex build (36.6 D) that never holds the whole axis."""
+
+    def __init__(self) -> None:
+        self.nan_count = 0
+        self.decreasing = 0
+        self.first_bad: int | None = None
+        self._prev: float | None = None  # last finite value of the previous chunks
+
+    def feed(self, chunk: np.ndarray, start: int) -> None:
+        finite = np.isfinite(chunk)
+        nfin = int(np.count_nonzero(finite))
+        self.nan_count += chunk.size - nfin
+        if nfin == chunk.size:
+            idx = None
+            v = chunk
+        else:
+            idx = np.nonzero(finite)[0]
+            v = chunk[idx]
+        if v.size == 0:
+            return
+        if self._prev is not None and v[0] < self._prev:
+            self.decreasing += 1
+            if self.first_bad is None:
+                self.first_bad = start + (int(idx[0]) if idx is not None else 0)
+        if v.size > 1:
+            bad = np.nonzero(np.diff(v) < 0)[0]
+            if bad.size:
+                self.decreasing += int(bad.size)
+                if self.first_bad is None:
+                    j = int(bad[0]) + 1
+                    self.first_bad = start + (int(idx[j]) if idx is not None else j)
+        self._prev = v[-1]
+
+    def report(self) -> TimeOrderReport:
+        return TimeOrderReport(self.nan_count, self.decreasing, self.first_bad)
+
+
+def check_time_order(values: np.ndarray) -> TimeOrderReport:
+    """Check that a time axis is ascending (equal neighbours allowed) and finite
+    (detailed_specification.md 29.1). Range lookups use np.searchsorted, which
+    silently assumes this. Non-finite values are skipped when looking for
+    decreases, so one NaN doesn't also count as an ordering fault. Processed in
+    chunks of _TIME_ORDER_CHUNK_ROWS carrying the last finite value across chunk
+    boundaries, so temporary memory stays small for huge columns."""
+    values = np.asarray(values)
+    scanner = TimeOrderScanner()
+    for start in range(0, values.size, _TIME_ORDER_CHUNK_ROWS):
+        scanner.feed(values[start : start + _TIME_ORDER_CHUNK_ROWS], start)
+    return scanner.report()

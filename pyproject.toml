@@ -1,6 +1,6 @@
 [project]
 name = "parquet-analyzer"
-version = "0.2.0"
+version = "0.3.0"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.7",
@@ -9,6 +9,9 @@ dependencies = [
     "pyarrow>=17.0",
     "numpy>=1.26",
     "matplotlib>=3.8",
+    "pyopengl>=3.1.7",
+    # Windows has no system tz database; pyarrow/zoneinfo need it for tz-aware timestamp columns
+    "tzdata; sys_platform == 'win32'",
 ]
 
 [dependency-groups]
@@ -30,3 +33,6 @@ package = false
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# Any test running longer than this dumps every thread's stack (backlog 13.6), so a hang
+# diagnoses itself instead of stopping silently.
+faulthandler_timeout = 120

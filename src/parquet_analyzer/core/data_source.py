@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import bisect
 import datetime
+import math
+import warnings
 from functools import lru_cache
 from pathlib import Path
 
@@ -23,7 +25,11 @@ def _stat_to_numeric(value: object) -> float | None:
     if value is None:
         return None
     if isinstance(value, (datetime.date, datetime.datetime)):
-        return float(to_numeric(np.array([np.datetime64(value)]))[0])
+        with warnings.catch_warnings():
+            # numpy warns when given a tz-aware datetime ("no explicit representation of
+            # timezones"), but it converts to UTC, which is the value we want (data 29.5)
+            warnings.simplefilter("ignore", UserWarning)
+            return float(to_numeric(np.array([np.datetime64(value)]))[0])
     return float(value)
 
 
@@ -49,7 +55,7 @@ class ParquetDataSource:
         self.path = Path(path)
         self._lazy = pl.scan_parquet(self.path)
         self._schema = self._lazy.collect_schema()
-        self._pf: pq.ParquetFile | None = None  # opened lazily; footer-only cost
+        self._footer: pq.FileMetaData | None = None  # read lazily; footer-only cost, no handle kept
         self._block_rows = block_rows
         self._read_block_cached = lru_cache(maxsize=cache_blocks)(self._read_block_uncached)
 
@@ -74,6 +80,11 @@ class ParquetDataSource:
         # column bounds how many of those chunked-plus-rechunked pairs are ever alive
         # at once to one, instead of all len(columns) of them (measured: peak RSS at
         # open 8.05 -> 4.89 GiB on a 4GB/5-column file, same wall time).
+        # Clamp a negative start / reversed range (data 29.5; polars would count from the end or
+        # raise "negative slice lengths") to an empty or in-file slice.
+        row_start = max(0, row_start)
+        if row_end is not None:
+            row_end = max(row_end, row_start)
         result: dict[str, np.ndarray] = {}
         for c in columns:
             lf = self._lazy.select(c)
@@ -88,15 +99,17 @@ class ParquetDataSource:
 
     # -- Footer-only metadata (no data I/O); detailed_specification.md 13.5.1 Phase B --
 
-    def _parquet_file(self) -> pq.ParquetFile:
-        if self._pf is None:
-            self._pf = pq.ParquetFile(self.path)
-        return self._pf
+    def _footer_metadata(self) -> pq.FileMetaData:
+        # read_metadata closes the file again: a held handle would block deleting/overwriting
+        # the Parquet file while it is open in the app on Windows (WinError 32)
+        if self._footer is None:
+            self._footer = pq.read_metadata(self.path)
+        return self._footer
 
     def row_groups(self) -> list[tuple[int, int]]:
         """Per-row-group (row_offset, num_rows), from the Parquet footer alone —
         no data pages are read (measured ~7ms for 872 row groups)."""
-        meta = self._parquet_file().metadata
+        meta = self._footer_metadata()
         groups: list[tuple[int, int]] = []
         offset = 0
         for i in range(meta.num_row_groups):
@@ -111,18 +124,24 @@ class ParquetDataSource:
         (`has_min_max=False`) — treat that row group as "unknown range", not as
         an all-null one; null_count is still reported when available.
         """
-        pf = self._parquet_file()
-        field_index = pf.schema_arrow.get_field_index(name)
+        meta = self._footer_metadata()
+        field_index = meta.schema.to_arrow_schema().get_field_index(name)
         if field_index < 0:
             raise KeyError(name)
-        meta = pf.metadata
         result: list[tuple[float | None, float | None, int]] = []
         for i in range(meta.num_row_groups):
             stats = meta.row_group(i).column(field_index).statistics
             if stats is None or not stats.has_min_max:
                 result.append((None, None, (stats.null_count or 0) if stats is not None else 0))
                 continue
-            result.append((_stat_to_numeric(stats.min), _stat_to_numeric(stats.max), stats.null_count or 0))
+            try:
+                lo, hi = _stat_to_numeric(stats.min), _stat_to_numeric(stats.max)
+            except (ValueError, TypeError):
+                # a string/binary/float16/time-of-day column: Parquet has statistics but they
+                # have no float scale -> "unknown range", like has_min_max=False (never raise
+                # out of the footer-only metadata path; data 29.5)
+                lo = hi = None
+            result.append((lo, hi, stats.null_count or 0))
         return result
 
     def column_bounds(self, name: str) -> tuple[float, float] | None:
@@ -131,7 +150,9 @@ class ParquetDataSource:
         dtype Parquet doesn't compute min/max for)."""
         lo = hi = None
         for mn, mx, _null_count in self.column_stats(name):
-            if mn is None:
+            # +-Inf statistics (a column holding Inf values) are skipped: bounds feed the
+            # plot's Y range, and a non-finite range must never reach pyqtgraph (29.4, data 29.5)
+            if mn is None or mx is None or not (math.isfinite(mn) and math.isfinite(mx)):
                 continue
             lo = mn if lo is None else min(lo, mn)
             hi = mx if hi is None else max(hi, mx)
@@ -168,6 +189,8 @@ class ParquetDataSource:
         check it itself, to keep it a cheap pure lookup (13.5.1's monotonicity
         note). Returns (0, 0) if nothing overlaps.
         """
+        if not (x_lo <= x_hi):  # reversed or NaN bound: no overlap (data 29.5)
+            return (0, 0)
         groups = self.row_groups()
         stats = self.column_stats(column)
         maxs = [mx if mx is not None else float("-inf") for _mn, mx, _n in stats]
@@ -194,6 +217,11 @@ class ParquetDataSource:
         budget — a fine simplification while nothing calls this yet; revisit if
         Phase D's real usage pattern wants tighter memory control.
         """
+        # Clamp to the file's rows: a window past the end must not walk millions of empty
+        # blocks, and a negative start must not read from the end (data 29.5).
+        total = self._footer_metadata().num_rows
+        row_start = max(0, row_start)
+        row_end = min(total, row_end)
         if row_end <= row_start:
             return {c: np.array([], dtype=np.float64) for c in columns}
         columns_key = tuple(columns)

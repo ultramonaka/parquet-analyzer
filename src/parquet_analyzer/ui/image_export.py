@@ -60,6 +60,8 @@ class PlotSnapshot:
     y_range: tuple[float, float]
     series: list[SeriesSnapshot] = field(default_factory=list)
     cursors: list[float] = field(default_factory=list)
+    x_linked: bool = True  # in the X-linked group; only linked time subplots share an axis (24.6)
+    height_ratio: float = 1.0  # on-screen height share, drives the subplot heights (22.2/24.6)
 
 
 def export_format(path: str | Path) -> str:
@@ -129,16 +131,22 @@ def _build_figure(snapshots, stamp_lines, size_px):
     fig.get_layout_engine().set(rect=(0, stamp_h, 1, 1 - stamp_h))
 
     n = len(snapshots)
-    axes = fig.subplots(n, 1, squeeze=False)[:, 0] if n else []
-    time_axes = []
-    first_time_ax = None
+    ratios = [max(float(s.height_ratio), 1e-3) for s in snapshots]  # follow the screen's pane heights
+    axes = fig.subplots(n, 1, squeeze=False, gridspec_kw={"height_ratios": ratios})[:, 0] if n else []
+    # Only X-linked time subplots share an axis (24.6); an independent one keeps its own
+    # range and tick labels, a frequency-domain one is never shared with time.
+    linked_axes = []
+    independent_axes = []
     for ax, snap in zip(axes, snapshots):
-        if snap.x_axis_datetime:
-            if first_time_ax is None:
-                first_time_ax = ax
-            else:
-                ax.sharex(first_time_ax)
-            time_axes.append(ax)
+        if not snap.x_axis_datetime:
+            continue
+        if not snap.x_linked:
+            independent_axes.append(ax)
+        elif linked_axes:
+            ax.sharex(linked_axes[0])
+            linked_axes.append(ax)
+        else:
+            linked_axes.append(ax)
 
     for ax, snap in zip(axes, snapshots):
         offset = _local_offset_s(snap.x_range[0]) if snap.x_axis_datetime else 0.0
@@ -159,11 +167,13 @@ def _build_figure(snapshots, stamp_lines, size_px):
         if snap.series:
             ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
 
-    if time_axes:
+    # A shared group has one locator/formatter (set on its first axis); each independent
+    # axis gets its own. The group shows tick labels only on its last subplot.
+    for group in ([linked_axes] if linked_axes else []) + [[ax] for ax in independent_axes]:
         locator = mdates.AutoDateLocator()
-        time_axes[0].xaxis.set_major_locator(locator)
-        time_axes[0].xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-        for ax in time_axes[:-1]:
+        group[0].xaxis.set_major_locator(locator)
+        group[0].xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        for ax in group[:-1]:
             ax.tick_params(axis="x", labelbottom=False)
             ax.xaxis.get_offset_text().set_visible(False)
 

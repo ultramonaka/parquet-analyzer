@@ -131,3 +131,23 @@ def test_fullwidth_characters_from_japanese_ime_are_normalized():
     np.testing.assert_array_equal(evaluate_expression("a＋b", variables), [5.0, 7.0, 9.0])
     np.testing.assert_array_equal(evaluate_expression("sqrt（a）", {"a": np.array([4.0, 9.0])}), [2.0, 3.0])
     np.testing.assert_array_equal(evaluate_expression("a　+　b", variables), [5.0, 7.0, 9.0])
+
+
+def test_rolling_nanmean_via_expression_and_registry():
+    from parquet_analyzer.core.functions import FunctionRegistry
+
+    a = np.array([1.0, 2.0, np.nan, 4.0, 5.0, 6.0, 7.0])
+    r = evaluate_expression("rolling_nanmean(a, 5)", {"a": a})
+    assert len(r) == len(a) and not np.isnan(r).any()
+    np.testing.assert_allclose(r[3], np.nanmean(a[1:6]))
+    assert np.isnan(evaluate_expression("rolling_mean(a, 5)", {"a": a})[3])
+    r2 = evaluate_expression("rolling_nanmean(a, 5)", {"a": a}, FunctionRegistry())
+    np.testing.assert_allclose(r2, r)
+    assert FunctionRegistry().kind("rolling_nanmean") == "builtin"
+
+
+def test_rolling_nanmean_enforces_arity():
+    a = np.array([1.0, 2.0, 3.0])
+    for expr in ("rolling_nanmean(a)", "rolling_nanmean(a, 3, 1)"):
+        with pytest.raises(ExpressionError):
+            evaluate_expression(expr, {"a": a})

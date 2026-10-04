@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import sys
 
@@ -11,10 +12,31 @@ import pyarrow.parquet as pq
 import pytest
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _gc_on_main_thread_only():
+    """detailed_specification.md 37.2 / backlog 13.6: automatic cyclic GC can run on a
+    QThreadPool worker and destroy Qt objects off the UI thread (intermittent crash in a
+    later, unrelated test). Disable it; `_collect_between_tests` collects on the main thread."""
+    was_enabled = gc.isenabled()
+    gc.disable()
+    yield
+    if was_enabled:
+        gc.enable()
+
+
+@pytest.fixture(autouse=True)
+def _collect_between_tests():
+    yield
+    gc.collect()
+
+
 @pytest.fixture(scope="session")
 def qapp():
+    from PySide6.QtCore import QCoreApplication, Qt
     from PySide6.QtWidgets import QApplication
 
+    if QApplication.instance() is None:  # same as __main__ (25.3); only possible before the app exists
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     yield app
 

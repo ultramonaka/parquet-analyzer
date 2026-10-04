@@ -12,3 +12,11 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Claude Code agent worktrees (parallel work; never part of the repo)
+.claude/worktrees/
+
+# coverage.py output
+.coverage
+.coverage.*
+htmlcov/
