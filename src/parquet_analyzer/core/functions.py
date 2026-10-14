@@ -8,8 +8,8 @@ from __future__ import annotations
 import ast
 import keyword
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping
 
 import numpy as np
 
@@ -77,7 +77,6 @@ def _is_ident(s: object) -> bool:
 def _static_check_calls(fn: UserFunction, registry: FunctionRegistry, old: str | None) -> None:
     """Arity / keyword checks for every call in the body, so errors surface at save time."""
     tree = _parse(fn.expression)
-    consts = {c[0] for c in fn.constants}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue

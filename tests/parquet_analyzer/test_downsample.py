@@ -83,25 +83,44 @@ def test_all_nan_series_does_not_crash():
     assert len(xd) == len(yd) == 40
 
 
+def _best_ms(fn, runs: int = 7) -> float:
+    """Best-of-N wall time in ms (the minimum is the least noisy estimate under CPU contention)."""
+    best = float("inf")
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t0)
+    return best * 1000
+
+
 def test_finite_only_data_is_not_slowed_down_by_nan_safety():
     """Regression test: the NaN-safety fix (nanmean, nan_to_num) originally ran
     unconditionally on every bucket regardless of whether the data actually had any
     NaN/Inf, using np.nanmean (~5x slower than np.mean) and re-entering
-    warnings.catch_warnings() every iteration — turning a real redraw at the app's
-    ~13M-row target scale from ~40ms into 100ms+. Finite-only data (the common case)
-    must run close to the original speed; a generous threshold keeps this from being
-    flaky on slower CI machines while still catching a real regression.
+    warnings.catch_warnings() every iteration -- making finite-only data ~2.5x slower than it
+    should be. Finite-only data (the common case) must take the fast path.
+
+    An absolute millisecond threshold is machine dependent (CI measured 65-87 ms against a
+    60 ms limit), so compare on the same machine, in the same process, best-of-N: the same data
+    with a single NaN injected takes the (slow) NaN-safe path and is the reference. The fast path
+    must be clearly faster (the regression made them equal, 1.0x; the fast path is ~2.5x).
     """
     n = 3_000_000
     x = np.linspace(0.0, 1000.0, n)
     y = np.sin(x)
+    y_nan = y.copy()
+    y_nan[n // 2] = np.nan
 
     # warm up (first call pays one-time interpreter/cache costs)
     lttb(x, y, 2400)
+    with np.errstate(invalid="ignore"):
+        lttb(x, y_nan, 2400)
 
-    t0 = time.perf_counter()
-    for _ in range(3):
-        lttb(x, y, 2400)
-    elapsed_ms = (time.perf_counter() - t0) / 3 * 1000
+    fast = _best_ms(lambda: lttb(x, y, 2400))
+    with np.errstate(invalid="ignore"):
+        slow = _best_ms(lambda: lttb(x, y_nan, 2400))
 
-    assert elapsed_ms < 60, f"lttb() on finite-only data took {elapsed_ms:.1f}ms, expected well under 60ms"
+    assert fast < slow / 1.5, (
+        f"lttb() on finite-only data took {fast:.1f}ms vs {slow:.1f}ms on the NaN-safe path; "
+        "the finite fast path should be well under the NaN-safe one"
+    )

@@ -59,11 +59,11 @@ docs/
 |---|---|---|---|
 | Data | [domains/data.md](./domains/data.md) | Reading Parquet, lazy/windowed reading, choosing the time-axis column, downsampling, the drawing indicator, the MDF/MATLAB conversion tool | `core/data_source.py`, `core/column.py`, `core/pyramid.py`, `core/downsample.py`, `core/numeric.py`, `core/background_worker.py`, `core/convert.py` |
 | Plots | [domains/plots.md](./domains/plots.md) | The main window's plots, the navigator, interaction (zoom/pan), cursors, multiple plots, height/reordering, per-series operations, independent X axes | `ui/plot_widget.py`, `ui/plot_grid.py`, `ui/navigator.py` |
-| Expressions | [domains/expressions.md](./domains/expressions.md) | Inter-variable expressions, derived variables and their editing, Δ analysis, user functions, maps | `core/expression.py`, `core/variable.py`, `core/analysis.py` (delta/rolling_mean), `ui/expression_bar.py`, `ui/variable_panel.py` |
-| Analysis | [domains/analysis.md](./domains/analysis.md) | Statistics, FFT, XY/XYZ plots (histogram later) | `core/analysis.py`, `ui/stats_dialog.py` |
+| Expressions | [domains/expressions.md](./domains/expressions.md) | Inter-variable expressions, derived variables and their editing, Δ analysis, user functions, maps, conditional branches (ch. 43) | `core/expression.py`, `core/variable.py`, `core/analysis.py` (delta/rolling_mean), `ui/expression_bar.py`, `ui/variable_panel.py` |
+| Analysis | [domains/analysis.md](./domains/analysis.md) | Statistics, FFT, XY/XYZ plots, histogram (ch. 42) | `core/analysis.py`, `core/histogram.py`, `ui/stats_dialog.py`, `ui/analysis_window.py`, `ui/xy_plot_window.py`, `ui/xy_map_view.py`, `ui/xy_overlay_controller.py`, `ui/histogram_window.py` |
 | Persistence | [domains/persistence.md](./domains/persistence.md) | Views (JSON, manager window), the settings file and settings menu, layout persistence | `io/view.py`, `io/settings.py`, `ui/view_manager.py`, `ui/settings_dialog.py`, `ui/folder_picker.py` |
 | Export | [domains/export.md](./domains/export.md) | Saving the plots as an image (re-drawn with matplotlib, annotation and metadata) | `ui/image_export.py` |
-| App foundation | [domains/app.md](./domains/app.md) | Directory layout and paths, startup, logs and the operation log, error handling, version, feature flags | `config.py`, `core/oplog.py`, `ui/main_window.py` (overall wiring), `ui/i18n.py` |
+| App foundation | [domains/app.md](./domains/app.md) | Directory layout and paths, startup, logs and the operation log, error handling, version, feature flags, tests for side effects of operations (ch. 45) | `config.py`, `core/oplog.py`, `ui/main_window.py` (overall wiring), `ui/i18n.py` |
 
 ### 1.1 Domain relation diagram
 
@@ -196,6 +196,7 @@ document first.
 | Pyramid | A coarse min/max envelope of a big column (`core/pyramid.py`) |
 | View | A saved screen configuration (`data/parquet_analyzer/*.json`) |
 | Feature flag | A switch that shows or hides the UI entry points of an unfinished feature (`features.py`) |
+| External review 1 / External review 2 | Code reviews by ChatGPT. In the spec, "external review #N" and "external review 1 #N" are item numbers of review 1 (2026-10-02, static review; original text in commit `2e794ca`'s `idea.md`, items later organized from `idea.md`); "external review 2 #N" are item numbers of review 2 (2026-10-04, public release 0.3.0; `idea.md`) |
 
 ## 4. Overall requirements (purpose, environment, non-functional requirements, out of scope)
 
@@ -275,11 +276,16 @@ src/parquet_analyzer/
 │   ├── plot_widget.py        # TimePlotWidget: zoom/pan, drawing series, cursors, hover readout (ch. 39),
 │   │                          # export_snapshot() for image export (19.1)
 │   ├── navigator.py          # NavigatorWidget: reduced overview + selection rectangle (shared, single)
+│   ├── navigator_sync.py     # NavigatorSync: creation of the overview and selection sync in one place (plots 24.9)
 │   ├── variable_panel.py     # VariablePanel: variable list, drag & drop, editing/deleting derived variables (18.3)
 │   ├── expression_bar.py     # ExpressionBar: expression input (including edit mode, 18.3)
 │   ├── stats_dialog.py       # StatsDialog: non-modal separate window with statistics
 │   ├── analysis_window.py    # AnalysisWindow: shared parts of analysis windows (range, follow, recompute; 25.1)
 │   ├── xy_plot_window.py     # XYPlotWindow: XY plot (25.2), 2D/3D switch (25.5)
+│   ├── xy_map_view.py        # XYMapViewMixin: XY map/curve display (settings row, computation, drawing, export; ch. 44, 44.12)
+│   ├── xy_overlay.py         # OverlayState (no Qt), contour line segments, overlay drawing for image export (44.7, 44.12)
+│   ├── xy_overlay_controller.py # XYOverlayController: overlay menu, drawing, contour values (via OverlayHost; 44.12)
+│   ├── histogram_window.py   # HistogramWindow: histogram (analysis 5.33, ch. 42)
 │   ├── xyz_3d_window.py      # Xyz3DView: 3D display (OpenGL, 25.3, 25.5)
 │   ├── analysis_common.py    # small helpers shared by XY and 3D (chunking, time ticks)
 │   ├── flow_layout.py        # a layout that wraps to the width (XY/3D settings row, 25.5)
@@ -304,6 +310,7 @@ src/parquet_analyzer/
 │   ├── expression.py         # evaluate_expression(): AST-whitelist evaluation, referenced_names()
 │   ├── functions.py          # registry for calling user functions and maps from expressions (ch. 26, 27)
 │   ├── maps.py               # LookupTable: curve/map interpolation and out-of-range handling (ch. 27)
+│   ├── histogram.py          # histogram computation (without/with groups, local-time groups; analysis 42.3)
 │   ├── analysis.py           # fft(), sampling_report() (ch. 32), delta, rolling_mean, basic_stats
 │   ├── variable.py           # DerivedVariable; dependency_order(), dependents_of() (18.1)
 │   ├── convert.py            # MDF/MATLAB→Parquet conversion (ch. 15); used only via convert_cli.py
@@ -345,6 +352,7 @@ package "ui" as ui {
   rectangle "plot_grid" as grid
   rectangle "plot_widget" as pw
   rectangle "navigator" as nav
+  rectangle "navigator_sync" as navsync
   rectangle "image_export" as ie
   rectangle "view_manager" as vm
   rectangle "settings_dialog" as sd
@@ -354,6 +362,10 @@ package "ui" as ui {
   rectangle "folder_picker" as fp
   rectangle "analysis_window" as aw
   rectangle "xy_plot_window" as xy
+  rectangle "xy_map_view" as xymv
+  rectangle "xy_overlay_controller" as xyoc
+  rectangle "xy_overlay" as xyo
+  rectangle "histogram_window" as hist
   rectangle "xyz_3d_window" as xyz
   rectangle "analysis_common / flow_layout" as acom
   rectangle "function_reference" as fref
@@ -383,11 +395,13 @@ package "core" as core {
   rectangle "variable" as var
   rectangle "analysis" as ana
   rectangle "oplog / oplog_view" as oplog
+  rectangle "histogram" as chist
   rectangle "convert" as conv
 }
 
 mw --> grid
 mw --> nav
+mw --> navsync
 mw --> ie
 mw --> vm
 mw --> sd
@@ -399,10 +413,18 @@ mw --> xy
 mw --> fm
 mw --> mm
 mw --> xyz
+mw --> hist
 mw --> fref
 fref --> fm
 fref --> expr
 xy --> xyz
+xy --> xymv
+xy --> xyoc
+xy --> xyo
+xyoc --> xyo
+xyoc --> xyz
+xyo --> pw
+xymv ..> xy : at run time, refers to XY_* constants, _colormap etc.
 xy --> acom
 xyz --> acom
 xyz --> aw
@@ -415,7 +437,18 @@ pw --> bw
 pw --> lttb
 pw ..> ie : PlotSnapshot
 nav --> lttb
+navsync --> nav
+navsync --> bw
+navsync --> col
+navsync --> pyr
+navsync --> tix
+navsync --> num
 xy --> aw
+hist --> aw
+hist --> chist
+hist --> acom
+hist --> ie
+chist --> num
 xy --> pw
 aw --> bw
 aw --> ie

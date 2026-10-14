@@ -16,18 +16,17 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QListWidget, QMessageBox, QToolBar, QToolButton
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QToolBar, QToolButton
 
 sys.path.insert(0, str(Path(__file__).parent))
 from generate_feature_test_parquet import build_table  # noqa: E402
 
 from parquet_analyzer import features  # noqa: E402
-from parquet_analyzer.ui import main_window as mw_mod  # noqa: E402
 from parquet_analyzer.ui import messages  # noqa: E402
 from parquet_analyzer.ui import xy_plot_window as xy_mod  # noqa: E402
 from parquet_analyzer.ui import xyz_3d_window as x3  # noqa: E402
-from parquet_analyzer.ui.flow_layout import FlowLayout  # noqa: E402
 from parquet_analyzer.ui.analysis_window import CANCELLED  # noqa: E402
+from parquet_analyzer.ui.flow_layout import FlowLayout  # noqa: E402
 from parquet_analyzer.ui.main_window import MainWindow  # noqa: E402
 from parquet_analyzer.ui.settings_dialog import SettingsDialog  # noqa: E402
 
@@ -241,7 +240,7 @@ def _graphs_entries(win):
 
 def test_graphs_menu_entries_follow_flags(qapp, isolated_config, monkeypatch):
     def entries(xy, xyz, fft):
-        for key, on in (("xy_plot", xy), ("xyz_3d", xyz), ("fft", fft)):
+        for key, on in (("xy_plot", xy), ("xyz_3d", xyz), ("fft", fft), ("histogram", False)):
             monkeypatch.setitem(features._EFFECTIVE, key, on)
         return _graphs_entries(MainWindow())
 
@@ -256,7 +255,7 @@ def test_graphs_button_replaces_the_standalone_toolbar_buttons(qapp, isolated_co
     for key in ("xy_plot", "xyz_3d", "fft"):
         monkeypatch.setitem(features._EFFECTIVE, key, True)
     win = MainWindow()
-    toolbar = win.findChild(QToolBar, "main_toolbar")
+    toolbar = win.findChild(QToolBar, "analysis_toolbar")
     button = win.findChild(QToolButton, "graphs_button")
     assert button is not None and button.objectName() == "graphs_button"
     assert toolbar.widgetForAction(toolbar.actions()[0]) is not None
@@ -321,16 +320,13 @@ def _toggle_3d(w):
 
 
 def _configure_3d(w, x="sine", y="cosine", z="ramp", color="z"):
-    for widget in (w._x_combo, w._y_list, w._z_combo, w._color_combo):
+    for widget in (w._x_combo, w._y_picker, w._z_combo, w._color_combo):
         widget.blockSignals(True)
     w._x_combo.setCurrentText(x)
-    w._y_list.clearSelection()
-    for i in range(w._y_list.count()):
-        if w._y_list.item(i).text() == y:
-            w._y_list.item(i).setSelected(True)
+    w._y_picker.set_selected([y])
     w._z_combo.setCurrentText(z)
     w._color_combo.setCurrentIndex(["single", "time", "z"].index(color))
-    for widget in (w._x_combo, w._y_list, w._z_combo, w._color_combo):
+    for widget in (w._x_combo, w._y_picker, w._z_combo, w._color_combo):
         widget.blockSignals(False)
     w._apply_color_constraints()
 
@@ -405,7 +401,7 @@ def test_toggle_carries_selections_across(qapp, mw, monkeypatch):
     assert w._z_combo.currentText() == "offset_sine" and w._z_combo.isEnabled()  # Z = third axis now
     assert w._color_combo.currentData() == "z"  # single colour is not offered in 3D
     assert not w._color_combo.model().item(0).isEnabled()
-    assert w._y_list.selectionMode() == QListWidget.SelectionMode.SingleSelection
+    assert w._y_picker._single
     assert w._display_group.isHidden() and w._view3d is not None and w._stack.currentWidget() is w._view3d
     assert w._result is not None and isinstance(w._result, x3.Xyz3DResult)
     # back to 2D: X/Y/Z stay (Y is the one that was kept)
@@ -421,14 +417,11 @@ def test_toggle_carries_selections_across(qapp, mw, monkeypatch):
 
 def _configure_2d_multi(w):
     w._x_combo.blockSignals(True)
-    w._y_list.blockSignals(True)
+    w._y_picker.blockSignals(True)
     w._x_combo.setCurrentText("sine")
-    w._y_list.clearSelection()
-    for i in range(w._y_list.count()):
-        if w._y_list.item(i).text() in ("cosine", "ramp"):
-            w._y_list.item(i).setSelected(True)
+    w._y_picker.set_selected(["cosine", "ramp"])
     w._x_combo.blockSignals(False)
-    w._y_list.blockSignals(False)
+    w._y_picker.blockSignals(False)
 
 
 def test_open_in_3d_computes_with_prefilled_selection(qapp, mw, monkeypatch):
@@ -491,7 +484,7 @@ def test_time_column_is_a_candidate_for_every_axis(qapp, mw):
     tc = mw._time_column
     for combo in (w._x_combo, w._z_combo):
         assert combo.findText(tc) >= 0
-    assert w._y_list.findItems(tc, Qt.MatchFlag.MatchExactly)
+    assert tc in w._y_picker.candidates()
     # defaults skip it: the first window does not start on the clock
     assert w._x_combo.currentText() != tc and w._z_combo.currentText() != tc
 
@@ -608,18 +601,15 @@ def test_time_as_2d_axis_export_is_local_time(qapp, mw, monkeypatch, tmp_path):
 
 
 def _configure_2d(w, x, ys, color=None, z=None):
-    for widget in (w._x_combo, w._y_list, w._color_combo, w._z_combo):
+    for widget in (w._x_combo, w._y_picker, w._color_combo, w._z_combo):
         widget.blockSignals(True)
     w._x_combo.setCurrentText(x)
-    w._y_list.clearSelection()
-    for i in range(w._y_list.count()):
-        if w._y_list.item(i).text() in ys:
-            w._y_list.item(i).setSelected(True)
+    w._y_picker.set_selected(ys)
     if color:
         w._color_combo.setCurrentIndex(["single", "time", "z"].index(color))
     if z:
         w._z_combo.setCurrentText(z)
-    for widget in (w._x_combo, w._y_list, w._color_combo, w._z_combo):
+    for widget in (w._x_combo, w._y_picker, w._color_combo, w._z_combo):
         widget.blockSignals(False)
     w._apply_color_constraints()
 

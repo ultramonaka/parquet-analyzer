@@ -17,11 +17,13 @@ ENV = features.ENV_VAR
 
 def test_defaults_match_spec():
     assert features.DEFAULT_FEATURES == {
-        "fft": False, "independent_x_axis": True, "xy_plot": True,
+        "fft": False, "histogram": True, "independent_x_axis": True, "xy_plot": True,
         "xyz_3d": True, "user_functions": True, "maps": True,
         "big_a_thin_first_draw": True,
         "big_c_windowed_derived": True,
         "big_d_time_index": True,
+        "map_from_xy": True,
+        "map_exclude_points": False,
     }
 
 

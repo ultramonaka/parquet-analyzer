@@ -19,20 +19,21 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 import numpy as np
 from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from ..core.oplog import log_op
+from .analysis_common import chunks as _chunks
+from .analysis_common import format_time_tick
 from .analysis_window import CANCELLED
 from .i18n import tr
 from .image_export import _FIG_DPI, _font_context
 from .plot_widget import _COLOR_CYCLE
-from .analysis_common import chunks as _chunks, format_time_tick
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +303,15 @@ def project_points(pos, proj: np.ndarray, view: np.ndarray, width: float, height
     return np.column_stack([sx, sy]), front
 
 
+def orphan_vertices(faces: np.ndarray, keep: np.ndarray) -> np.ndarray:
+    """Flat indices (`i*ny + j`) of the vertices that have a value (`keep`, shape (nx, ny)) but belong
+    to none of `faces` (44.3: drawn as points so a ring-shaped measurement does not lose them)."""
+    used = np.zeros(keep.size, dtype=bool)
+    if len(faces):
+        used[np.unique(faces)] = True
+    return np.flatnonzero(keep.ravel() & ~used)
+
+
 def pick_nearest(pos, proj: np.ndarray, view: np.ndarray, width: float, height: float,
                  mx: float, my: float, radius: float = HOVER_RADIUS_PX) -> int | None:
     """Index of the point closest to the mouse (mx, my) on screen within `radius` px, else None."""
@@ -330,6 +340,8 @@ class Xyz3DView(QWidget):
     # mouse, wheel, preset, `setCameraPosition`), and a preset/free-rotation frame change.
     cameraChanged = Signal()
     presetChanged = Signal(object)  # preset name ("home", "xy", ...) or None for a free rotation
+    # A left press released without moving on a surface grid point: (iy, ix) of that point (27.12).
+    gridPointClicked = Signal(int, int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -338,6 +350,7 @@ class Xyz3DView(QWidget):
         self._gl = gl
         self._camera_state: tuple | None = None
         self._syncing = False
+        self._press_pos = None  # left-press position awaiting its release (click vs drag, 27.12)
         owner = self
 
         class _WatchedView(gl.GLViewWidget):
@@ -355,6 +368,7 @@ class Xyz3DView(QWidget):
         self.setFocusProxy(self._view)
         self.setMinimumHeight(260)
         self._data_items: list = []
+        self.overlay_items: list = []  # registered maps overlaid on the scene (44.7); part of `_data_items`
         self._frame_items: list = []
         self._frame_args = None  # (bounds, labels) of the current frame
         self._hidden_ticks: str | None = None
@@ -416,7 +430,7 @@ class Xyz3DView(QWidget):
             self._camera_state = state
             self.cameraChanged.emit()
 
-    def link_camera(self, other: "Xyz3DView") -> None:
+    def link_camera(self, other: Xyz3DView) -> None:
         """Keep both views' cameras and preset frames identical, in both directions (27.9).
         Applying a state that is already current emits nothing, so there is no ping-pong."""
         for a, b in ((self, other), (other, self)):
@@ -518,12 +532,40 @@ class Xyz3DView(QWidget):
             else:
                 p = event.position()
                 self.hover_at(p.x(), p.y())
+        elif t == QEvent.Type.MouseButtonRelease:
+            self._finish_click(event)
         elif t in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress, QEvent.Type.Wheel):
             self._clear_hover()
+            if t == QEvent.Type.MouseButtonPress:
+                left = event.button() == Qt.MouseButton.LeftButton
+                self._press_pos = event.position() if left else None
             if t == QEvent.Type.MouseButtonPress:
                 self._rebuild_frame(None)  # a free rotation: every axis' ticks are readable again
                 self.presetChanged.emit(None)
         return False
+
+    def _finish_click(self, event) -> None:
+        """A left release within `startDragDistance` of its press is a click: emit
+        `gridPointClicked(iy, ix)` for the surface grid point under it (27.12). Drags (rotate / pan)
+        and non-surface scenes emit nothing."""
+        start, self._press_pos = self._press_pos, None
+        if start is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        end = event.position()
+        if (end - start).manhattanLength() >= QApplication.startDragDistance():
+            return
+        i = self.pick_at(end.x(), end.y())
+        cell = self.grid_index_of(i) if i is not None else None
+        if cell is not None:
+            self.gridPointClicked.emit(*cell)
+
+    def grid_index_of(self, i: int) -> tuple[int, int] | None:
+        """`(iy, ix)` of `scene["pos"][i]` for a surface scene, else None (27.12)."""
+        grid = self.scene.get("grid_index")
+        if self.scene.get("kind") != "surface" or grid is None:
+            return None
+        ix, iy = divmod(int(grid[i]), self.scene["ny"])  # vertex number = ix * ny + iy
+        return int(iy), int(ix)
 
     # -- hover -----------------------------------------------------------------------
 
@@ -559,6 +601,12 @@ class Xyz3DView(QWidget):
             f"{n}: {format_axis_value(v, *bounds[k], k in time_axes)}"
             for k, n, v in zip("xyz", self.scene["labels"], real)
         )
+        extra = self.scene.get("extra")
+        if extra is not None:
+            text += "   " + str(extra[i])
+        elif self.scene.get("extra_fn") is not None:
+            ix, iy = divmod(int(self.scene["extra_index"][i]), self.scene["ny"])
+            text += "   " + str(self.scene["extra_fn"](iy, ix))
         t = self.scene.get("time")
         if t is not None:
             tv = np.asarray(t, dtype=np.float64)
@@ -600,6 +648,8 @@ class Xyz3DView(QWidget):
     # -- scene ---------------------------------------------------------------------
 
     def _clear(self, items: list) -> None:
+        if items is self._data_items:
+            self.overlay_items.clear()  # they go with the scene (the window re-adds them, 44.7)
         for it in items:
             self._view.removeItem(it)
         items.clear()
@@ -645,6 +695,7 @@ class Xyz3DView(QWidget):
         self._clear(self._frame_items)
         self._clear_hover()
         self.scene = {}
+        self.orphan_points = np.empty((0, 3), dtype=np.float32)  # points drawn for faceless valued vertices (44.3)
         self.set_colorbar(None)
 
     def set_scatter(self, x, y, z, colors, bounds=None, labels=("X", "Y", "Z"), size: float = 4.0, times=None,
@@ -668,13 +719,17 @@ class Xyz3DView(QWidget):
         self.scene = {"kind": "scatter", "pos": pos, "real": np.column_stack(arrs), "colors": rgba, "bounds": bounds,
                       "labels": labels, "time_axes": tuple(time_axes), "time": None if times is None else np.asarray(times, dtype=np.float64)}
 
-    def set_surface(self, x_axis, y_axis, z_grid, labels=("X", "Y", "Z"), axis_names=None, z_range=None) -> None:
+    def set_surface(self, x_axis, y_axis, z_grid, labels=("X", "Y", "Z"), axis_names=None, z_range=None,
+                    extra=None) -> None:
         """Surface of a grid: `z_grid` is shaped (len(y_axis), len(x_axis)), the map convention
-        (27.1). NaN cells are drawn at the grid's minimum. `axis_names` = ("X", "Y", "Z") titles
+        (27.1). A NaN (empty, 27.10 / 44.3) grid point is not drawn: every square it touches is left
+        out of the mesh, and it is no hover candidate. `axis_names` = ("X", "Y", "Z") titles
         (the map's axis names, 27.7); it overrides `labels`, default X/Y/Z (25.3). `z_range` =
         (lo, hi) fixes the Z normalization (and colours) instead of the grid's own min/max, so
-        two surfaces can share one scale (27.9)."""
+        two surfaces can share one scale (27.9). `extra` = a (len(y), len(x)) array of strings (or a function `(iy, ix) -> str`) appended to
+        each grid point's hover readout (the XY map: "count: n (filled)", 44.3)."""
         self._clear_hover()
+        self.orphan_points = np.empty((0, 3), dtype=np.float32)  # test hook: the points drawn for orphans
         if axis_names is not None:
             labels = tuple(axis_names)
         xs, ys = np.asarray(x_axis, dtype=np.float64), np.asarray(y_axis, dtype=np.float64)
@@ -692,15 +747,122 @@ class Xyz3DView(QWidget):
         self._clear(self._data_items)
         self._build_frame(bounds, labels)
         item = self._gl.GLSurfacePlotItem(x=xn, y=yn, z=zn, colors=colors, shader="shaded", smooth=False)
+        keep = np.isfinite(z).T  # (nx, ny), like zn
+        orphans = np.empty(0, dtype=np.intp)
+        if not keep.all():
+            orphans = self._drop_empty_faces(item, keep)
         self._data_items.append(item)
         self._view.addItem(item)
+        if len(orphans):  # valued points that lost every face are drawn as coloured points (44.3)
+            gx0, gy0 = np.meshgrid(xn, yn, indexing="ij")
+            opos = np.column_stack([gx0.ravel(), gy0.ravel(), zn.ravel()])[orphans].astype(np.float32)
+            dots = self._gl.GLScatterPlotItem(pos=opos, color=colors[orphans], size=6.0, pxMode=True)
+            dots.setGLOptions("translucent")
+            self._data_items.append(dots)
+            self._view.addItem(dots)
+            self.orphan_points = opos
         # grid vertices are the hover candidates: (nx*ny, 3), real values straight from the table
         gx, gy = np.meshgrid(xn, yn, indexing="ij")
         rx, ry = np.meshgrid(xs, ys, indexing="ij")
         pos = np.column_stack([gx.ravel(), gy.ravel(), zn.ravel()]).astype(np.float32)
         real = np.column_stack([rx.ravel(), ry.ravel(), z.T.ravel()])
+        if not keep.all():
+            flat = keep.ravel()
+            pos, real = pos[flat], real[flat]
+        extras = extra_fn = vidx = None
+        # vertex number = ix * ny + iy for each candidate: maps a picked point back to its cell (27.12)
+        grid_index = np.arange(len(xs) * len(ys))
+        if not keep.all():
+            grid_index = grid_index[keep.ravel()]
+        if callable(extra):  # `extra(iy, ix) -> str`, evaluated lazily for the hovered point only
+            extra_fn = extra
+            vidx = grid_index
+        elif extra is not None:
+            extras = np.asarray(extra, dtype=object).T.ravel()
+            if not keep.all():
+                extras = extras[keep.ravel()]
         self.scene = {"kind": "surface", "x": xn, "y": yn, "z": zn, "pos": pos, "real": real, "time": None,
-                      "colors": colors, "bounds": bounds, "labels": labels, "time_axes": ()}
+                      "colors": colors, "bounds": bounds, "labels": labels, "time_axes": (), "extra": extras,
+                      "extra_fn": extra_fn, "extra_index": vidx, "ny": len(ys),
+                      "grid_index": grid_index}
+
+    def add_points(self, x, y, z, color=(0.3, 0.3, 0.3, 0.75), size: float = 3.0) -> None:
+        """Overlay measured points (real values) on the current scene, normalized with its bounds
+        (the XY map's "show measured points", 44.3). Does nothing before a scene exists."""
+        bounds = self.scene.get("bounds")
+        if not bounds or len(x) == 0:
+            return
+        arrs = [np.asarray(a, dtype=np.float64) for a in (x, y, z)]
+        pos = np.column_stack([normalize(a, *bounds[k]) for k, a in zip("xyz", arrs)]).astype(np.float32)
+        item = self._gl.GLScatterPlotItem(pos=pos, color=color, size=size, pxMode=True)
+        item.setGLOptions("translucent")
+        self._data_items.append(item)
+        self._view.addItem(item)
+
+    def add_surface_overlay(self, x_axis, y_axis, z_grid, color=(0.85, 0.2, 0.2, 0.4)) -> bool:
+        """A translucent single-colour surface of another map over the current scene (44.7). It is
+        normalised with the scene's bounds, clipped to the X / Y range (the caller widens Z so that
+        every value fits) and NaN (empty, 27.10) grid points drop the
+        squares they touch. Returns whether anything was added."""
+        bounds = self.scene.get("bounds")
+        if not bounds:
+            return False
+        xs, ys = np.asarray(x_axis, dtype=np.float64), np.asarray(y_axis, dtype=np.float64)
+        z = np.asarray(z_grid, dtype=np.float64)
+        ix = np.flatnonzero((xs >= bounds["x"][0]) & (xs <= bounds["x"][1]))
+        iy = np.flatnonzero((ys >= bounds["y"][0]) & (ys <= bounds["y"][1]))
+        if len(ix) < 2 or len(iy) < 2:
+            return False
+        z = z[np.ix_(iy, ix)].copy()
+        zlo, zhi = bounds["z"]  # the window widens the scene's Z range to hold the overlay (44.7)
+        if not np.isfinite(z).any():
+            return False
+        xn, yn = normalize(xs[ix], *bounds["x"]), normalize(ys[iy], *bounds["y"])
+        zn = normalize(np.where(np.isfinite(z), z, zlo), zlo, zhi).T  # pyqtgraph wants (nx, ny)
+        colors = np.tile(np.asarray(color, dtype=np.float32), (zn.size, 1))
+        item = self._gl.GLSurfacePlotItem(x=xn, y=yn, z=zn, colors=colors, smooth=False)
+        item.setGLOptions("translucent")
+        keep = np.isfinite(z).T
+        if not keep.all():
+            self._drop_empty_faces(item, keep)
+        self._data_items.append(item)
+        self.overlay_items.append(item)
+        self._view.addItem(item)
+        return True
+
+    def clear_overlays(self) -> None:
+        """Remove the overlay surfaces (the base scene stays)."""
+        for it in self.overlay_items:
+            if it in self._view.items:
+                self._view.removeItem(it)
+            if it in self._data_items:
+                self._data_items.remove(it)
+        self.overlay_items.clear()
+
+    @staticmethod
+    def _drop_empty_faces(item, keep: np.ndarray) -> np.ndarray:
+        """Remove the mesh squares that touch a vertex with `keep == False` (shape (nx, ny)). pyqtgraph's
+        surface numbers vertices `i*ny + j` and makes two triangles per square; GLSurfacePlotItem
+        cannot draw NaN, and alpha 0 per vertex would fade the neighbours, so the faces go instead.
+        Returns the flat indices of the valued vertices left without any face (`orphan_vertices`)."""
+        nx, ny = keep.shape
+        if nx < 2 or ny < 2:
+            return np.empty(0, dtype=np.intp)
+        md = item.opts["meshdata"]
+        faces = md.faces()
+        if faces is None or not len(faces):
+            return np.empty(0, dtype=np.intp)
+        if len(faces) == 2 * (nx - 1) * (ny - 1):
+            # pyqtgraph: row i (of nx-1) holds the first triangles of its ny-1 squares, then the second
+            # ones; a square goes as a whole when any of its four corners is empty (44.3)
+            square_ok = keep[:-1, :-1] & keep[1:, :-1] & keep[:-1, 1:] & keep[1:, 1:]  # (nx-1, ny-1)
+            good = np.concatenate([square_ok, square_ok], axis=1).ravel()
+        else:  # an unexpected face layout: drop the triangles that use an empty vertex
+            good = keep.ravel()[faces].all(axis=1)
+        kept_faces = np.ascontiguousarray(faces[good])
+        md.setFaces(kept_faces)
+        item.meshDataChanged()
+        return orphan_vertices(kept_faces, keep)
 
     # -- colour bar ----------------------------------------------------------------
 

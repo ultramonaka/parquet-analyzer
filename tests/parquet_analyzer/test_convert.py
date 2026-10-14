@@ -32,7 +32,7 @@ def test_mdf_time_column_is_absolute_epoch_seconds(tmp_path):
     the converted "time" column would render as dates near 1970-01-01 in the app.
     """
     t = np.linspace(0.0, 10.0, 1000)
-    start = dt.datetime(2026, 3, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    start = dt.datetime(2026, 3, 1, 12, 0, 0, tzinfo=dt.UTC)
     src = tmp_path / "sample.mf4"
     _write_mdf(src, start, {"temperature": (t, np.sin(t)), "pressure": (t, np.cos(t))})
 
@@ -55,7 +55,7 @@ def test_mdf_conversion_resamples_multi_rate_channels_onto_one_time_axis(tmp_pat
     src = tmp_path / "multirate.mf4"
     _write_mdf(
         src,
-        dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         {"fast": (t_fast, np.sin(t_fast)), "slow": (t_slow, np.cos(t_slow))},
     )
 

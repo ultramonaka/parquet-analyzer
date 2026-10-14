@@ -33,7 +33,7 @@ def _mat(tmp_path, name="a.mat", **variables):
     return path
 
 
-def _mdf(tmp_path, name, channels, start=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)):
+def _mdf(tmp_path, name, channels, start=dt.datetime(2026, 1, 1, tzinfo=dt.UTC)):
     from asammdf import MDF, Signal
 
     mdf = MDF()

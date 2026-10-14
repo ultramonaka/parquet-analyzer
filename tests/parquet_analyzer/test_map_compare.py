@@ -7,14 +7,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from PySide6.QtWidgets import QMessageBox
+from test_functions_maps_ui import CURVE, MAP, _csv, boxes, flags_on, win  # noqa: F401  (fixtures/helpers)
 
 from parquet_analyzer import features
 from parquet_analyzer.ui import map_manager
 from parquet_analyzer.ui import xyz_3d_window as x3
 from parquet_analyzer.ui.i18n import tr
 from parquet_analyzer.ui.map_manager import MapManagerWindow
-
-from test_functions_maps_ui import CURVE, MAP, _csv, boxes, flags_on, win  # noqa: F401  (fixtures/helpers)
 
 
 @pytest.fixture(autouse=True)

@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QWidget
 
-from ..core.expression import ExpressionError
+from ..core.expression import ExpressionError, UnknownFunctionError
 from . import messages
 from .i18n import tr
 
@@ -85,6 +85,9 @@ class ExpressionBar(QWidget):
             return
         try:
             self._evaluate_callback(name, expr)
+        except UnknownFunctionError as e:  # translated "function/map not found" (26.1, 43.5)
+            messages.warning(self, tr("expr.error_title"), tr("error.unknown_function", name=e.name))
+            return
         except ExpressionError as e:
             messages.warning(self, tr("expr.error_title"), str(e))
             return  # stays in edit mode (if editing) with the user's text intact

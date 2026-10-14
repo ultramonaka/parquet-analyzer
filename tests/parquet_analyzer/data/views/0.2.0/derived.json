@@ -1,0 +1,65 @@
+{
+  "schema_version": "1",
+  "view_name": "derived",
+  "source": {
+    "parquet_path": "/tmp/parquet_analyzer_old_views/0.2.0/sample.parquet",
+    "path_type": "absolute"
+  },
+  "derived_variables": [
+    {
+      "name": "d_double",
+      "expression": "sine * 2"
+    },
+    {
+      "name": "d_sum",
+      "expression": "d_double + cosine"
+    },
+    {
+      "name": "d_abs",
+      "expression": "abs(sine - cosine)"
+    }
+  ],
+  "plots": [
+    {
+      "plot_id": "p1",
+      "series": [
+        {
+          "variable": "d_sum",
+          "color": "#1f77b4"
+        },
+        {
+          "variable": "d_abs",
+          "color": "#ff7f0e"
+        }
+      ],
+      "y_axis_range": [
+        -2.325483206741904,
+        2.3254977783513495
+      ]
+    },
+    {
+      "plot_id": "p2",
+      "series": [
+        {
+          "variable": "d_double",
+          "color": "#1f77b4"
+        },
+        {
+          "variable": "flag",
+          "color": "#ff7f0e"
+        }
+      ],
+      "y_axis_range": [
+        -2.0799982700985566,
+        2.079991782486503
+      ]
+    }
+  ],
+  "x_axis_range": [
+    1767225571.4335537,
+    1767227099.8209918
+  ],
+  "downsample": {
+    "enabled": false
+  }
+}

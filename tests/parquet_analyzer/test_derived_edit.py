@@ -11,7 +11,6 @@ from parquet_analyzer.core.variable import dependency_order, dependents_of
 from parquet_analyzer.io import view as view_io
 from parquet_analyzer.ui.main_window import MainWindow
 
-
 # -- core ------------------------------------------------------------------------------
 
 
@@ -139,7 +138,7 @@ def test_panel_marks_derived_variables_and_keeps_marks_across_time_axis_switch(w
 def test_view_saves_edited_variables_in_dependency_order_and_reloads(win, monkeypatch):
     from PySide6.QtWidgets import QInputDialog, QMessageBox
 
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("v", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("v", True)))
     monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
     win._on_add_derived_variable("d1", "a")
     win._on_add_derived_variable("d2", "b * 2")
@@ -186,7 +185,7 @@ def test_edit_request_puts_expression_bar_in_edit_mode(win):
 
 
 def test_variable_names_can_be_inserted_while_editing(win, qapp):
-    from PySide6.QtCore import QMimeData, QPointF, Qt
+    from PySide6.QtCore import QPointF, Qt
     from PySide6.QtGui import QDropEvent
 
     win._on_add_derived_variable("d1", "a")

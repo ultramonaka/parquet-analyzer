@@ -291,11 +291,12 @@ def test_variable_panel_context_menu(qapp, monkeypatch):
     def ctx(point):
         panel.contextMenuEvent(QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point, panel.mapToGlobal(point)))
 
-    ctx(rect_a.center())  # file column: no menu
     ctx(panel.viewport().rect().bottomRight())  # empty area
     assert menus == []
+    ctx(rect_a.center())  # file column: only "Add alias..." (persistence 54.3), nothing to edit/delete
+    assert menus == [["Add alias..."]]
     ctx(rect_d.center())
-    assert len(menus) == 1 and len(menus[0]) == 2
+    assert len(menus) == 2 and len(menus[1]) == 2
 
 
 def test_variable_panel_mime_text_is_first_item(qapp):

@@ -3,7 +3,7 @@
 **[English](#english)** | **[日本語](#japanese)**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-0.3.0-informational.svg)
+![Version](https://img.shields.io/badge/version-0.4.0-informational.svg)
 ![Author](https://img.shields.io/badge/author-ultramonaka-lightgrey.svg)
 
 ---
@@ -21,6 +21,23 @@ For the specification, start at
 links to the per-domain specs in `src/parquet_analyzer/docs/domains/` (a Japanese edition, `*.ja.md`,
 sits next to each file).
 
+### Quick start
+
+1. `tools/run.sh` (Windows: `tools\run.bat`; macOS double-click: `tools/run.command`), then "Open" a Parquet file.
+2. Drag a column from the "Variables" panel onto a plot ("+ Add plot" for another pane).
+3. Zoom and pan with Ctrl + scroll / scroll, or drag the frame in the navigator at the top.
+4. Type an expression such as `speed * 3.6` into the expression bar at the bottom and "Add" it —
+   it becomes a derived variable you can plot like a column.
+5. Save the layout as a view ("View ▾" > "Save..." on the toolbar) to reopen it on this or another file.
+
+**Reporting a bug**: just reproduce it in a normal run (every run writes an operation log), then
+run `tools/show_ops_log.sh --session` and attach its output (or today's `*_ops_*.log` from
+Settings > "Open log folder") to the report, with what you expected to happen.
+
+**Large files** (measured on an Apple M4 Pro / 24 GB, 100 million rows, 4.6 GB): the first draw
+takes about 1.1 s, zooming and panning 0.1–0.5 s; memory is about 1.4 GB in normal use and peaks at
+about 4.7 GB (statistics over the whole file). Details: data domain 36.4 / 36.7.
+
 ### Requirements
 
 - Windows or macOS
@@ -37,7 +54,7 @@ tools\run.bat          # Windows
 On first launch `uv` automatically installs the dependencies (PySide6, pyqtgraph,
 polars, pyarrow, numpy, matplotlib).
 
-The UI is in English by default; switch to Japanese in "Settings" (takes effect after
+The UI is in English by default; switch to Japanese in "⚙ ▾" > "Settings..." (takes effect after
 a restart). Button names below are the English ones.
 
 On macOS, double-clicking a `.sh` file just opens it in a text editor by default and
@@ -113,7 +130,7 @@ that go up and down relate to each other, use the XY plot rather than changing t
 | Mouse wheel scroll | Pan along the time axis (no zoom) |
 | Ctrl + scroll | Zoom time (X) axis only |
 | Shift + scroll | Zoom amplitude (Y) axis only |
-| H key / Home button | Reset the view to the full data range |
+| H key / "Show all" button | Reset the view to the full data range |
 | R key / Redraw button | Recompute downsampling for the current view |
 
 Which action each of plain/Ctrl+/Shift+scroll performs is configurable in the
@@ -129,7 +146,7 @@ Large datasets are automatically decimated for display based on pixel count (the
 algorithm, which preserves a waveform's peaks/troughs while reducing point count).
 This recompute runs asynchronously on a background thread — a progress indicator
 appears in the status bar while it's running, but the UI itself never blocks.
-"Allow coarse preview" on the toolbar can be turned off to always draw the real,
+"Allow coarse preview" in the toolbar's "⚙ ▾" menu can be turned off to always draw the real,
 per-sample data (slower on very large files).
 
 **Large files** (by default, when a column is over 512 MB; configurable in Settings) are
@@ -166,11 +183,23 @@ isn't included in exported images.
   the variable panel (shown in italics; hover it to see its expression).
   - Operators: `+ - * / ** % //`
   - Functions (all elementwise): `abs`, `sqrt`, `delta` (first-order difference),
-    `rolling_mean(a, window)` (moving average; a missing value in the window makes the
-    result missing), `rolling_nanmean(a, window)` (moving average ignoring missing values),
+    `rolling_mean(a, window)` (centered moving average: the window spans samples before and
+    after the point — for an even window n, n/2 before and n/2-1 after; a missing value in
+    the window makes the result missing), `rolling_nanmean(a, window)` (the same centered
+    window, ignoring missing values),
+    `trailing_mean(a, window)` (past-only moving average: for each point, the mean of the current
+    point and up to window-1 past points; at the start, averages available points; missing values
+    propagate but only window-1 points forward), `trailing_nanmean(a, window)` (the same past-only
+    window, ignoring missing values),
     `sin`, `cos`, `tan`, `exp`, `log`, `log10`, `sign`, `floor`, `ceil`, `round`,
     `min(a, b)`, `max(a, b)`, `clip(a, lo, hi)` (`min`/`max` are elementwise comparisons
     here, unlike Python's built-ins — they don't reduce to a single scalar).
+  - Conditionals: `where(c, a, b)` or `a if c else b` (a where the condition is true, else b),
+    comparisons `< <= > >= == !=` (chains like `0 < a < 5` work) and `and` / `or` / `not`,
+    which give 1 (true) or 0 (false) and so can be used in arithmetic, e.g. `(a > 0) * a`.
+    `isnan(a)` is 1 for missing values. A comparison or condition involving a missing value
+    (NaN) is itself missing, except that `and`/`or` use three-valued logic (`true or NaN` is 1,
+    `false and NaN` is 0); replace missing values with `where(isnan(a), 0, a)`.
 - Defining a derived variable with the same name as an existing column is an error
   (to prevent accidentally shadowing real data).
 - Right-click a derived variable in the panel for "Edit expression..." or "Delete".
@@ -180,7 +209,7 @@ isn't included in exported images.
   back to itself (circularly) is rejected.
 - Double-clicking a variable in the panel — or dragging it onto the expression bar —
   inserts its name at the cursor position, also while editing.
-- "Functions..." in the expression bar opens a list of the built-in functions, user
+- "Function list..." in the expression bar opens a list of the built-in functions, user
   functions and maps (syntax, description, example) in a separate window; a chosen
   example can be inserted into the expression bar.
 - Frequency analysis (FFT) exists internally, but it is hidden from the "Graphs ▾" menu by a
@@ -198,7 +227,7 @@ isn't included in exported images.
 
 #### User functions and maps
 
-- **User functions** ("Functions" on the toolbar): define an expression with arguments and
+- **User functions** ("User functions" on the toolbar): define an expression with arguments and
   constants (with default values) once and use it with any file. Example:
   `Power_flow_by_press(flow_lpm, press_kpa)` = `flow_lpm * press_kpa / k` (`k = 60000`); in an
   expression, `power1 = Power_flow_by_press(signal1, signal2)`, and override a constant with
@@ -233,7 +262,7 @@ the viewpoint. Where OpenGL isn't available 3D can't be selected (the tooltip sa
 
 #### Saving and loading views
 
-"Save view" saves the current plot layout, overlaid variables, and expressions as a
+"View ▾" > "Save..." on the toolbar saves the current plot layout, overlaid variables, and expressions as a
 "view" (JSON, under `data/parquet_analyzer/`). Derived variables are saved as their defining
 formula rather than computed values, so they're recomputed from the source columns
 whenever the view is loaded — including after the underlying data has changed. If any
@@ -250,7 +279,10 @@ A view also records the time-axis column, and loading it switches back to that c
 source file's location is saved as a relative path as well, so a folder holding the data and
 its views can be moved elsewhere and still open.
 
-"View..." opens the view manager: pick a saved view to see what it contains before
+The save dialog lists the saved views: pick one to overwrite it (you are asked to confirm) or type a
+new name. After a view has been loaded, its name is filled in first.
+
+"View ▾" > "Manage..." opens the view manager: pick a saved view to see what it contains before
 loading it — source file, each plot's channels with their colors, derived variables
 and their expressions, the saved time range, and when it was saved. With a file open,
 channels that file doesn't have (and would be skipped) are shown in red. Views can be
@@ -267,7 +299,7 @@ time range, the export date/time, and the app version.
 
 #### Settings menu
 
-"Settings" on the toolbar lets you change the following (saved to
+"⚙ ▾" > "Settings..." on the toolbar lets you change the following (saved to
 `cfg/parquet_analyzer/settings.json` and restored on next launch):
 
 - Auto-redraw on/off (manual redraw via the R button/shortcut always works even when
@@ -277,7 +309,7 @@ time range, the export date/time, and the app version.
   range only) instead of being fully loaded once and kept resident — only affects
   files opened after the change
 - Which action (X zoom / Y zoom / pan) each of plain/Ctrl+/Shift+scroll performs
-- Keyboard shortcuts for each toolbar action (home, redraw, open, add plot, statistics,
+- Keyboard shortcuts for each toolbar action (show all, redraw, open, add plot, statistics,
   XY / 3D plot, save view, view manager, save image, coarse-preview toggle, cursor, values,
   functions, maps) and for removing the selected series (Delete by default) — frequency
   analysis is omitted here while it is hidden from the menu, see above
@@ -288,7 +320,7 @@ time range, the export date/time, and the app version.
 
 Window size, the variable panel's dock position, and similar screen layout are saved
 automatically on exit and restored on next launch. The variable panel defaults to the
-left side of the window. "Reset layout" on the toolbar discards
+left side of the window. "Reset layout" in the toolbar's "⚙ ▾" menu discards
 the saved layout and restores the default arrangement at any time.
 
 ### Converting MDF/MATLAB files
@@ -347,6 +379,8 @@ uv run python tests/parquet_analyzer/generate_feature_test_parquet.py
 
 Licensed under the **[MIT License](LICENSE)**.
 
+For information about third-party software and libraries used by this application, see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
 **Author**: [ultramonaka](https://github.com/ultramonaka)
 
 ---
@@ -360,6 +394,21 @@ XY・3Dプロット、カーソル、ホバー表示、ビュー保存、画像�
 
 仕様の詳細は [`src/parquet_analyzer/docs/overview.ja.md`](src/parquet_analyzer/docs/overview.ja.md)
 （総括仕様）から、分野ごとの仕様（`src/parquet_analyzer/docs/domains/`）へ辿れる。
+
+### 最短ルート
+
+1. `tools/run.sh`（Windowsは`tools\run.bat`、macOSのダブルクリックは`tools/run.command`）で起動し、「開く」でParquetファイルを選ぶ。
+2. 「変数」パネルから列をプロットへドラッグする（プロットを増やすときは「＋ プロット追加」）。
+3. Ctrl＋スクロールでズーム、スクロールでパン。画面上部のナビゲータの枠をドラッグしても動かせる。
+4. 画面下部の演算式入力欄に`speed * 3.6`のような式を入れて「追加」すると仮想変数になり、
+   列と同じようにプロットできる。
+5. ツールバーの「ビュー ▾」→「保存...」で今の配置を「ビュー」として保存すると、同じファイルや別のファイルで呼び出せる。
+
+**不具合の報告**: 普通に起動して再現し（操作ログは毎回書かれる）、`tools/show_ops_log.sh --session`の
+出力（または設定画面の「ログのフォルダを開く」にある当日の`*_ops_*.log`）を、期待していた動きと一緒に添える。
+
+**大きなファイル**（Apple M4 Pro／24GB、1億行・4.6GBで測定）: 最初の描画は約1.1秒、ズーム・パンは
+0.1〜0.5秒。メモリは普段約1.4GB、ファイル全体の統計の計算中に最大約4.7GB。詳細はデータの仕様36.4・36.7。
 
 ### 必要環境
 
@@ -376,7 +425,7 @@ tools\run.bat          # Windows
 初回起動時に `uv` が依存パッケージ（PySide6, pyqtgraph, polars, pyarrow, numpy, matplotlib）を
 自動でインストールする。
 
-画面の表示言語は既定で英語。「Settings」（設定）で日本語に切り替えられる（再起動後に反映）。
+画面の表示言語は既定で英語。ツールバーの「⚙ ▾」→「Settings...」（設定）で日本語に切り替えられる（再起動後に反映）。
 以下のボタン名は日本語表示時のもの。
 
 macOSでは `.sh` はダブルクリックしても既定でテキストエディタが開くだけで実行されない
@@ -448,7 +497,7 @@ XYプロットを使う。
 | マウスホイールスクロール | 時間軸方向にパン（移動。ズームはしない） |
 | Ctrl + スクロール | 時間軸（X軸）のみズーム |
 | Shift + スクロール | Amp（Y軸）のみズーム |
-| H キー / ホームボタン | 表示範囲を全データ表示にリセット |
+| H キー / 「全体表示」ボタン | 表示範囲を全データ表示にリセット |
 | R キー / 再描画ボタン | 現在の表示範囲でダウンサンプリングを再計算 |
 
 無印/Ctrl+/Shift+スクロールそれぞれの動作は、「設定」ダイアログの「スクロール操作」欄で
@@ -462,7 +511,7 @@ XYプロットを使う。
 大量データはピクセル数に応じて自動的に間引いて（ダウンサンプリング）表示される
 （LTTBアルゴリズム、波形のピーク・谷を保ったまま点数を削減）。この再計算は別スレッドで
 非同期に実行されるため、実行中はステータスバーに進捗バーが表示されるがUI操作はブロックされない。
-ツールバーの「簡易表示を許可」をオフにすると、常に間引かない実データで描画する（非常に大きな
+ツールバーの「⚙ ▾」の「簡易表示を許可」をオフにすると、常に間引かない実データで描画する（非常に大きな
 ファイルでは遅くなる）。
 
 **大きなファイル**（既定では1列が512MBを超えるもの。設定で変更可）は、列を丸ごと読まず、表示範囲の
@@ -492,10 +541,18 @@ XYプロットを使う。
   （仮想変数）として変数パネルに追加される（斜体で表示。ホバーすると式を確認できる）。
   - 演算子: `+ - * / ** % //`
   - 関数（いずれも要素ごとの演算）: `abs`, `sqrt`, `delta`（1階差分）,
-    `rolling_mean(a, window)`（移動平均。窓の中に欠損があると結果も欠損）,
-    `rolling_nanmean(a, window)`（欠損を除いた移動平均）, `sin`, `cos`, `tan`, `exp`, `log`, `log10`,
+    `rolling_mean(a, window)`（中心移動平均。窓はその点の前後にまたがる。偶数nのときは
+    前にn/2点・後にn/2-1点。窓の中に欠損があると結果も欠損）,
+    `rolling_nanmean(a, window)`（同じ窓で欠損を除いた中心移動平均）,
+    `trailing_mean(a, window)`（過去だけの移動平均。各点でその点と過去最大window-1点の平均。先頭ではある分だけで平均。欠損がn-1点先まで伝播）,
+    `trailing_nanmean(a, window)`（同じ過去だけの窓で欠損を除いた移動平均）,
+    `sin`, `cos`, `tan`, `exp`, `log`, `log10`,
     `sign`, `floor`, `ceil`, `round`, `min(a, b)`, `max(a, b)`, `clip(a, lo, hi)`
     （`min`/`max`はPython組み込みと違い要素ごとの比較で、スカラー1つを返す集約関数ではない）
+  - 条件分岐: `where(c, a, b)` または `a if c else b`（条件が真ならa、偽ならb）、
+    比較 `< <= > >= == !=`（`0 < a < 5`のような連続した比較も可）、`and` / `or` / `not`。
+    結果は1（真）か0（偽）なので `(a > 0) * a` のように計算にも使える。`isnan(a)` は欠損なら1。
+    欠損(NaN)を含む比較・条件の結果は欠損になる（`and`/`or`は3値論理: 真 or 欠損=1、偽 and 欠損=0）。欠損の置き換えは `where(isnan(a), 0, a)`。
 - 演算変数名が既存の列名と同じ場合はエラーになる（列データの意図しない上書きを防ぐため）。
 - 変数パネルで仮想変数を右クリックすると「式を編集...」「削除」を選べる。編集は演算式入力欄で
   行い（「更新」で適用、「キャンセル」またはEscで中止）、それを使う他の仮想変数や表示中の曲線も
@@ -517,7 +574,7 @@ XYプロットを使う。
 
 #### ユーザー関数・マップ
 
-- **ユーザー関数**（ツールバー「関数」）: 引数・定数（デフォルト値付き）を持つ式を定義し、どの
+- **ユーザー関数**（ツールバー「ユーザー関数」）: 引数・定数（デフォルト値付き）を持つ式を定義し、どの
   ファイルでも使える。例: `Power_flow_by_press(flow_lpm, press_kpa)` = `flow_lpm * press_kpa / k`
   （`k = 60000`）。式で`power1 = Power_flow_by_press(signal1, signal2)`、定数の上書きは
   `…, k=1000)`。「信号に適用」タブでは、変数パネルから引数の欄へドラッグして作れる。
@@ -546,7 +603,7 @@ XYプロットを使う。
 
 #### ビューの保存・読込
 
-「ビュー保存」で、現在のプロット配置・重ね合わせ変数・演算式を「ビュー」としてJSON保存できる
+ツールバーの「ビュー ▾」→「保存...」で、現在のプロット配置・重ね合わせ変数・演算式を「ビュー」としてJSON保存できる
 （`data/parquet_analyzer/`）。演算変数は計算結果ではなく定義式として保存されるため、
 元データが更新されても読み込み時に再計算される。ビュー読込時、**何らかのファイルが既に
 開かれている場合**（ビュー保存時のファイルとは別のファイルでも、まさにそのファイル自身でも）
@@ -559,7 +616,10 @@ XYプロットを使う。
 ビューには時間軸に使った列も保存され、読み込むとその列に戻る。データとビューの入ったフォルダごと
 別の場所へ移しても開けるよう、元ファイルの場所は相対パスでも保存される。
 
-「ビュー...」でビューの管理画面を開く。保存済みビューを選ぶと、読み込む前に中身を確認できる——
+保存の画面では保存済みのビューの一覧から選んで上書きでき（確認が出る）、新しい名前も打てる。
+ビューを読み込んだ後は、その名前が最初に入っている。
+
+「ビュー ▾」→「管理...」でビューの管理画面を開く。保存済みビューを選ぶと、読み込む前に中身を確認できる——
 元ファイル、プロットごとのチャンネルとその色、仮想変数とその式、保存時の時間範囲、保存日時。
 ファイルを開いている場合、そのファイルに無い（読み込むとスキップされる）チャンネルは赤字で
 示される。ここからビューを読み込む（ボタンまたはダブルクリック）ことも、削除する（確認あり）
@@ -574,7 +634,7 @@ XYプロットを使う。
 
 #### 設定メニュー
 
-ツールバーの「設定」から以下を変更できる（`cfg/parquet_analyzer/settings.json` に保存され、
+ツールバーの「⚙ ▾」→「設定...」から以下を変更できる（`cfg/parquet_analyzer/settings.json` に保存され、
 次回起動時も引き継がれる）。
 
 - 自動再描画のON/OFF（OFFでもRボタン/ショートカットでの手動再描画は常に可能）
@@ -582,8 +642,8 @@ XYプロットを使う。
 - 列を開いた時点で全体を読み込まず表示範囲だけを都度読み込むようにする容量しきい値
   （変更後に開いたファイルから反映）
 - 無印/Ctrl+/Shift+スクロールそれぞれの動作（X軸ズーム/Y軸ズーム/パン）
-- ツールバーの各操作（ホーム、再描画、開く、プロット追加、統計、XY / 3Dプロット、ビュー保存、
-  ビュー管理、画像を保存、簡易表示の切替、カーソル、値の表示、関数、マップ）と、選択した系列の削除
+- ツールバーの各操作（全体表示、再描画、開く、プロット追加、統計、XY / 3Dプロット、ビュー保存、
+  ビュー管理、画像を保存、簡易表示の切替、カーソル、値の表示、ユーザー関数、マップ）と、選択した系列の削除
   （既定はDelete）のショートカットキー
   （周波数解析はメニューから隠している間、ここにも表示されない。上記参照）
 - 表示言語（English / 日本語。再起動後に反映）
@@ -592,7 +652,7 @@ XYプロットを使う。
 #### レイアウトの永続化
 
 ウィンドウサイズ・変数パネルの配置などの画面レイアウトは終了時に自動保存され、次回起動時に
-復元される。変数パネルの既定位置は画面左側。ツールバーの「レイアウトをリセット」で、保存された
+復元される。変数パネルの既定位置は画面左側。ツールバーの「⚙ ▾」の「レイアウトをリセット」で、保存された
 レイアウトを破棄していつでも既定配置に戻せる。
 
 ### MDF/MATLABファイルの変換
@@ -647,5 +707,7 @@ uv run python tests/parquet_analyzer/generate_feature_test_parquet.py
 ### ライセンス
 
 **[MIT License](LICENSE)** の下で公開しています。
+
+このアプリケーションが使用する第三者ソフトウェアとライブラリについては [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) をご覧ください。
 
 **作者**: [ultramonaka](https://github.com/ultramonaka)

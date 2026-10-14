@@ -52,13 +52,21 @@ def test_spline_through_cubic_with_zero_end_curvature():
     s = curve("spline", x=x, y=y)
     np.testing.assert_allclose(s(x), y, atol=1e-12)
     h = 1e-4
-    f = lambda v: float(s(np.array(v)))
-    d2 = lambda v: (f(v + h) - 2 * f(v) + f(v - h)) / h**2
+
+    def f(v):
+        return float(s(np.array(v)))
+
+    def d2(v):
+        return (f(v + h) - 2 * f(v) + f(v - h)) / h**2
+
     assert abs(d2(x[0] + 2 * h)) < 1e-2  # ~0 at the left end
     assert abs(d2(x[-1] - 2 * h)) < 1e-2
     # continuity of 1st and 2nd derivative across an interior knot
     k = x[2]
-    d1 = lambda v: (f(v + h) - f(v - h)) / (2 * h)
+
+    def d1(v):
+        return (f(v + h) - f(v - h)) / (2 * h)
+
     assert d1(k - 1e-4) == pytest.approx(d1(k + 1e-4), abs=1e-2)
     assert d2(k - 1e-3) == pytest.approx(d2(k + 1e-3), abs=5e-2)
 
@@ -247,7 +255,7 @@ def test_csv_kind_override(tmp_path):
         ("0,0\n1,abc\n", "auto", "row 2, column 2"),
         ("0,0\n1,2\n1,3\n", "auto", "row 3, column 1"),  # duplicate
         ("0,0\n2,2\n1,3\n", "auto", "row 3, column 1"),  # descending (not sorted)
-        ("0,0\n1,nan\n", "auto", "row 2, column 2"),
+        ("0,0\n1,-inf\n", "auto", "row 2, column 2"),  # (nan / blank are empty cells since 27.10)
         ("0,0\ninf,1\n", "auto", "row 2, column 1"),
         ("0,0\n", "auto", "at least 2"),
         ("x,y\n0,0\n", "auto", "at least 2"),

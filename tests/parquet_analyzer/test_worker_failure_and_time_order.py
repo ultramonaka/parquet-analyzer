@@ -5,19 +5,18 @@ from __future__ import annotations
 import logging
 import time
 import weakref
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QMessageBox, QTableWidget
 
 from parquet_analyzer.core import column as column_module
 from parquet_analyzer.core.background_worker import WorkerHub, _Task
 from parquet_analyzer.core.column import MAX_PYRAMID_FAILURES, WindowedColumn
 from parquet_analyzer.core.data_source import ParquetDataSource
-from parquet_analyzer.core import numeric as numeric_module
 from parquet_analyzer.core.numeric import check_time_order
 from parquet_analyzer.ui import main_window as main_window_module
 from parquet_analyzer.ui import plot_widget as plot_widget_module
@@ -163,8 +162,11 @@ def test_pyramid_build_failure_retries_then_falls_back_to_real_fetch(qapp, isola
     monkeypatch.setattr(plot_widget_module, "_PYRAMID_PREFERRED_ROW_THRESHOLD", 500)
     calls = []
 
-    def bad_build(*a, **k):
-        calls.append(1)
+    def bad_build(path, *a, **k):
+        # Count only this test's file: a pyramid job left in flight by an earlier test in the
+        # same process resolves `build_pyramid` when it runs, so it may land here late.
+        if Path(path).parent == tmp_path:
+            calls.append(1)
         raise RuntimeError("no pyramid")
 
     monkeypatch.setattr(column_module, "build_pyramid", bad_build)

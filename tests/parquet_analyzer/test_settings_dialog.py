@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtGui import QKeySequence
+from waiting import wait_until
 
 from parquet_analyzer.io.settings import DEFAULT_SCROLL_BINDINGS, SCROLL_ACTIONS, Settings
 from parquet_analyzer.ui.main_window import MainWindow
@@ -97,8 +98,7 @@ def test_progress_bar_visible_while_downsampling(qapp, isolated_config, sample_p
 
     name = win.variable_panel.item(0).text()
     win._on_variable_dropped(win.plot_grid.plots[0], name)
-    for _ in range(50):
-        qapp.processEvents()
+    wait_until(lambda: True in visibility_events and visibility_events[-1] is False)
 
     assert True in visibility_events
     assert visibility_events[-1] is False

@@ -25,6 +25,7 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "add_plot": "",
     "fft": "",
     "stats": "",
+    "histogram": "",  # the "Graphs" menu's Histogram entry; gated by features "histogram" (analysis 42.1)
     "xy_plot": "",  # the "Graphs" menu's XY / 3D entry; gated by features "xy_plot" (25.2, 25.5)
     "save_view": "",
     "load_view": "",
@@ -34,6 +35,7 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "export_image": "",
     "user_functions": "",  # toolbar entries gated by feature flags (21)
     "maps": "",
+    "signal_aliases": "",  # the alias editor (persistence 54.4); always shown
     "remove_series": "Del",  # removes the selected series (detailed_specification.md 23.3)
 }
 
@@ -123,6 +125,8 @@ class Settings:
     log_retention_days: int = DEFAULT_LOG_RETENTION_DAYS
     # Toolbar "show values" toggle: hover line + value readout (detailed_specification.md 39.3).
     hover_values_enabled: bool = True
+    # Global switch "use signal aliases" (persistence 54.9); the dictionary itself is in signal_aliases.json.
+    signal_aliases_enabled: bool = True
     # Map manager: sizes of the [table, graphs] splitter (detailed_specification.md 27.8).
     # Normalize with normalize_splitter_sizes(); None = default proportions.
     map_manager_splitter: list[int] | None = None
@@ -182,6 +186,8 @@ def load_settings() -> Settings:
         settings.log_retention_days = normalize_log_retention_days(settings.log_retention_days)
         if not isinstance(settings.hover_values_enabled, bool):
             settings.hover_values_enabled = True
+        if not isinstance(settings.signal_aliases_enabled, bool):
+            settings.signal_aliases_enabled = True
         settings.map_manager_splitter = normalize_splitter_sizes(settings.map_manager_splitter)
         if settings.language not in LANGUAGES:
             settings.language = DEFAULT_LANGUAGE

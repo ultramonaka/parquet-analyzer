@@ -11,7 +11,11 @@ import json
 import numpy as np
 import pytest
 
-from parquet_analyzer.core.expression import ExpressionError, UnknownFunctionError, evaluate_expression
+from parquet_analyzer.core.expression import (
+    ExpressionError,
+    UnknownFunctionError,
+    evaluate_expression,
+)
 from parquet_analyzer.core.functions import (
     FunctionRegistry,
     UserFunction,
@@ -87,7 +91,7 @@ def test_scalar_and_empty_arguments(reg):
 
 @pytest.mark.parametrize(
     "body",
-    ["rolling_mean(p, 1.5)", "rolling_mean(p, p)", "rolling_nanmean(p, 0)", "zzz + p", "p +", "p < 1", "True + p"],
+    ["rolling_mean(p, 1.5)", "rolling_mean(p, p)", "rolling_nanmean(p, 0)", "zzz + p", "p +", "p is 1", "True + p"],
 )
 def test_bad_bodies_fail_as_expression_error_at_evaluation(body):
     # bypass validation: a hand-edited file or an older version can hold such a body
@@ -189,7 +193,7 @@ def test_invalid_definitions_raise_expression_error(fn):
 
 
 @pytest.mark.parametrize(
-    "body", ["p < 1", "p.real", "p[0]", "p if p else 1", "[p]", "True", "p + True", "p and 1", "'s'", "p @ p", "p & 1", "~p", "(p, p)", "abs(*p)"]
+    "body", ["p is 1", "p in p", "p.real", "p[0]", "1 if True else 2", "[p]", "True", "p + True", "p and True", "'s'", "p @ p", "p & 1", "~p", "(p, p)", "abs(*p)"]
 )
 def test_disallowed_syntax_in_body_is_rejected_at_save_time(body):
     with pytest.raises(ExpressionError):
@@ -204,7 +208,7 @@ def test_allowed_syntax_in_body_still_validates(body):
 def test_loader_skips_previously_saved_unevaluable_bodies_one_by_one(isolated_config):
     entries = [
         {"name": n, "params": ["v"], "constants": [], "expression": body}
-        for n, body in [("cmp", "v < 1"), ("attr", "v.real"), ("sub", "v[0]"), ("tern", "v if v else 1"), ("lst", "[v]")]
+        for n, body in [("cmp", "v is 1"), ("attr", "v.real"), ("sub", "v[0]"), ("tern", "v if True else 1"), ("lst", "[v]")]
     ] + [GOOD]
     _write(isolated_config, entries)
     fns, warns, skipped = uf_io.load_user_functions_ex()

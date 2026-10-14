@@ -1,0 +1,44 @@
+{
+  "schema_version": "1",
+  "view_name": "time_axis",
+  "source": {
+    "parquet_path": "/tmp/parquet_analyzer_old_views/0.1.0/sample.parquet",
+    "path_type": "absolute"
+  },
+  "derived_variables": [
+    {
+      "name": "d_flag2",
+      "expression": "flag * 2"
+    }
+  ],
+  "plots": [
+    {
+      "plot_id": "p1",
+      "series": [
+        {
+          "variable": "sine",
+          "color": "#1f77b4"
+        },
+        {
+          "variable": "cosine",
+          "color": "#ff7f0e"
+        },
+        {
+          "variable": "d_flag2",
+          "color": "#2ca02c"
+        }
+      ],
+      "y_axis_range": [
+        -1.0399991350492783,
+        1.0399958912432514
+      ]
+    }
+  ],
+  "x_axis_range": [
+    -19.98,
+    1018.98
+  ],
+  "downsample": {
+    "enabled": true
+  }
+}

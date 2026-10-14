@@ -205,7 +205,7 @@ def _open_with_three_plots(qapp, tmp_path):
 
 
 def test_view_round_trip_restores_height_ratios(qapp, isolated_config, monkeypatch, tmp_path):
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("hv", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("hv", True)))
     win = _open_with_three_plots(qapp, tmp_path)
     win.plot_grid.set_plot_height_ratios([0.5, 0.3, 0.2])
     _settle(qapp)
@@ -225,7 +225,7 @@ def test_view_round_trip_restores_height_ratios(qapp, isolated_config, monkeypat
 
 
 def test_old_view_without_height_ratio_loads_equal(qapp, isolated_config, monkeypatch, tmp_path):
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("old", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("old", True)))
     win = _open_with_three_plots(qapp, tmp_path)
     win.save_view_dialog()
     win.close()
@@ -246,7 +246,7 @@ def test_old_view_without_height_ratio_loads_equal(qapp, isolated_config, monkey
 
 
 def test_view_with_skipped_plot_normalizes_remaining_ratios(qapp, isolated_config, monkeypatch, tmp_path):
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("sk", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("sk", True)))
     win = _open_with_three_plots(qapp, tmp_path)
     win.plot_grid.set_plot_height_ratios([0.5, 0.3, 0.2])
     _settle(qapp)
@@ -318,7 +318,7 @@ def test_insertion_index_and_allowed_slots(qapp):
 def test_drop_slot_across_domain_boundary_not_allowed(qapp):
     grid = PlotGridWidget()
     t1 = grid.plots[0]
-    t2 = grid.add_plot()
+    grid.add_plot()
     f1 = grid.add_plot(x_axis_datetime=False)
     grid.resize(600, 600)
     grid.show()
@@ -489,7 +489,7 @@ def test_load_view_rejects_non_numeric_height_ratio(isolated_config):
         view_io.View(
             view_name="r",
             source=view_io.SourceDef("x.parquet", "absolute"),
-            plots=[view_io.PlotDef("p%d" % i, [view_io.SeriesDef("a", "#fff")]) for i in range(5)],
+            plots=[view_io.PlotDef(f"p{i}", [view_io.SeriesDef("a", "#fff")]) for i in range(5)],
         )
     )
     path = view_io.view_path("r")

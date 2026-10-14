@@ -6,6 +6,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from parquet_analyzer.io import view as view_io
+from parquet_analyzer.ui import messages
+from parquet_analyzer.ui.i18n import tr
 from parquet_analyzer.ui.main_window import MainWindow
 
 
@@ -273,7 +275,7 @@ def test_save_view_dialog_rejects_unsafe_view_name(qapp, isolated_config, monkey
 
     path = tmp_path / "a.parquet"
     _write_parquet(path, {"x": np.arange(200, dtype=float)})
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("/tmp/evil", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("/tmp/evil", True)))
 
     win = MainWindow()
     win.load_parquet(str(path))
@@ -408,7 +410,7 @@ def test_save_view_preserves_the_current_zoom_range(qapp, isolated_config, monke
     path = tmp_path / "a.parquet"
     _write_parquet(path, {"x": np.sin(np.linspace(0.0, 10.0, 1000))}, n=1000)
 
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("myview", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("myview", True)))
 
     win = MainWindow()
     win.load_parquet(str(path))
@@ -427,3 +429,47 @@ def test_save_view_preserves_the_current_zoom_range(qapp, isolated_config, monke
     assert x_range == pytest.approx([100.0, 500.0])
     assert y_range == pytest.approx([-0.5, 0.5])
     win2.close()
+
+
+def test_load_view_warning_lists_each_skipped_item_once_with_its_reason(qapp, isolated_config, tmp_path, monkeypatch):
+    """Backlog 33 (found by the A4 old-view test): a derived variable that couldn't be restored
+    was listed twice in the consolidated warning (once as the variable, once as the series
+    plotting it), and the heading blamed "the currently open file" even when the cause was a
+    missing function. Each item is now listed once; a plain column missing from the file says so."""
+    warnings: list[str] = []
+    monkeypatch.setattr(messages, "warning", lambda _parent, _title, text, *a, **k: warnings.append(text))
+    path_a = tmp_path / "a.parquet"
+    _write_parquet(path_a, {"x": np.arange(200, dtype=float), "y": np.arange(200, dtype=float)})
+    view = view_io.View(
+        view_name="skips",
+        source=view_io.SourceDef(parquet_path=str(path_a), path_type="absolute"),
+        plots=[
+            view_io.PlotDef(plot_id="p1", series=[
+                view_io.SeriesDef(variable="y", color="#111111"),
+                view_io.SeriesDef(variable="x", color="#222222"),
+                view_io.SeriesDef(variable="z", color="#333333"),
+                view_io.SeriesDef(variable="f", color="#444444"),
+            ]),
+        ],
+        derived_variables=[
+            view_io.DerivedVariableDef(name="z", expression="x + 1"),
+            view_io.DerivedVariableDef(name="f", expression="no_such_fn(y)"),
+        ],
+    )
+    view_io.save_view(view)
+    path_b = tmp_path / "b.parquet"
+    _write_parquet(path_b, {"y": np.arange(200, dtype=float)})  # has "y", not "x"
+
+    win = MainWindow()
+    win.load_parquet(str(path_b))
+    win.load_view("skips")
+
+    assert len(warnings) == 1
+    text = warnings[0]
+    lines = [line[2:] for line in text.splitlines() if line.startswith("- ")]
+    assert [line.split(" ")[0] for line in lines] == ["z", "f", "x"]  # derived first, then series; once each
+    assert lines[0] == "z"
+    assert "no_such_fn" in lines[1]
+    assert lines[2] == f"x ({tr('view.skipped_not_in_file')})"
+    assert "currently open file" not in text
+    win.close()

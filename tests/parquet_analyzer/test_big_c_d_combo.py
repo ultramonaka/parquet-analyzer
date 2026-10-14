@@ -106,7 +106,7 @@ def test_derived_with_lazy_time_axis_matches_flags_off(qapp, isolated_config, mo
 
 @pytest.mark.parametrize("direct_rows", [10**9, 0])  # computed directly / via the pyramid envelope
 def test_navigator_overview_with_derived_and_lazy_axis(qapp, isolated_config, monkeypatch, path, direct_rows):
-    from parquet_analyzer.ui import main_window
+    from parquet_analyzer.ui import navigator_sync as main_window
 
     p, t, a, b = path
     _forbid_axis_materialization(monkeypatch)

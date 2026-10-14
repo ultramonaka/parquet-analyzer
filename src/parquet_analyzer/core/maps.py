@@ -6,11 +6,10 @@ adding one entry to `INTERPOLATIONS` / `EXTRAPOLATIONS`.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
-
 
 # ---------------------------------------------------------------- spline helpers
 
@@ -64,22 +63,28 @@ def _nearest_index(grid: np.ndarray, q: np.ndarray) -> np.ndarray:
 # `extend` (linear extrapolation requested); kernels that cannot extend just give the edge value.
 
 
-def _curve_linear(t: "LookupTable", q: np.ndarray, extend: bool) -> np.ndarray:
+def _curve_linear(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
     x, y = t.x, t.y
     i = _cell(x, q)
     f = (q - x[i]) / (x[i + 1] - x[i])
-    return y[i] + f * (y[i + 1] - y[i])
+    r = y[i] + f * (y[i + 1] - y[i])
+    if t.has_empty:
+        # Empty (NaN) grid values (27.10): a point exactly on a grid point is that point's value
+        # (NaN if empty); between two points NaN propagates through the arithmetic above.
+        # Only tables with empty cells take this path, so every other table is bit-identical.
+        r = np.where(f == 0, y[i], np.where(f == 1, y[i + 1], r))
+    return r
 
 
-def _curve_nearest(t: "LookupTable", q: np.ndarray, extend: bool) -> np.ndarray:
+def _curve_nearest(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
     return t.y[_nearest_index(t.x, q)]
 
 
-def _curve_previous(t: "LookupTable", q: np.ndarray, extend: bool) -> np.ndarray:
+def _curve_previous(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
     return t.y[_prev_index(t.x, q)]
 
 
-def _curve_spline(t: "LookupTable", q: np.ndarray, extend: bool) -> np.ndarray:
+def _curve_spline(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
     x, y = t.x, t.y
     if len(x) < 3:
         return _curve_linear(t, q, extend)
@@ -102,24 +107,36 @@ def _curve_spline(t: "LookupTable", q: np.ndarray, extend: bool) -> np.ndarray:
 # ---------------------------------------------------------------- 2-D kernels
 
 
-def _map_linear(t: "LookupTable", qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
+def _map_linear(t: LookupTable, qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
     x, y, z = t.x, t.y, t.z
     ix, iy = _cell(x, qx), _cell(y, qy)
     fx = (qx - x[ix]) / (x[ix + 1] - x[ix])
     fy = (qy - y[iy]) / (y[iy + 1] - y[iy])
-    return (
-        z[iy, ix] * (1 - fx) * (1 - fy)
-        + z[iy, ix + 1] * fx * (1 - fy)
-        + z[iy + 1, ix] * (1 - fx) * fy
-        + z[iy + 1, ix + 1] * fx * fy
-    )
+    if not t.has_empty:
+        return (
+            z[iy, ix] * (1 - fx) * (1 - fy)
+            + z[iy, ix + 1] * fx * (1 - fy)
+            + z[iy + 1, ix] * (1 - fx) * fy
+            + z[iy + 1, ix + 1] * fx * fy
+        )
+    # Empty (NaN) cells (27.10): a grid point with weight 0 does not take part, so only the
+    # corners that really contribute can make the result empty. Same summation order as above.
+    out = 0.0
+    for z_c, wx, wy in (
+        (z[iy, ix], 1 - fx, 1 - fy),
+        (z[iy, ix + 1], fx, 1 - fy),
+        (z[iy + 1, ix], 1 - fx, fy),
+        (z[iy + 1, ix + 1], fx, fy),
+    ):
+        out = out + np.where((wx == 0) | (wy == 0), 0.0, z_c * wx * wy)
+    return out
 
 
-def _map_nearest(t: "LookupTable", qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
+def _map_nearest(t: LookupTable, qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
     return t.z[_nearest_index(t.y, qy), _nearest_index(t.x, qx)]
 
 
-def _map_previous(t: "LookupTable", qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
+def _map_previous(t: LookupTable, qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
     return t.z[_prev_index(t.y, qy), _prev_index(t.x, qx)]
 
 
@@ -202,9 +219,26 @@ class LookupTable:
             raise ValueError(f"unknown interpolation: {self.interpolation}")
         if self.kind not in INTERPOLATIONS[self.interpolation].kinds:
             raise ValueError(f"interpolation {self.interpolation} is not available for a {self.kind}")
+        if self.interpolation == "spline" and self.has_empty:
+            raise ValueError(f"{self.name}: spline cannot be used with empty cells; use linear")
         if self.extrapolation not in EXTRAPOLATIONS:
             raise ValueError(f"unknown extrapolation: {self.extrapolation}")
         self._m: np.ndarray | None = None
+
+    @property
+    def values(self) -> np.ndarray:
+        """The table's value array: Z of a map, Y of a curve."""
+        return self.z if self.kind == "map" else self.y
+
+    @property
+    def has_empty(self) -> bool:
+        """Whether any value is empty (NaN, 27.10). Checked per call: tables are small
+        (<= 500x500) and edits build new tables."""
+        return bool(np.isnan(self.values).any())
+
+    @property
+    def n_empty(self) -> int:
+        return int(np.isnan(self.values).sum())
 
     @property
     def arity(self) -> int:
@@ -212,9 +246,13 @@ class LookupTable:
 
     def warnings(self) -> list[str]:
         """Import-time notes, e.g. spline with fewer than 3 points falling back to linear."""
+        out = []
         if self.interpolation == "spline" and len(self.x) < 3:
-            return [f"{self.name}: spline needs at least 3 points; using linear"]
-        return []
+            out.append(f"{self.name}: spline needs at least 3 points; using linear")
+        n = self.n_empty
+        if n:
+            out.append(f"{self.name}: {n} empty cell(s); values falling on them become NaN")
+        return out
 
     def _spline_m(self) -> np.ndarray:
         if self._m is None:

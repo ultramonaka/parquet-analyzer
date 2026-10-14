@@ -464,7 +464,7 @@ def test_cursor_outside_an_independent_plots_range_does_not_raise(qapp, win):
 
 
 def _save(win, monkeypatch, name):
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: (name, True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: (name, True)))
     win.save_view_dialog()
 
 

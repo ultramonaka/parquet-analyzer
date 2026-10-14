@@ -7,9 +7,10 @@ delete it. Display-only: it never touches `MainWindow` state, loading is reporte
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtGui import QBrush, QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -22,9 +23,13 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..core.expression import ExpressionError, referenced_functions, referenced_names
+from ..core.expression import (
+    ExpressionError,
+    UnknownFunctionError,
+    referenced_functions,
+    referenced_names,
+)
 from ..core.functions import check_expression_calls
-from ..core.expression import UnknownFunctionError
 from ..core.variable import dependency_order
 from ..io import view as view_io
 from . import messages
@@ -77,14 +82,21 @@ class ViewManagerDialog(QDialog):
         all_columns: set[str] | None = None,
         available_functions: set[str] | None = None,
         registry=None,
+        aliases: Mapping[str, str] | None = None,
+        alias_names: set[str] | None = None,
     ) -> None:
         """`available_columns`: open file's columns minus the current time axis (None = no
         file open). `all_columns`: every column of the open file, so a view's saved time axis
         (persistence 33) can be checked and the available set recomputed for that axis.
         `available_functions`/`registry`: user functions and maps that exist now, so derived
         variables using a missing one (or a mismatched signature) are marked like load_view
-        skips them (expressions 26.5/27.5)."""
+        skips them (expressions 26.5/27.5). `aliases` (alias -> source column of the open file,
+        persistence 54.5): `all_columns` then contains the aliases, and a view's time axis removes
+        its source and all the aliases of it from the available set, as `load_view` does."""
         super().__init__(parent)
+        self._aliases = dict(aliases or {})
+        # every alias of the dictionary: a saved derived variable with such a name is skipped by load_view
+        self._alias_names = set(alias_names or ())
         self._registry = registry  # also enables the arity / keyword check of calls (26.5)
         # Names of the callable user functions/maps; None = don't check (26.5, 27.5).
         self._functions = available_functions
@@ -235,7 +247,9 @@ class ViewManagerDialog(QDialog):
             and self._all_columns is not None
             and view.time_column in self._all_columns
         ):
-            return self._all_columns - {view.time_column}
+            source = self._aliases.get(view.time_column, view.time_column)
+            axis = {view.time_column, source, *(a for a, src in self._aliases.items() if src == source)}
+            return self._all_columns - axis
         return self._available
 
     def _missing(self, view: view_io.View) -> tuple[set[str], set[str]]:
@@ -250,6 +264,9 @@ class ViewManagerDialog(QDialog):
         resolvable: set[str] = set()
         missing_derived: set[str] = set()
         for name in dependency_order(exprs):
+            if name in self._alias_names:
+                missing_derived.add(name)
+                continue
             try:
                 refs = referenced_names(exprs[name])  # also the syntax check: plain "missing" if it fails
                 absent = sorted(referenced_functions(exprs[name]) - self._functions) if self._functions is not None else []

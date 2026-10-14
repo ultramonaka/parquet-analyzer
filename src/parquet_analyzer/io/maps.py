@@ -5,15 +5,16 @@ column numbers are 1-based.
 """
 from __future__ import annotations
 
+import csv
 import json
 import keyword
 import logging
 import math
 import shutil
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
@@ -43,10 +44,11 @@ def _read_rows(path: Path) -> list[tuple[int, list[str]]]:
         except UnicodeDecodeError as e:
             raise MapError(f"cannot decode {Path(path).name} as UTF-8 or CP932") from e
     rows = []
-    for lineno, line in enumerate(text.splitlines(), start=1):
-        if not line.strip():
+    reader = csv.reader(text.splitlines())  # quoted cells may hold commas (names written by 44.4)
+    for cells in reader:
+        if not cells or (len(cells) == 1 and not cells[0].strip()):  # blank line
             continue
-        rows.append((lineno, [c.strip() for c in line.split(",")]))
+        rows.append((reader.line_num, [c.strip() for c in cells]))
     return rows
 
 
@@ -63,6 +65,19 @@ def _num(cell: str, row: int, col: int) -> float:
 def parse_cell(cell: str, row: int, col: int) -> float:
     """A finite number from an edited table cell; errors name the (1-based) row/column (27.8)."""
     return _num(cell.strip(), row, col)
+
+
+def _value_num(cell: str, row: int, col: int) -> float:
+    """A map Z / curve Y value (27.10): a blank cell or `nan`/`NaN` is empty (NaN); `inf` and other
+    text are errors as before. Axis values keep using `_num` (finite only)."""
+    if not cell.strip() or cell.strip().lower() == "nan":
+        return math.nan
+    return _num(cell, row, col)
+
+
+def parse_value_cell(cell: str, row: int, col: int) -> float:
+    """Like `parse_cell` for a Z / curve-Y cell of the manager's table: empty is allowed (27.10)."""
+    return _value_num(cell, row, col)
 
 
 def check_axis(values: list[float], positions: list[tuple[int, int]], label: str) -> None:
@@ -131,11 +146,13 @@ def parse_table_csv(
                 header = tuple(cells)  # header row: the default axis names (27.7)
                 continue
             xs.append(_num(cells[0], lineno, 1))
-            ys.append(_num(cells[1], lineno, 2))
+            ys.append(_value_num(cells[1], lineno, 2))
             xpos.append((lineno, 1))
         if len(xs) < 2:
             raise MapError("a curve needs at least 2 points")
         _check_axis(xs, xpos, "X")
+        _check_has_value(ys)
+        _check_empty_spline(interpolation, ys)
         table = LookupTable(name, "curve", np.array(xs), np.array(ys), None, interpolation, extrapolation,
                             axis_names=normalize_axis_names(header))
     else:
@@ -151,12 +168,36 @@ def parse_table_csv(
             if len(cells) != width:
                 raise MapError(f"row {lineno}: expected {width} columns, got {len(cells)}")
             ys.append(_num(cells[0], lineno, 1))
-            zrows.append([_num(c, lineno, j + 2) for j, c in enumerate(cells[1:])])
+            zrows.append([_value_num(c, lineno, j + 2) for j, c in enumerate(cells[1:])])
         if len(ys) < 2:
             raise MapError("a map needs at least 2 Y axis values (rows)")
         _check_axis(ys, [(rows[1 + i][0], 1) for i in range(len(ys))], "Y")
-        table = LookupTable(name, "map", np.array(xs), np.array(ys), np.array(zrows), interpolation, extrapolation)
+        _check_has_value(zrows)
+        # a top-left cell `<Y>\<X>` gives the default axis names (44.4); any other text is ignored
+        corner = first[0]
+        names = ()
+        if "\\" in corner:
+            yn, xn = corner.split("\\", 1)
+            names = (xn, yn)
+        table = LookupTable(name, "map", np.array(xs), np.array(ys), np.array(zrows), interpolation, extrapolation,
+                            axis_names=normalize_axis_names(names))
     return table
+
+
+def _check_has_value(values) -> None:
+    """A map / curve must hold at least one finite value (27.10)."""
+    if not np.isfinite(np.asarray(values, dtype=np.float64)).any():
+        raise MapError("no value in the table (every cell is empty)")
+
+
+def check_has_value(values) -> None:
+    """Public form of the "at least one finite value" check (27.10), used by the manager's edits."""
+    _check_has_value(values)
+
+
+def _check_empty_spline(interpolation: str, ys) -> None:
+    if interpolation == "spline" and np.isnan(np.asarray(ys, dtype=np.float64)).any():
+        raise MapError("spline cannot be used with a curve that has empty cells; use linear")
 
 
 def _check_settings(kind: str, interpolation: str, extrapolation: str) -> None:
@@ -193,6 +234,11 @@ class MapInfo:
     imported_at: str
     axis_names: tuple[str, str, str] = ("X", "Y", "Z")
     edited_at: str = ""  # ISO 8601 of the last in-manager value edit; "" = never (27.8)
+    # Maps made from XY measurements (analysis 44.4): where they came from, and which cells were
+    # filled in rather than measured ([iy, ix] per map cell, [ix] per curve point). Reference data
+    # only; unknown keys are ignored by older versions.
+    origin: dict = field(default_factory=dict)
+    filled: list = field(default_factory=list)
 
 
 def _safe(name: str) -> str:
@@ -214,6 +260,10 @@ def _json_path(name: str) -> Path:
 def _write_meta(info: MapInfo) -> None:
     payload = {"schema_version": SCHEMA_VERSION, **info.__dict__}
     payload["axis_names"] = dict(zip(("x", "y", "z"), normalize_axis_names(info.axis_names)))
+    if not info.origin:
+        del payload["origin"]  # maps imported from a CSV keep the 27.3 JSON unchanged
+    if not info.filled:
+        del payload["filled"]
     _json_path(info.name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -222,6 +272,14 @@ def _axis_names_from_json(raw) -> tuple[str, str, str]:
     if not isinstance(raw, dict):
         return normalize_axis_names(())
     return normalize_axis_names([raw.get(k) if isinstance(raw.get(k), str) else "" for k in ("x", "y", "z")])
+
+
+def _filled_from_json(raw) -> list:
+    """`filled` is optional (44.4): keep the well-formed `[int, ...]` entries, drop anything else."""
+    if not isinstance(raw, list):
+        return []
+    return [[int(i) for i in c] for c in raw
+            if isinstance(c, list) and 1 <= len(c) <= 2 and all(isinstance(i, int) and not isinstance(i, bool) for i in c)]
 
 
 def _read_meta(name: str) -> MapInfo:
@@ -244,6 +302,8 @@ def _read_meta(name: str) -> MapInfo:
             imported_at=d["imported_at"] if isinstance(d.get("imported_at"), str) else "",
             axis_names=_axis_names_from_json(d.get("axis_names")),
             edited_at=d["edited_at"] if isinstance(d.get("edited_at"), str) else "",
+            origin=d["origin"] if isinstance(d.get("origin"), dict) else {},
+            filled=_filled_from_json(d.get("filled")),
         )
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise MapError(f"map metadata unreadable: {name}: {e}") from e
@@ -317,6 +377,8 @@ def load_all_maps() -> tuple[dict[str, LookupTable], list[str]]:
 def save_map_settings(name: str, interpolation: str, extrapolation: str) -> LookupTable:
     info = _read_meta(name)
     _check_settings(info.kind, interpolation, extrapolation)
+    if info.kind == "curve":  # spline cannot cross empty cells (27.10)
+        _check_empty_spline(interpolation, load_map(name).y)
     info.interpolation, info.extrapolation = interpolation, extrapolation
     _write_meta(info)
     return load_map(name)
@@ -380,30 +442,48 @@ def reimport_map(name: str) -> LookupTable:
     shutil.copy2(src, _csv_path(name))
     info.imported_at = datetime.now().isoformat(timespec="seconds")
     info.edited_at = ""  # the stored copy is the source file again (27.8)
+    info.filled = []  # nothing is known about which cells were measured any more (44.4)
     _write_meta(info)
     return table
 
 
 def _fmt(v: float) -> str:
+    if math.isnan(v):
+        return ""  # an empty cell (27.10)
     return repr(float(v))  # shortest string that round-trips the float64 exactly
 
 
-def write_table_csv(table: LookupTable, path: Path | str) -> None:
-    """Write `table` in the 27.2 CSV format: a curve as `x,y` rows (no header; the axis names live
-    in the JSON), a map with an empty top-left cell, the X axis as the first row and the Y axis
-    as the first column."""
-    lines: list[str] = []
+def _header_names_ok(*names: str) -> bool:
+    """Axis names usable in a CSV header: non-empty, not readable as a number (the reader would take
+    the row for data) and, for the map corner, free of the `\\` separator (44.4)."""
+    return all(n and not _is_number(n) and "\\" not in n for n in names)
+
+
+def write_table_csv(table: LookupTable, path: Path | str, axis_header: bool = False) -> None:
+    """Write `table` in the 27.2 CSV format: a curve as `x,y` rows, a map with an empty top-left
+    cell, the X axis as the first row and the Y axis as the first column. Written with the `csv`
+    module (names may contain commas). `axis_header` (the map export, 44.4) adds the axis names: a
+    curve header row `<X>,<Y>`, a map's top-left cell `<Y>\\<X>`; omitted when a name would be read
+    as a number (or is empty / holds a backslash)."""
+    xn, yn, _zn = table.axis_names
+    rows: list[list[str]] = []
     if table.kind == "curve":
-        lines = [f"{_fmt(x)},{_fmt(y)}" for x, y in zip(table.x, table.y)]
+        if axis_header and _header_names_ok(xn, yn):
+            rows.append([xn, yn])
+        rows += [[_fmt(x), _fmt(y)] for x, y in zip(table.x, table.y)]
     else:
-        lines.append("," + ",".join(_fmt(x) for x in table.x))
+        corner = f"{yn}\\{xn}" if axis_header and _header_names_ok(xn, yn) else ""
+        rows.append([corner] + [_fmt(x) for x in table.x])
         for y, row in zip(table.y, table.z):
-            lines.append(_fmt(y) + "," + ",".join(_fmt(v) for v in row))
-    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            rows.append([_fmt(y)] + [_fmt(v) for v in row])
+    with open(Path(path), "w", encoding="utf-8", newline="") as f:
+        csv.writer(f, lineterminator="\n").writerows(rows)
 
 
-def save_map_values(name: str, table: LookupTable) -> LookupTable:
+def save_map_values(name: str, table: LookupTable, edited_cells=()) -> LookupTable:
     """Overwrite the stored CSV copy with the edited `table` and set `edited_at` (27.8).
+    `edited_cells` = the value cells the user changed (`(iy, ix)` for a map, `(i,)` for a curve):
+    they count as measured from now on, so they leave the `filled` list (44.4).
 
     All-or-nothing: the previous CSV and JSON are restored if writing, re-reading or the
     metadata update fails, and the error propagates.
@@ -414,12 +494,60 @@ def save_map_values(name: str, table: LookupTable) -> LookupTable:
     try:
         write_table_csv(table, csv_p)
         info.edited_at = datetime.now().isoformat(timespec="seconds")
+        if info.filled and edited_cells:
+            gone = {tuple(c) for c in edited_cells}
+            info.filled = [c for c in info.filled if tuple(c) not in gone]
         _write_meta(info)
         return load_map(name)  # re-parse: what is stored must load back
     except BaseException:
         csv_p.write_bytes(old_csv)
         json_p.write_bytes(old_json)
         raise
+
+
+def write_generated_map(
+    table: LookupTable,
+    origin: dict,
+    filled: list,
+    source_path: str = "",
+    overwrite: bool = False,
+    existing_names: Iterable[str] = (),
+    publish: Callable[[], None] | None = None,
+) -> LookupTable:
+    """Store a map / curve made from XY measurements (analysis 44.4): the CSV (27.2 format, empty cells
+    blank) and the JSON with `origin` and `filled`. `source_path` = the CSV the user also saved (""
+    when registered only: re-import is then unavailable). An existing map of that name is replaced
+    only with `overwrite`; all-or-nothing (the old files come back if anything fails, including when
+    `publish` raises). `publish` = the caller's last step (the export's temp CSV -> final path, 44.11),
+    run after the stored map loaded back."""
+    name = table.name
+    validate_map_name(name, existing_names)
+    csv_p, json_p = _csv_path(name), _json_path(name)
+    existed = csv_p.exists() or json_p.exists()
+    if existed and not overwrite:
+        raise MapError(f"name already in use: {name}")
+    old_csv = csv_p.read_bytes() if csv_p.exists() else None
+    old_json = json_p.read_bytes() if json_p.exists() else None
+    maps_dir().mkdir(parents=True, exist_ok=True)
+    try:
+        write_table_csv(table, csv_p, axis_header=True)  # same file as the export's CSV (44.4)
+        _write_meta(
+            MapInfo(name, table.kind, table.interpolation, table.extrapolation, source_path,
+                    datetime.now().isoformat(timespec="seconds"), table.axis_names, "", dict(origin), list(filled))
+        )
+        loaded = load_map(name)  # what is stored must load back
+        if publish is not None:
+            publish()
+    except BaseException:
+        for p, old in ((csv_p, old_csv), (json_p, old_json)):
+            if old is None:
+                p.unlink(missing_ok=True)
+            else:
+                p.write_bytes(old)
+        raise
+    for w in loaded.warnings():
+        logger.warning("%s", w)
+    return loaded
 
 
 def delete_map(name: str) -> None:

@@ -75,20 +75,17 @@ def _open(qapp, mw, x="sine", ys=("cosine",), color=None, z=None, display=None) 
 
 def _configure(w, x, ys, color=None, z=None, display=None):
     w.blockSignals(True)
-    for widget in (w._x_combo, w._y_list, w._color_combo, w._z_combo, w._display_combo):
+    for widget in (w._x_combo, w._y_picker, w._color_combo, w._z_combo, w._display_combo):
         widget.blockSignals(True)
     w._x_combo.setCurrentText(x)
-    w._y_list.clearSelection()
-    for i in range(w._y_list.count()):
-        if w._y_list.item(i).text() in ys:
-            w._y_list.item(i).setSelected(True)
+    w._y_picker.set_selected(ys)
     if color:
         w._color_combo.setCurrentIndex(["single", "time", "z"].index(color))
     if z:
         w._z_combo.setCurrentText(z)
     if display:
         w._display_combo.setCurrentIndex(["auto", "scatter", "density"].index(display))
-    for widget in (w._x_combo, w._y_list, w._color_combo, w._z_combo, w._display_combo):
+    for widget in (w._x_combo, w._y_picker, w._color_combo, w._z_combo, w._display_combo):
         widget.blockSignals(False)
     w.blockSignals(False)
     w._apply_color_constraints()
@@ -469,9 +466,9 @@ def test_export_stamp_has_variable_line(qapp, mw, monkeypatch, tmp_path):
     captured = {}
     orig = xy_plot_window.build_xy_figure
 
-    def spy(r, lines, size_px):
+    def spy(r, lines, size_px, **kw):
         captured["lines"] = list(lines)
-        return orig(r, lines, size_px)
+        return orig(r, lines, size_px, **kw)
 
     monkeypatch.setattr(xy_plot_window, "build_xy_figure", spy)
     w = _open(qapp, mw, ys=("cosine", "noise"), display="scatter")
@@ -507,7 +504,7 @@ def test_export_stamp_shows_computed_range_not_main_range(qapp, mw, monkeypatch,
     _drain(qapp, 0.3)
     captured = {}
     orig = xy_plot_window.build_xy_figure
-    monkeypatch.setattr(xy_plot_window, "build_xy_figure", lambda r, lines, sz: (captured.setdefault("l", list(lines)), orig(r, lines, sz))[1])
+    monkeypatch.setattr(xy_plot_window, "build_xy_figure", lambda r, lines, sz, **kw: (captured.setdefault("l", list(lines)), orig(r, lines, sz, **kw))[1])
     seen = {}
     real_save = analysis_window.save_figure
     monkeypatch.setattr(analysis_window, "save_figure", lambda fig, path, meta: (seen.update(meta), real_save(fig, path, meta))[1])

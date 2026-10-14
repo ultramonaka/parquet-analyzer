@@ -16,7 +16,6 @@ from parquet_analyzer import features
 from parquet_analyzer.core.analysis import FFT_JITTER_TOLERANCE, fft, sampling_report
 from parquet_analyzer.ui.main_window import MainWindow
 
-
 # ---- core -------------------------------------------------------------------------------
 
 def test_uniform_is_ok():

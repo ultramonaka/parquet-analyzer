@@ -63,6 +63,10 @@ EXPRS = [
     "rolling_nanmean(a, 7)",
     "rolling_mean(b, 1)",
     "rolling_nanmean(delta(a), 4)",
+    "trailing_mean(a, 5)",
+    "trailing_nanmean(a, 7)",
+    "trailing_mean(b, 1)",
+    "trailing_nanmean(delta(a), 4)",
     "delta(rolling_mean(a, 6))",
     "max(a, 0) + clip(b, -1, 1)",
     "scaled(a)",
@@ -72,6 +76,14 @@ EXPRS = [
     "delta(curve(a)) + scaled(b)",
     "-a",
     "rolling_mean(a, 100000)",  # window wider than the file
+    # conditionals (expressions 43.2): elementwise, so they stay windowed
+    "a > b",
+    "0 < a < 5 and not isnan(b)",
+    "where(a > 0, a, 0) + b",
+    "a if b > 0 else delta(a)",
+    "isnan(rolling_mean(a, 5))",
+    "where(delta(a) > 0, rolling_mean(b, 3), clip(a, -1, 1))",
+    "scaled(a) if a > 0 or b > 0 else smooth(b)",
 ]
 
 
@@ -110,6 +122,8 @@ def test_margins(registry):
     assert m("scaled(delta(a))") == (1, 0)
     assert m("smooth(a)") == (4, 3)  # delta(1,0) inside rolling_mean(4) -> (3,3): total (4,3)
     assert m("curve(a)") == (0, 0)
+    assert m("where(delta(a) > 0, a, b)") == (1, 0)
+    assert m("isnan(a) or a < b") == (0, 0)
 
 
 def test_unknown_margin_falls_back(cols, registry):
@@ -140,7 +154,6 @@ def test_probe_raises_for_bad_expression(cols, registry):
 
 def test_window_reads_only_what_it_needs(cols, registry):
     reads = []
-    inner = cols["a"].window
     cols["a"].__class__  # WindowedColumn has __slots__: wrap through a proxy column instead
 
     class Spy:
@@ -313,10 +326,14 @@ def test_flag_on_stats_per_window(qapp, isolated_config, tmp_path, flag_on, monk
         win._add_variable_to_plot(plot, "d")
         _settle(qapp, win)
         win._on_stats_requested()
-        for _ in range(200):
+        # Wait in real time, not a fixed number of event-loop spins: the stats run on a
+        # worker thread and a slow machine (the GitHub runner) needs longer than 200 spins.
+        import time
+
+        deadline = time.monotonic() + 10.0
+        while not shown and time.monotonic() < deadline:
             qapp.processEvents()
-            if shown:
-                break
+            time.sleep(0.005)
         assert shown
         r0, r1 = win._visible_row_range()
         want = basic_stats((a + b)[r0:r1])
@@ -360,9 +377,9 @@ def test_flag_on_navigator_overview_for_derived(qapp, isolated_config, tmp_path,
         win._on_add_derived_variable("d", "a + b")
         plot = win.plot_grid.plots[0]
         win._add_variable_to_plot(plot, "d")
-        win._refresh_navigator_overview()
+        win._nav_sync.refresh()
         _settle(qapp, win)  # short file: computed directly, no crash
-        win._set_derived_navigator_overview(win._raw_variables["d"])
+        win._nav_sync._set_derived_navigator_overview(win._raw_variables["d"])
         ox, oy = win.navigator._curve.getData()
         assert len(ox) == len(oy) > 100 and np.isfinite(ox).all()
         # the overview is the derived series itself (a + b), NaN rows aside
@@ -374,7 +391,7 @@ def test_flag_on_navigator_overview_for_derived(qapp, isolated_config, tmp_path,
 
 
 def test_flag_on_wide_view_waits_for_pyramid_instead_of_full_fetch(qapp, isolated_config, tmp_path, flag_on, monkeypatch):
-    from parquet_analyzer.ui import main_window as mw_module
+    from parquet_analyzer.ui import navigator_sync as mw_module
     from parquet_analyzer.ui import plot_widget as pw_module
 
     monkeypatch.setattr(pw_module, "_PYRAMID_PREFERRED_ROW_THRESHOLD", 100)
@@ -390,7 +407,7 @@ def test_flag_on_wide_view_waits_for_pyramid_instead_of_full_fetch(qapp, isolate
         assert "d" in plot._coarse_series  # drawn from the envelope, not from a full fetch + LTTB
         assert len(plot._series["d"]["curve"].getData()[0]) > 0
         # navigator got the pyramid-based overview without error
-        win._refresh_navigator_overview()
+        win._nav_sync.refresh()
         _settle(qapp, win)
     finally:
         win.close()

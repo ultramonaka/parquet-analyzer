@@ -66,6 +66,52 @@ def rolling_nanmean(y: np.ndarray, window: float) -> np.ndarray:
     return out
 
 
+def trailing_mean(y: np.ndarray, window: float) -> np.ndarray:
+    """Past-only moving average (expressions.ja.md 31.2, expression function
+    `trailing_mean(a, window)`). For each position i, averages y[max(0, i-window+1):i+1]
+    (current point plus up to `window-1` past points). At the start, averages only the
+    available points (no NaN output). Same length as y.
+    NaN propagates: any window containing a NaN yields NaN, but NaN does not propagate
+    beyond `window-1` points after it. Use `trailing_nanmean` to average the non-NaN
+    samples instead.
+    """
+    w = int(window)
+    if w < 1:
+        raise ValueError("trailing_mean window must be a positive integer")
+    n = len(y)
+    if n == 0:
+        return np.empty_like(y, dtype=np.result_type(y, 0.0))
+    w = min(w, n)
+    # Sum of the past w samples (convolve sums only the overlap, so a NaN/Inf reaches just the
+    # w outputs whose window holds it); count is min(i+1, w).
+    sums = np.convolve(np.asarray(y, dtype=float), np.ones(w))[:n]
+    return sums / np.minimum(np.arange(1, n + 1), w)
+
+
+def trailing_nanmean(y: np.ndarray, window: float) -> np.ndarray:
+    """NaN-ignoring past-only moving average (expressions.ja.md 31.2, expression function
+    `trailing_nanmean(a, window)`). For each position i, averages the non-NaN samples in
+    y[max(0, i-window+1):i+1]. NaN only when the window has no non-NaN sample. Same length as y.
+    """
+    w = int(window)
+    if w < 1:
+        raise ValueError("trailing_nanmean window must be a positive integer")
+    n = len(y)
+    if n == 0:
+        return np.empty_like(y, dtype=np.result_type(y, 0.0))
+    w = min(w, n)
+    yf = np.asarray(y, dtype=float)
+    valid = ~np.isnan(yf)
+    kernel = np.ones(w)
+    sums = np.convolve(np.where(valid, yf, 0.0), kernel)[:n]
+    # Counts are exact small integers; round to remove convolve float noise.
+    counts = np.round(np.convolve(valid.astype(float), kernel)[:n])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = sums / counts
+    out[counts == 0] = np.nan
+    return out
+
+
 def basic_stats(y: np.ndarray) -> dict[str, float | int]:
     """Summary statistics for one variable over whatever slice it's given
     (specification.md 5.x). NaN/Inf-safe: non-finite samples are excluded from the

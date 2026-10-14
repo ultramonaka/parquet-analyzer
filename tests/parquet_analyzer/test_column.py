@@ -5,7 +5,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from parquet_analyzer.core.column import LazyColumn, LazyVariables, MaterializedColumn, WindowedColumn
+from parquet_analyzer.core.column import (
+    LazyColumn,
+    LazyVariables,
+    MaterializedColumn,
+    WindowedColumn,
+)
 from parquet_analyzer.core.data_source import ParquetDataSource
 from parquet_analyzer.core.numeric import to_numeric
 
@@ -127,7 +132,7 @@ def test_windowed_column_request_pyramid_returns_a_working_job(multi_row_group_p
     assert job is not None
     assert col.pyramid is None  # not set until the caller calls set_pyramid()
 
-    pyramid = job()  # what a BackgroundWorker would run off the UI thread
+    pyramid = job()  # what WorkerHub would run off the UI thread
     col.set_pyramid(pyramid)
     assert col.pyramid is pyramid
     assert pyramid.mins.min() == pytest.approx(a.min())

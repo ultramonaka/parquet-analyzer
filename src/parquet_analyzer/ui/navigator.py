@@ -14,6 +14,8 @@ class NavigatorWidget(pg.PlotWidget):
     (specification.md 5.2). Only the X (time) axis is interactive; Y is fixed.
     """
 
+    # Emitted only by the user's drag/click on the window -- never by set_overview_data /
+    # set_selected_range (programmatic changes are silent; plots 24.9).
     rangeSelected = Signal(float, float)
 
     def __init__(self, parent=None):
@@ -28,12 +30,20 @@ class NavigatorWidget(pg.PlotWidget):
         self._region.sigRegionChanged.connect(self._on_region_changed)
         self.addItem(self._region)
         self._x_full: np.ndarray | None = None
+        self._has_overview = False  # a finite overview has been shown (keep_region has a region to keep)
 
-    def set_overview_data(self, x: np.ndarray, y: np.ndarray) -> None:
+    def set_overview_data(self, x: np.ndarray, y: np.ndarray, *, keep_region: bool = True) -> None:
         """Overview curve + region bounds. Only points whose x and y are both finite are
-        used, and the bounds/initial selection are the finite min/max of x (not x[0]/x[-1],
-        which may be NaN or not the extremes); no finite x -> empty overview, range left
-        alone (detailed_specification.md 29.4)."""
+        used, and the bounds are the finite min/max of x (not x[0]/x[-1], which may be NaN
+        or not the extremes); no finite x -> empty overview, range left alone
+        (detailed_specification.md 29.4).
+
+        The selection window: keep_region=True (default) keeps the current one, clamped into
+        the new bounds (full extent on the first overview, or when it no longer overlaps the
+        new bounds at all); keep_region=False = full extent ("home", plots 24.9). Bounds and
+        region are changed with the region's signals blocked: rangeSelected is emitted only
+        by the user's drag/click, never by this call (LinearRegionItem.setBounds moves the
+        lines and emits sigRegionChanged when the region exceeds the new bounds)."""
         x = np.asarray(x)
         y = np.asarray(y)
         self._x_full = x
@@ -45,10 +55,22 @@ class NavigatorWidget(pg.PlotWidget):
         x_ds, y_ds = lttb(x_c, y_c, _OVERVIEW_POINTS)
         self._curve.setData(x_ds, y_ds)
         x_ok = x[np.isfinite(x)]
-        if len(x_ok):
-            lo, hi = float(x_ok.min()), float(x_ok.max())
+        if not len(x_ok):
+            return
+        lo, hi = float(x_ok.min()), float(x_ok.max())
+        target = (lo, hi)
+        if keep_region and self._has_overview:
+            cur_lo, cur_hi = self._region.getRegion()
+            c_lo, c_hi = max(float(cur_lo), lo), min(float(cur_hi), hi)
+            if c_lo <= c_hi and np.isfinite(c_lo) and np.isfinite(c_hi):
+                target = (c_lo, c_hi)
+        self._region.blockSignals(True)
+        try:
             self._region.setBounds([lo, hi])
-            self.set_selected_range(lo, hi)
+            self._region.setRegion(target)
+        finally:
+            self._region.blockSignals(False)
+        self._has_overview = True
 
     def set_selected_range(self, x_min: float, x_max: float) -> None:
         if not (np.isfinite(x_min) and np.isfinite(x_max)):

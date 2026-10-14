@@ -6,12 +6,11 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from test_windowed_series import _drain, _FakeWindowSource, _make_plot
 
 from parquet_analyzer import features
 from parquet_analyzer.core.pyramid import thin_column
 from parquet_analyzer.ui import plot_widget as plot_widget_module
-
-from test_windowed_series import _FakeWindowSource, _drain, _make_plot
 
 
 class _ThinSource(_FakeWindowSource):

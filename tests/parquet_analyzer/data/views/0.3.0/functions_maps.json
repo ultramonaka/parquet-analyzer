@@ -1,0 +1,60 @@
+{
+  "schema_version": "1",
+  "view_name": "functions_maps",
+  "source": {
+    "parquet_path": "/tmp/parquet_analyzer_old_views/0.3.0/sample.parquet",
+    "path_type": "absolute",
+    "relative_path": "../../../../../../tmp/parquet_analyzer_old_views/0.3.0/sample.parquet"
+  },
+  "time_column": "time",
+  "derived_variables": [
+    {
+      "name": "d_fn",
+      "expression": "scaled(sine)"
+    },
+    {
+      "name": "d_map",
+      "expression": "curve(ramp)"
+    },
+    {
+      "name": "d_plain",
+      "expression": "cosine + 1"
+    }
+  ],
+  "plots": [
+    {
+      "plot_id": "p1",
+      "series": [
+        {
+          "variable": "d_fn",
+          "color": "#1f77b4",
+          "visible": true
+        },
+        {
+          "variable": "d_map",
+          "color": "#ff7f0e",
+          "visible": true
+        },
+        {
+          "variable": "d_plain",
+          "color": "#2ca02c",
+          "visible": true
+        }
+      ],
+      "y_axis_range": [
+        -2.0799982700985566,
+        2.079991782486503
+      ],
+      "height_ratio": 1.0,
+      "x_linked": true,
+      "x_axis_range": null
+    }
+  ],
+  "x_axis_range": [
+    1767225580.02,
+    1767226618.98
+  ],
+  "downsample": {
+    "enabled": true
+  }
+}

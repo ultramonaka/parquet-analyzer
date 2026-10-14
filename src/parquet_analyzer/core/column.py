@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Protocol
-
 import logging
+from collections.abc import Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
 from .expression import ExpressionError
 from .numeric import NonNumericColumnError, to_numeric
-from .pyramid import ColumnPyramid, DEFAULT_BUCKET_ROWS, build_pyramid, build_pyramid_from_windows
+from .pyramid import DEFAULT_BUCKET_ROWS, ColumnPyramid, build_pyramid, build_pyramid_from_windows
 
 if TYPE_CHECKING:
     from .data_source import ParquetDataSource
@@ -70,7 +70,7 @@ class LazyColumn:
 
     __slots__ = ("_data_source", "_name", "_array")
 
-    def __init__(self, data_source: "ParquetDataSource", name: str):
+    def __init__(self, data_source: ParquetDataSource, name: str):
         self._data_source = data_source
         self._name = name
         self._array: np.ndarray | None = None
@@ -95,13 +95,14 @@ class WindowedColumn:
     `window(0, row_count)`, so it costs exactly what the old eager-load-the-
     -whole-file path always cost — this class only helps when callers actually
     ask for a sub-range, which TimePlotWidget's windowed series (rendering) and
-    MainWindow.variable_window() (FFT/stats) do (detailed_specification.md
-    13.5.1 Phase D).
+    MainWindow.variable_window() (FFT) do (detailed_specification.md 13.5.1
+    Phase D). Statistics stream the range in chunks through read_uncached()
+    (data ch.53).
     """
 
     __slots__ = ("_data_source", "_name", "_bounds", "_pyramid", "_pyramid_building", "_pyramid_failures")
 
-    def __init__(self, data_source: "ParquetDataSource", name: str):
+    def __init__(self, data_source: ParquetDataSource, name: str):
         self._data_source = data_source
         self._name = name
         self._bounds: tuple[float, float] | None | object = _UNSET
@@ -117,6 +118,16 @@ class WindowedColumn:
         if row_end <= row_start:
             return np.array([], dtype=np.float64)
         raw = self._data_source.read_window([self._name], row_start, row_end)[self._name]
+        return _numeric_column(raw, self._name)
+
+    def read_uncached(self, row_start: int, row_end: int) -> np.ndarray:
+        """Like `window`, but read straight from the file without going through
+        `read_window`'s block cache (data 53.2): for chunked whole-range scans (stats), which
+        must not push the blocks the plots use out of the LRU. Reads only rows
+        [row_start, row_end) (clamped by `read_columns`, data 29.5); empty range -> empty array."""
+        if row_end <= row_start:
+            return np.array([], dtype=np.float64)
+        raw = self._data_source.read_columns([self._name], row_start, row_end)[self._name]
         return _numeric_column(raw, self._name)
 
     def values(self) -> np.ndarray:
@@ -150,7 +161,7 @@ class WindowedColumn:
     def request_pyramid(self) -> Callable[[], ColumnPyramid] | None:
         """Call when a caller (TimePlotWidget, at a wide-enough zoom level) wants
         this column's pyramid and it isn't ready yet. Returns a zero-arg job to
-        run on a background thread (e.g. via BackgroundWorker) if a build isn't
+        run on a background thread (e.g. via WorkerHub) if a build isn't
         already in flight — the caller must call set_pyramid() with the result
         when that job finishes — or None if a build is already running or
         already done (nothing more to do). Building here rather than eagerly at
@@ -196,7 +207,7 @@ class _WindowVariables(Mapping[str, np.ndarray]):
 
     __slots__ = ("_inputs", "_start", "_end", "_cache")
 
-    def __init__(self, inputs: Mapping[str, "Column"], start: int, end: int):
+    def __init__(self, inputs: Mapping[str, Column], start: int, end: int):
         self._inputs = inputs
         self._start = start
         self._end = end
@@ -235,7 +246,7 @@ class DerivedColumn:
     `set_pyramid`.
     """
 
-    def __init__(self, expression: str, inputs: Mapping[str, "Column"], n_rows: int, registry, margin: tuple[int, int]):
+    def __init__(self, expression: str, inputs: Mapping[str, Column], n_rows: int, registry, margin: tuple[int, int]):
         self.expression = expression
         self.inputs = dict(inputs)
         self.n_rows = n_rows

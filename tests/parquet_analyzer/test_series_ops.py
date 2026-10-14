@@ -10,6 +10,7 @@ import pytest
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox
+from test_windowed_series import _FakeWindowSource
 
 from parquet_analyzer.io import view as view_io
 from parquet_analyzer.io.settings import DEFAULT_SHORTCUTS
@@ -17,8 +18,6 @@ from parquet_analyzer.ui import i18n
 from parquet_analyzer.ui.main_window import MainWindow
 from parquet_analyzer.ui.plot_grid import PlotGridWidget
 from parquet_analyzer.ui.plot_widget import TimePlotWidget, _SeriesSample
-
-from test_windowed_series import _FakeWindowSource
 
 
 @pytest.fixture(autouse=True)
@@ -468,7 +467,7 @@ def test_selection_cleared_on_file_open_view_load_and_time_switch(qapp, win, sam
 
     win._add_variable_to_plot(grid.plots[0], "a")
     _click_label(grid.plots[0], "a")
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("v_sel", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("v_sel", True)))
     win.save_view_dialog()
     _click_label(grid.plots[0], "a")
     win.load_view("v_sel")
@@ -489,7 +488,7 @@ def test_navigator_overview_uses_first_visible_series(qapp, win):
     plot = win.plot_grid.plots[0]
     used = []
     orig = win.navigator.set_overview_data
-    win.navigator.set_overview_data = lambda x, y: (used.append(np.asarray(y).copy()), orig(x, y))[1]
+    win.navigator.set_overview_data = lambda x, y, **kw: (used.append(np.asarray(y).copy()), orig(x, y, **kw))[1]
     _, y_b, _ = plot.series_data("b")
     _, y_a, _ = plot.series_data("a")
 
@@ -656,7 +655,7 @@ def test_remove_plot_menu_item_still_removes_the_plot(qapp, monkeypatch):
 def test_view_round_trip_keeps_visible(qapp, win, monkeypatch):
     plot = win.plot_grid.plots[0]
     plot.set_series_visible("a", False)
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("v_vis", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("v_vis", True)))
     win.save_view_dialog()
 
     saved = view_io.load_view("v_vis")

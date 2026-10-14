@@ -23,7 +23,8 @@ Only usable when the axis is ascending and finite (29.1 ``ok``); ``TimeIndex.bui
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Iterable
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -47,7 +48,7 @@ class TimeIndex:
 
     def __init__(
         self,
-        data_source: "ParquetDataSource",
+        data_source: ParquetDataSource,
         column: str,
         n: int,
         anchors: np.ndarray,
@@ -67,11 +68,11 @@ class TimeIndex:
     @classmethod
     def build(
         cls,
-        data_source: "ParquetDataSource",
+        data_source: ParquetDataSource,
         column: str,
         pin_rows: Iterable[int] = (),
         chunk_rows: int = _SCAN_CHUNK_ROWS,
-    ) -> "TimeIndex | None":
+    ) -> TimeIndex | None:
         """One streaming pass over `column`. None if it is empty, not ascending or has
         non-finite values (the caller then loads it fully, as before)."""
         n = data_source.row_count()

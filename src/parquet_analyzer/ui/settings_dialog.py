@@ -23,10 +23,10 @@ from ..core.oplog import log_op
 from ..io.settings import (
     DEFAULT_SHORTCUTS,
     LANGUAGES,
-    normalize_log_retention_days,
     SCROLL_ACTIONS,
     SCROLL_MODIFIERS,
     Settings,
+    normalize_log_retention_days,
     normalize_scroll_bindings,
 )
 from .i18n import LANGUAGE_LABELS, scroll_action_label, scroll_modifier_label, shortcut_label, tr
@@ -96,7 +96,7 @@ class SettingsDialog(QDialog):
         for key in DEFAULT_SHORTCUTS:
             if key == "fft" and not features.is_enabled("fft"):
                 continue  # developer feature flag, detailed_specification.md 21
-            if key in ("user_functions", "maps", "xy_plot") and not features.is_enabled(key):
+            if key in ("user_functions", "maps", "xy_plot", "histogram") and not features.is_enabled(key):
                 continue
             edit = QKeySequenceEdit()
             seq = settings.shortcuts.get(key, "")

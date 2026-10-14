@@ -3,8 +3,7 @@ from __future__ import annotations
 import itertools
 
 import numpy as np
-from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, Signal
-from PySide6.QtCore import QRectF
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QDrag, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -184,6 +183,7 @@ class PlotGridWidget(QWidget):
         self._active_job_count = 0
         self._coarse_plots: set[TimePlotWidget] = set()
         self._cursor_mode_enabled = False
+        self._downsample_enabled = True  # owned here so new plots inherit it (plots 50.1)
         self._hover_enabled = True  # detailed_specification.md 39.3; MainWindow applies the saved setting
         # The one selected series across the whole grid (detailed_specification.md 23.2).
         self._selected: tuple[TimePlotWidget, str] | None = None
@@ -228,6 +228,7 @@ class PlotGridWidget(QWidget):
         plot.moveDownRequested.connect(self.move_plot_down)
         plot.seriesLabelClicked.connect(self.select_series)
         plot.seriesRemoved.connect(self._on_series_removed)
+        plot.seriesChanged.connect(self._on_series_changed)
         plot.seriesVisibilityChanged.connect(self._on_series_visibility_changed)
         plot.removeSeriesRequested.connect(self._on_remove_series_requested)
         plot.separateSeriesRequested.connect(self._on_separate_series_requested)
@@ -243,6 +244,7 @@ class PlotGridWidget(QWidget):
         plot.cursorAddRequested.connect(self._on_cursor_add_requested)
         plot.hoverXChanged.connect(self._on_hover_x_changed)
         plot.set_hover_enabled(self._hover_enabled)
+        plot.set_downsample_enabled(self._downsample_enabled)  # (plots 50.1)
         plot.cursorMoveRequested.connect(self._on_cursor_move_requested)
         plot.cursorRemoveRequested.connect(self._on_cursor_remove_requested)
         plot.set_cursor_mode_enabled(self._cursor_mode_enabled)
@@ -321,7 +323,7 @@ class PlotGridWidget(QWidget):
         # If a downsample job for this plot is still in flight, its `finished` signal
         # (queued, cross-thread) could still be delivered after deleteLater() actually
         # destroys the C++ widget, crashing when the slot touches the dead object (the
-        # same class of bug fixed for BackgroundWorker itself — see its __init__).
+        # same class of bug fixed for WorkerHub — see data ch.37).
         # Deleting only once every job has actually finished sidesteps it entirely.
         # (Applies to the whole pane, which owns the plot.)
         if plot.pending_downsample_count() == 0:
@@ -652,8 +654,13 @@ class PlotGridWidget(QWidget):
             plot.set_scroll_bindings(bindings)
 
     def set_downsample_enabled(self, enabled: bool) -> None:
+        """The grid owns the setting so plots created later inherit it (plots 50.1)."""
+        self._downsample_enabled = enabled
         for plot in self._plots:
             plot.set_downsample_enabled(enabled)
+
+    def downsample_enabled(self) -> bool:
+        return self._downsample_enabled
 
     def set_x_range(self, x_min: float, x_max: float) -> None:
         # Never hand pyqtgraph a non-finite bound (data 29.4, plots 24.8): it raises from inside the
@@ -796,9 +803,31 @@ class PlotGridWidget(QWidget):
         self.layoutChanged.emit()
         return True
 
+    def remove_series_everywhere(self, name: str) -> bool:
+        """Remove `name` from every time-domain plot (a deleted derived variable, expressions
+        18.3); one layoutChanged afterwards re-syncs the navigator (plots 50.2). True if any
+        plot had it."""
+        removed = False
+        for plot in self._plots:
+            if plot.x_axis_datetime and name in plot.series_names():
+                plot.remove_series(name)
+                removed = True
+        if removed:
+            self.layoutChanged.emit()
+        return removed
+
     def _on_series_removed(self, plot: TimePlotWidget, name: str) -> None:
         if self._selected == (plot, name):
             self.clear_selection()
+
+    def _on_series_changed(self, plot: TimePlotWidget, name: str) -> None:
+        """A series was added/replaced: the navigator overview only depends on the anchor's first
+        visible series (24.9), so signal a layout change only then (plots 50.2)."""
+        if plot is not self.anchor_plot():
+            return
+        visible = plot.visible_series_names()
+        if visible and visible[0] == name:
+            self.layoutChanged.emit()
 
     def _on_series_visibility_changed(self, plot: TimePlotWidget, name: str, visible: bool) -> None:
         self.layoutChanged.emit()  # the navigator overview follows the first *visible* series

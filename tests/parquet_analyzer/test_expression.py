@@ -151,3 +151,59 @@ def test_rolling_nanmean_enforces_arity():
     for expr in ("rolling_nanmean(a)", "rolling_nanmean(a, 3, 1)"):
         with pytest.raises(ExpressionError):
             evaluate_expression(expr, {"a": a})
+
+
+def test_trailing_mean_smooths_and_is_past_only():
+    """Verify trailing_mean produces expected results and only uses past values."""
+    y = np.array([1.0, 2.0, 100.0, 2.0, 1.0])
+    result = evaluate_expression("trailing_mean(a, 3)", {"a": y})
+    assert len(result) == len(y)
+    # pos 0: [1] -> 1
+    # pos 1: [1, 2] -> 1.5
+    # pos 2: [1, 2, 100] -> 34.333...
+    # pos 3: [2, 100, 2] -> 34.666...
+    # pos 4: [100, 2, 1] -> 34.333...
+    np.testing.assert_allclose(result, [1.0, 1.5, 34 + 1/3, 34 + 2/3, 34 + 1/3])
+
+
+def test_trailing_mean_via_expression_and_registry():
+    from parquet_analyzer.core.functions import FunctionRegistry
+
+    a = np.array([1.0, 2.0, np.nan, 4.0, 5.0, 6.0, 7.0])
+    r = evaluate_expression("trailing_mean(a, 5)", {"a": a})
+    assert len(r) == len(a)
+    # NaN at pos 2 affects positions 2, 3, 4, 5, 6 (n-1=4 points forward)
+    assert np.isnan(r[[2, 3, 4, 5, 6]]).all()
+    assert not np.isnan(r[[0, 1]]).any()
+    r2 = evaluate_expression("trailing_mean(a, 5)", {"a": a}, FunctionRegistry())
+    np.testing.assert_allclose(r2, r, equal_nan=True)
+    assert FunctionRegistry().kind("trailing_mean") == "builtin"
+
+
+def test_trailing_mean_enforces_arity():
+    a = np.array([1.0, 2.0, 3.0])
+    for expr in ("trailing_mean(a)", "trailing_mean(a, 3, 1)"):
+        with pytest.raises(ExpressionError):
+            evaluate_expression(expr, {"a": a})
+
+
+def test_trailing_nanmean_via_expression_and_registry():
+    from parquet_analyzer.core.functions import FunctionRegistry
+
+    a = np.array([1.0, 2.0, np.nan, 4.0, 5.0, 6.0, 7.0])
+    r = evaluate_expression("trailing_nanmean(a, 5)", {"a": a})
+    assert len(r) == len(a) and not np.isnan(r).any()
+    # Window at pos 3: [2, NaN, 4, 5] (NaN is at pos 2, window is [max(0, 3-4):4] = [0:4] if we count correctly)
+    # Actually for pos 3: window = [max(0, 3-5+1):4] = [0:4] = [1, 2, NaN, 4]
+    # With NaN ignored: [1, 2, 4] -> mean = 7/3
+    np.testing.assert_allclose(r[3], (1 + 2 + 4) / 3)
+    r2 = evaluate_expression("trailing_nanmean(a, 5)", {"a": a}, FunctionRegistry())
+    np.testing.assert_allclose(r2, r)
+    assert FunctionRegistry().kind("trailing_nanmean") == "builtin"
+
+
+def test_trailing_nanmean_enforces_arity():
+    a = np.array([1.0, 2.0, 3.0])
+    for expr in ("trailing_nanmean(a)", "trailing_nanmean(a, 3, 1)"):
+        with pytest.raises(ExpressionError):
+            evaluate_expression(expr, {"a": a})

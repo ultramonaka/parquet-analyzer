@@ -4,6 +4,7 @@ The bug is a hang (pyqtgraph painting a NaN-x path), so each scenario runs in a
 subprocess with a time limit; a hang shows up as a timeout failure."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -40,7 +41,7 @@ _SCRIPT = textwrap.dedent(
     w.set_time_column({axis!r}); paint()          # nothing plotted yet
     plot = w.plot_grid.plots[0]
     w._add_variable_to_plot(plot, "val"); paint()  # first series
-    w._refresh_navigator_overview(); paint()
+    w._nav_sync.refresh(); paint()
     w.plot_grid.go_home(); paint()
     w.set_time_column("time"); paint()             # back to a clean axis
     w.set_time_column({axis!r}); paint()           # and again with series present
@@ -90,8 +91,12 @@ def test_nonfinite_time_axis_does_not_hang(tmp_path, kind):
     )
     pq.write_table(table, path)
     script = _SCRIPT.format(src=_SRC, path=str(path), axis="bad")
+    # Keep the child's cfg/data/log under tmp_path, like isolated_config does in-process.
+    env = {**os.environ, "PARQUET_ANALYZER_ROOT": str(tmp_path / "root")}
     try:
-        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=60, env=env
+        )
     except subprocess.TimeoutExpired:
         pytest.fail(f"{kind}: app hung painting a non-finite time axis (29.4)")
     assert "DONE" in proc.stdout, proc.stdout + proc.stderr

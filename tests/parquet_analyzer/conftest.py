@@ -11,6 +11,24 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+# Property-based tests (app 46.1): "default" is deterministic (same inputs every run, stable xdist
+# ids, no .hypothesis/ database); "thorough" is for trying more by hand:
+#   HYPOTHESIS_PROFILE=thorough uv run pytest tests/parquet_analyzer/test_property_*.py
+# max_examples is set per test with @settings(max_examples=...) (x10 under "thorough": see _examples()
+# in each test_property_*.py).
+from hypothesis import HealthCheck, settings
+
+settings.register_profile(
+    "default", derandomize=True, deadline=None, database=None, print_blob=True,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+)
+settings.register_profile(
+    "thorough", derandomize=False, deadline=None, database=None, print_blob=True,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+)
+settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "default"))
+
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _gc_on_main_thread_only():

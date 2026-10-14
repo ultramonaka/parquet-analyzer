@@ -20,3 +20,6 @@ __pycache__/
 .coverage
 .coverage.*
 htmlcov/
+
+# hypothesis example database (HYPOTHESIS_PROFILE=thorough)
+.hypothesis/

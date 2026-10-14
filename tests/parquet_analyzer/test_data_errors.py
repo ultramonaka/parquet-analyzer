@@ -12,7 +12,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from parquet_analyzer.core.column import LazyColumn, LazyVariables, MaterializedColumn, WindowedColumn
+from parquet_analyzer.core.column import (
+    LazyColumn,
+    LazyVariables,
+    MaterializedColumn,
+    WindowedColumn,
+)
 from parquet_analyzer.core.data_source import ParquetDataSource
 from parquet_analyzer.core.expression import ExpressionError
 from parquet_analyzer.core.numeric import NonNumericColumnError, check_time_order, to_numeric
@@ -206,7 +211,7 @@ _D = datetime.datetime(2026, 1, 1)
         (pa.array([None, None, None]), [math.nan] * 3),
         (pa.array([1, 2, 3], type=pa.duration("ms")), [1.0, 2.0, 3.0]),
         (pa.array([_D] * 3), [1767225600.0] * 3),
-        (pa.array([_D.replace(tzinfo=datetime.timezone.utc)] * 3, type=pa.timestamp("ns", tz="UTC")), [1767225600.0] * 3),
+        (pa.array([_D.replace(tzinfo=datetime.UTC)] * 3, type=pa.timestamp("ns", tz="UTC")), [1767225600.0] * 3),
         (pa.array([datetime.date(2026, 1, 1)] * 3), [1767225600.0] * 3),
         (pa.array([2**63 - 1, 2**63 - 2, 5], type=pa.int64()), [2.0**63, 2.0**63, 5.0]),  # precision loss is inherent to float64
         (pa.array([2**64 - 1, 1, 2], type=pa.uint64()), [2.0**64, 1.0, 2.0]),
@@ -359,7 +364,7 @@ def test_timezone_aware_statistics_convert_without_a_warning(tmp_path):
     """data 29.5: numpy's tz UserWarning is harmless (value is UTC) and must not surface."""
     import warnings
 
-    ts = pa.array([_D.replace(tzinfo=datetime.timezone.utc)] * 3, type=pa.timestamp("ns", tz="UTC"))
+    ts = pa.array([_D.replace(tzinfo=datetime.UTC)] * 3, type=pa.timestamp("ns", tz="UTC"))
     ds = ParquetDataSource(_write(tmp_path / "f.parquet", t=np.arange(3.0), x=ts))
     with warnings.catch_warnings():
         warnings.simplefilter("error")

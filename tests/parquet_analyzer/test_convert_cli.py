@@ -159,7 +159,7 @@ def test_cli_output_is_directory_exits_1(tmp_path, capsys):
 def test_cli_invalid_raster_exits_1(tmp_path, capsys, raster):
     asammdf = pytest.importorskip("asammdf")
     mdf = asammdf.MDF()
-    mdf.header.start_time = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    mdf.header.start_time = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
     mdf.append([asammdf.Signal(samples=T, timestamps=T, name="x")])
     src = tmp_path / "a.mf4"
     mdf.save(src, overwrite=True)

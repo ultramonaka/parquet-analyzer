@@ -49,35 +49,37 @@ _cd: dict = {}
 _cd["self"] = _cd
 
 
+_ANY_VALUES = [
+    BadStr(),
+    BadItem(),
+    _circ,
+    _cd,
+    b"\xff\x00",
+    float("nan"),
+    float("inf"),
+    np.float32(1.5),
+    np.arange(5),
+    np.float64("nan"),
+    "x" * 10**6,
+    10**400,
+    {3, 1},
+    {1: "a", "1": "b", None: "c"},
+    {(1, 2): 3},
+    Path("/x"),
+    date.today(),
+    object(),
+    "\ud800",  # lone surrogate: not UTF-8 encodable
+    "bad\udcff-name",  # what surrogateescape makes of an undecodable file name
+    {"\ud800": 1},
+    {BadStr(): 1},
+    [BadStr()] * 3,
+    list(range(10_000)),
+]
+
+
+# ids from the position, not id(v): xdist workers must collect identical test ids.
 @pytest.mark.parametrize(
-    "value",
-    [
-        BadStr(),
-        BadItem(),
-        _circ,
-        _cd,
-        b"\xff\x00",
-        float("nan"),
-        float("inf"),
-        np.float32(1.5),
-        np.arange(5),
-        np.float64("nan"),
-        "x" * 10**6,
-        10**400,
-        {3, 1},
-        {1: "a", "1": "b", None: "c"},
-        {(1, 2): 3},
-        Path("/x"),
-        date.today(),
-        object(),
-        "\ud800",  # lone surrogate: not UTF-8 encodable
-        "bad\udcff-name",  # what surrogateescape makes of an undecodable file name
-        {"\ud800": 1},
-        {BadStr(): 1},
-        [BadStr()] * 3,
-        list(range(10_000)),
-    ],
-    ids=lambda v: type(v).__name__ + str(id(v) % 1000),
+    "value", _ANY_VALUES, ids=[f"{type(v).__name__}{i}" for i, v in enumerate(_ANY_VALUES)]
 )
 def test_log_op_with_any_argument_never_raises_and_the_record_is_written(log_dir, value):
     """A broken __str__ or a lone surrogate used to drop the record silently (UnicodeEncodeError

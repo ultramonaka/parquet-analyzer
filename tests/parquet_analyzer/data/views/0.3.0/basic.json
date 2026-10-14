@@ -1,0 +1,59 @@
+{
+  "schema_version": "1",
+  "view_name": "basic",
+  "source": {
+    "parquet_path": "/tmp/parquet_analyzer_old_views/0.3.0/sample.parquet",
+    "path_type": "absolute",
+    "relative_path": "../../../../../../tmp/parquet_analyzer_old_views/0.3.0/sample.parquet"
+  },
+  "time_column": "time",
+  "derived_variables": [],
+  "plots": [
+    {
+      "plot_id": "p1",
+      "series": [
+        {
+          "variable": "sine",
+          "color": "#1f77b4",
+          "visible": true
+        },
+        {
+          "variable": "cosine",
+          "color": "#ff7f0e",
+          "visible": false
+        }
+      ],
+      "y_axis_range": [
+        -2.0,
+        2.0
+      ],
+      "height_ratio": 0.6666666666666666,
+      "x_linked": true,
+      "x_axis_range": null
+    },
+    {
+      "plot_id": "p2",
+      "series": [
+        {
+          "variable": "ramp",
+          "color": "#1f77b4",
+          "visible": true
+        }
+      ],
+      "y_axis_range": [
+        -19.98,
+        1018.98
+      ],
+      "height_ratio": 0.3333333333333333,
+      "x_linked": true,
+      "x_axis_range": null
+    }
+  ],
+  "x_axis_range": [
+    1767225783.0406568,
+    1767226201.0103283
+  ],
+  "downsample": {
+    "enabled": true
+  }
+}

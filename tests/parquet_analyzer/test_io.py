@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from parquet_analyzer import config
 
+from parquet_analyzer import config
 from parquet_analyzer.io import view as view_io
 from parquet_analyzer.io.settings import (
     DEFAULT_SCROLL_BINDINGS,

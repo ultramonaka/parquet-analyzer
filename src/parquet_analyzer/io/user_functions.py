@@ -6,9 +6,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Mapping
 
 from .. import config
 from ..core.functions import FunctionRegistry, UserFunction, validate_user_function

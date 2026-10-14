@@ -6,8 +6,8 @@ import os
 import sys
 from datetime import date
 
-from PySide6.QtWidgets import QApplication
 from pyqtgraph.util.garbage_collector import GarbageCollector
+from PySide6.QtWidgets import QApplication
 
 from . import __version__, config
 from .core import oplog

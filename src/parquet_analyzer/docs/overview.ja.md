@@ -50,11 +50,11 @@ docs/
 |---|---|---|---|
 | データ | [domains/data.ja.md](./domains/data.ja.md) | Parquetの読み込み、遅延・窓読み込み、時間軸列の選択、ダウンサンプリング、描画中表示、MDF/MATLAB変換ツール | `core/data_source.py`, `core/column.py`, `core/pyramid.py`, `core/downsample.py`, `core/numeric.py`, `core/background_worker.py`, `core/convert.py` |
 | プロット | [domains/plots.ja.md](./domains/plots.ja.md) | メイン画面のプロット、ナビゲータ、操作（ズーム・パン）、カーソル、マルチプロット、高さ・並べ替え、系列ごとの操作、X軸の独立 | `ui/plot_widget.py`, `ui/plot_grid.py`, `ui/navigator.py` |
-| 演算式 | [domains/expressions.ja.md](./domains/expressions.ja.md) | 変数間演算・仮想変数とその編集、Δ解析、ユーザー関数、マップ | `core/expression.py`, `core/variable.py`, `core/analysis.py`（delta/rolling_mean）, `ui/expression_bar.py`, `ui/variable_panel.py` |
-| 解析 | [domains/analysis.ja.md](./domains/analysis.ja.md) | 統計、FFT、XY/XYZプロット（今後ヒストグラム） | `core/analysis.py`, `ui/stats_dialog.py` |
+| 演算式 | [domains/expressions.ja.md](./domains/expressions.ja.md) | 変数間演算・仮想変数とその編集、Δ解析、ユーザー関数、マップ、条件分岐（43章） | `core/expression.py`, `core/variable.py`, `core/analysis.py`（delta/rolling_mean）, `ui/expression_bar.py`, `ui/variable_panel.py` |
+| 解析 | [domains/analysis.ja.md](./domains/analysis.ja.md) | 統計、FFT、XY/XYZプロット、ヒストグラム（42章） | `core/analysis.py`, `core/histogram.py`, `ui/stats_dialog.py`, `ui/analysis_window.py`, `ui/xy_plot_window.py`, `ui/xy_map_view.py`, `ui/xy_overlay_controller.py`, `ui/histogram_window.py` |
 | 保存 | [domains/persistence.ja.md](./domains/persistence.ja.md) | ビュー（JSON・管理画面）、設定ファイル・設定メニュー、レイアウトの永続化 | `io/view.py`, `io/settings.py`, `ui/view_manager.py`, `ui/settings_dialog.py`, `ui/folder_picker.py` |
 | 画像保存 | [domains/export.ja.md](./domains/export.ja.md) | プロットの画像保存（matplotlibでの再描画、記載・メタデータ） | `ui/image_export.py` |
-| アプリ基盤 | [domains/app.ja.md](./domains/app.ja.md) | ディレクトリ構成・パス、起動、ログ・操作ログ、エラー処理、バージョン、機能フラグ | `config.py`, `core/oplog.py`, `ui/main_window.py`（全体の配線）, `ui/i18n.py` |
+| アプリ基盤 | [domains/app.ja.md](./domains/app.ja.md) | ディレクトリ構成・パス、起動、ログ・操作ログ、エラー処理、バージョン、機能フラグ、操作の副作用のテスト（45章） | `config.py`, `core/oplog.py`, `ui/main_window.py`（全体の配線）, `ui/i18n.py` |
 
 ### 1.1 分野の関係図
 
@@ -179,6 +179,7 @@ end note
 | ピラミッド | 大きい列の粗い最小/最大の包絡線（`core/pyramid.py`） |
 | ビュー | 保存した画面構成（`data/parquet_analyzer/*.json`） |
 | 機能フラグ | 開発中の機能のUIの入口を出し入れするスイッチ（`features.py`） |
+| 外部レビュー1 / 外部レビュー2 | ChatGPTによるコードレビュー。仕様書の「外部レビュー#N」「外部レビュー1の#N」は1（2026-10-02、静的レビュー。原文はコミット`2e794ca`の`idea.md`、項目はその後`idea.md`から整理済み）の項目番号、「外部レビュー2の#N」は2（2026-10-04、公開版0.3.0。`idea.md`）の項目番号 |
 
 ## 4. 全体の要求（目的・動作環境・非機能要件・対象外）
 
@@ -255,11 +256,16 @@ src/parquet_analyzer/
 │   ├── plot_widget.py        # TimePlotWidget: ズーム/パン、系列の描画、カーソル、ホバー表示（39章）、
 │   │                          # 画像保存用のexport_snapshot()（19.1章）
 │   ├── navigator.py          # NavigatorWidget: 縮小全体表示 + 選択範囲矩形（共通・単一）
+│   ├── navigator_sync.py     # NavigatorSync: 概観の作成と選択範囲の同期を1か所に（plots 24.9）
 │   ├── variable_panel.py     # VariablePanel: 変数一覧、D&D、仮想変数の編集/削除（18.3章）
 │   ├── expression_bar.py     # ExpressionBar: 演算式入力欄（編集モードを含む。18.3章）
 │   ├── stats_dialog.py       # StatsDialog: 統計結果の非モーダル別ウィンドウ
 │   ├── analysis_window.py    # AnalysisWindow: 解析ウィンドウの共通部品（範囲・追従・再計算、25.1章）
 │   ├── xy_plot_window.py     # XYPlotWindow: XYプロット（25.2章）、2D/3Dの切替（25.5章）
+│   ├── xy_map_view.py        # XYMapViewMixin: XYのマップ・カーブ表示（設定欄・計算・描画・書き出し、44章、44.12）
+│   ├── xy_overlay.py         # OverlayState（Qtなし）・等高線の線分・画像保存への重ね描き（44.7、44.12）
+│   ├── xy_overlay_controller.py # XYOverlayController: 重ねるメニュー・描画・等高線の値（OverlayHost経由、44.12）
+│   ├── histogram_window.py   # HistogramWindow: ヒストグラム（analysis 5.33・42章）
 │   ├── xyz_3d_window.py      # Xyz3DView: 3D表示（OpenGL、25.3・25.5章）
 │   ├── analysis_common.py    # XY・3Dで共有する小物（区切り、時刻の目盛り）
 │   ├── flow_layout.py        # 幅に合わせて折り返すレイアウト（XY/3Dの設定欄、25.5章）
@@ -284,6 +290,7 @@ src/parquet_analyzer/
 │   ├── expression.py         # evaluate_expression(): AST許可リスト方式の評価、referenced_names()
 │   ├── functions.py          # ユーザー関数・マップを式から呼ぶためのレジストリ（26・27章）
 │   ├── maps.py               # LookupTable: カーブ/マップの補間・範囲外の扱い（27章）
+│   ├── histogram.py          # ヒストグラムの計算（区切りなし/あり、ローカル時刻の区切り、analysis 42.3）
 │   ├── analysis.py           # fft()、sampling_report()（32章）、delta、rolling_mean、basic_stats
 │   ├── variable.py           # DerivedVariable; dependency_order(), dependents_of()（18.1章）
 │   ├── convert.py            # MDF/MATLAB→Parquet変換（15章）。convert_cli.py経由でのみ使う
@@ -330,6 +337,7 @@ package "ui" as ui {
   rectangle "plot_grid" as grid
   rectangle "plot_widget" as pw
   rectangle "navigator" as nav
+  rectangle "navigator_sync" as navsync
   rectangle "image_export" as ie
   rectangle "view_manager" as vm
   rectangle "settings_dialog" as sd
@@ -339,6 +347,10 @@ package "ui" as ui {
   rectangle "folder_picker" as fp
   rectangle "analysis_window" as aw
   rectangle "xy_plot_window" as xy
+  rectangle "xy_map_view" as xymv
+  rectangle "xy_overlay_controller" as xyoc
+  rectangle "xy_overlay" as xyo
+  rectangle "histogram_window" as hist
   rectangle "xyz_3d_window" as xyz
   rectangle "analysis_common / flow_layout" as acom
   rectangle "function_reference" as fref
@@ -367,12 +379,14 @@ package "core" as core {
   rectangle "maps" as cmaps
   rectangle "variable" as var
   rectangle "analysis" as ana
+  rectangle "histogram" as chist
   rectangle "oplog / oplog_view" as oplog
   rectangle "convert" as conv
 }
 
 mw --> grid
 mw --> nav
+mw --> navsync
 mw --> ie
 mw --> vm
 mw --> sd
@@ -384,10 +398,18 @@ mw --> xy
 mw --> fm
 mw --> mm
 mw --> xyz
+mw --> hist
 mw --> fref
 fref --> fm
 fref --> expr
 xy --> xyz
+xy --> xymv
+xy --> xyoc
+xy --> xyo
+xyoc --> xyo
+xyoc --> xyz
+xyo --> pw
+xymv ..> xy : 実行時にXY_*定数・_colormap等を参照
 xy --> acom
 xyz --> acom
 xyz --> aw
@@ -400,7 +422,18 @@ pw --> bw
 pw --> lttb
 pw ..> ie : PlotSnapshot
 nav --> lttb
+navsync --> nav
+navsync --> bw
+navsync --> col
+navsync --> pyr
+navsync --> tix
+navsync --> num
 xy --> aw
+hist --> aw
+hist --> chist
+hist --> acom
+hist --> ie
+chist --> num
 xy --> pw
 aw --> bw
 aw --> ie

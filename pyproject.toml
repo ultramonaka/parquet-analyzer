@@ -1,6 +1,6 @@
 [project]
 name = "parquet-analyzer"
-version = "0.3.0"
+version = "0.4.0"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.7",
@@ -17,6 +17,9 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-xdist>=3.5",
+    "hypothesis>=6.100",
+    "ruff>=0.17",
 ]
 # Only needed by tools/convert_to_parquet.sh (MDF/MAT -> Parquet); kept out
 # of the main app's dependencies so the GUI install doesn't pull in asammdf/scipy/h5py for
@@ -29,6 +32,21 @@ convert = [
 
 [tool.uv]
 package = false
+
+# Lint only (app ch.52): no formatter. E501 is not checked; line-length is used by I (import wrapping).
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+include = ["src/**/*.py", "tests/**/*.py", "tools/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test fixtures imported from other test modules look like redefinitions (F811) (app 52.1).
+"tests/**" = ["F811"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

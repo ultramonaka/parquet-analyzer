@@ -23,9 +23,10 @@ import threading
 import time
 import traceback
 import weakref
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .. import config
 
@@ -125,7 +126,9 @@ def purge_old_logs(log_dir: Path, retention_days: int, today: date | None = None
     Returns what was removed."""
     removed: list[Path] = []
     today = today or date.today()
-    from ..io.settings import normalize_log_retention_days  # the one validation (1..365, else default)
+    from ..io.settings import (
+        normalize_log_retention_days,  # the one validation (1..365, else default)
+    )
 
     retention_days = normalize_log_retention_days(retention_days)
     cutoff = today - timedelta(days=retention_days)

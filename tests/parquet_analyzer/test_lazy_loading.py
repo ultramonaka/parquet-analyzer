@@ -45,7 +45,7 @@ def multi_var_path(tmp_path):
 
 def test_load_parquet_materializes_only_the_time_column_and_the_navigator_fallback(qapp, isolated_config, multi_var_path):
     """"a" (the file's first raw variable) is still eagerly materialized here, not
-    because load_parquet itself reads it, but because _refresh_navigator_overview's
+    because load_parquet itself reads it, but because NavigatorSync.refresh's
     "nothing plotted yet" fallback does (`main_window.py`'s documented, deliberately
     deferred gap -- see detailed_specification.md 13.5.1's Phase B note). "b"/"c"
     stay lazy since nothing has touched them at all.

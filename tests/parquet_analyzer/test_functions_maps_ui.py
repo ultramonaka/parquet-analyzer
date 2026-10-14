@@ -14,9 +14,13 @@ from parquet_analyzer.io import maps as maps_io
 from parquet_analyzer.io import user_functions as uf_io
 from parquet_analyzer.io import view as view_io
 from parquet_analyzer.io.view import DerivedVariableDef, PlotDef, SeriesDef, SourceDef, View
-from parquet_analyzer.ui.function_manager import DropLineEdit, FunctionManagerWindow, build_call_expression
+from parquet_analyzer.ui.function_manager import (
+    DropLineEdit,
+    FunctionManagerWindow,
+    build_call_expression,
+)
 from parquet_analyzer.ui.main_window import MainWindow
-from parquet_analyzer.ui.map_manager import MapImportDialog, MapManagerWindow, default_map_name
+from parquet_analyzer.ui.map_manager import MapImportDialog, default_map_name
 from parquet_analyzer.ui.view_manager import ViewManagerDialog
 
 POWER = UserFunction("Power_fn", ["p", "q"], [("k", 2.0)], "p * q / k", "demo")
@@ -183,10 +187,10 @@ def test_save_new_function_persists_and_lists(win):
         ("g", "v", "w + 1", ()),  # direct column reference
         ("g", "v", "nofunc(v)", ()),
         # disallowed syntax is refused at save time (expressions 6.1)
-        ("g", "v", "v < 1", ()),
+        ("g", "v", "v is 1", ()),
         ("g", "v", "v.real", ()),
         ("g", "v", "v[0]", ()),
-        ("g", "v", "v if v else 1", ()),
+        ("g", "v", "v in v", ()),
         ("g", "v", "[v]", ()),
         ("g", "v", "v + True", ()),
     ],

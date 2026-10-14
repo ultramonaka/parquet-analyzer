@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 import numpy as np
 import pyqtgraph as pg
@@ -21,22 +21,29 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QPushButton,
     QStackedWidget,
+    QVBoxLayout,
     QWidget,
 )
 
 from .. import features
 from ..core.column import MaterializedColumn
+from ..core.contour_levels import LevelSpec
 from ..core.oplog import log_op
+from . import xy_map as xm
+from . import xy_overlay as xo
 from . import xyz_3d_window as x3
 from .analysis_common import chunks, format_time_tick
 from .analysis_window import CANCELLED, AnalysisWindow
 from .flow_layout import FlowLayout
 from .i18n import tr
 from .image_export import _FIG_DPI, _font_context
+from .name_picker import NamePicker
 from .plot_widget import _COLOR_CYCLE
+from .xy_exclude import ExcludeViewBox, XYExcludeController
+from .xy_map_view import XYMapViewMixin
+from .xy_overlay_controller import XYOverlayController
 from .xyz_3d_window import Xyz3DResult, Xyz3DView, build_xyz_figure, colors_for, compute_xyz
 
 logger = logging.getLogger(__name__)
@@ -113,11 +120,14 @@ def compute_xy(
     chunk_rows: int | None = None,
     cancelled: Callable[[], bool] | None = None,
     time_name: str | None = None,
+    hidden=frozenset(),
 ) -> XYResult:
     """Compute what the XY window shows. `fetch(name, a, b)` returns rows [a, b) of a
     variable (also of the time column when it is chosen as X/Y/Z, 25.5; `time_name` only
     records which name that is, for the display). Rows where any variable used for a Y is
-    non-finite are excluded per Y."""
+    non-finite are excluded per Y. `hidden` Ys (legend click, 44.5) are ignored: a scatter keeps
+    their points (showing them again needs no recompute) and the density, which has no legend to
+    bring a Y back, draws every selected Y."""
     chunk_rows = chunk_rows or XY_CHUNK_ROWS
     color = effective_color(color, len(y_names), z_name)
     use_z = color == "z"
@@ -191,11 +201,11 @@ def compute_xy(
         rng = [[xlo, xhi], [ylo, yhi]]
         counts = np.zeros((XY_DENSITY_BINS, XY_DENSITY_BINS), dtype=np.float64)
         zsum = np.zeros_like(counts) if use_z else None
-        xedges = yedges = None
+        xedges, yedges = np.linspace(xlo, xhi, XY_DENSITY_BINS + 1), np.linspace(ylo, yhi, XY_DENSITY_BINS + 1)
         for a, b in chunks(row_start, row_end, chunk_rows):
             if stop():
                 return CANCELLED
-            for y_name in y_names:
+            for y_name in y_names:  # `hidden` is ignored: the density has no legend to bring a Y back (44.5)
                 x, y, c, mask = valid_points(a, b, y_name)
                 if not mask.any():
                     continue
@@ -253,6 +263,8 @@ def compute_xy(
 
 _DISPLAY_MODES = ("auto", "scatter", "density")
 _COLOR_MODES = ("single", "time", "z")
+
+
 _MODES = ("2d", "3d")
 
 
@@ -283,7 +295,7 @@ class _TimeAxis(pg.AxisItem):
         return [format_time_tick(v, span) for v in values]
 
 
-class XYPlotWindow(AnalysisWindow):
+class XYPlotWindow(XYMapViewMixin, AnalysisWindow):
     """The XY plot window, with a 2D/3D toggle (25.5): X, Y (2D: several, 3D: one), Z (2D: colour
     variable, 3D: third axis), colour and display mode in one wrapping row; the time-axis column is
     a candidate for every axis."""
@@ -292,10 +304,26 @@ class XYPlotWindow(AnalysisWindow):
         self._init_x = x_name
         self._init_y = list(y_names or [])
         self._result: XYResult | Xyz3DResult | None = None
+        self._grid_invalid = False  # the grid settings were refused at the last compute: export disabled (44.1)
         self._mode = "2d"
         self._view3d = None  # Xyz3DView, created on the first switch to 3D (needs OpenGL)
         self._gl3d_ok = False
         self._gl3d_reason = ""
+        # Series hidden by a click on their legend entry (44.5). Names, not items: it survives a
+        # redraw/recompute and is pruned to the selected Y's. The legend's own click only toggled
+        # its proxy swatch (the real points are separate items), which is why nothing happened.
+        self._hidden_y: set[str] = set()
+        self._series_items: dict[str, object] = {}  # Y name -> the plotted item(s)
+        self._legend_proxies: dict[object, str] = {}  # legend swatch item -> Y name
+        self._map_items: dict = {}  # the heat map's image / hatch / points items (tests, hover)
+        self._map_notice = ""  # why the map display was switched off (time axis chosen), shown in the status
+        self._median_total: int | None = None  # valid points of the last map computation (median limit, 44.2)
+        # Overlaid registered maps / curves (44.7, 44.12): state + menu + drawing are in the controller
+        # (its `state.hidden` / `state.notice` are read by the legend click and the status line below).
+        self._overlays = XYOverlayController(self)
+        self._keep_view_gen = -1  # generation of a click / rectangle recompute: its result keeps the view (44.13)
+        self._exclude = XYExcludeController(self)  # points taken out of the map by click / rectangle (44.13)
+        self._status_core = ""
         super().__init__(main, tr("xy.title"))
         self._apply_color_constraints()
         self._cursor_item = pg.ScatterPlotItem(
@@ -304,6 +332,9 @@ class XYPlotWindow(AnalysisWindow):
         self._cursor_item.setZValue(100)
         self._plot.addItem(self._cursor_item)
         main.plot_grid.cursorsChanged.connect(self._on_cursors_changed)
+        self._add_map_actions()
+        self._update_map_controls()
+        self._exclude.remember_variables()
         self._refresh_pending = False
         model = main.variable_panel.model()
         for sig in (model.rowsInserted, model.rowsRemoved, model.modelReset):
@@ -319,16 +350,25 @@ class XYPlotWindow(AnalysisWindow):
 
     def _candidates(self) -> list[str]:
         """Every variable plus the time-axis column (first), 25.5."""
-        names = list(self._main._raw_variables.keys())
-        tc = self._main._time_column
+        names = self._main.visible_column_names()  # aliases instead of their sources (persistence 54.2)
+        tc = self._time_name()
         return ([tc] if tc and tc not in names else []) + names
 
     def _data_names(self) -> list[str]:
         """The candidates without the time column: what the combos default to."""
-        return list(self._main._raw_variables.keys())
+        return self._main.visible_column_names()
+
+    def _time_name(self) -> str | None:
+        """The time axis as the combos show it (its alias when it has one)."""
+        return self._main._display_name(self._main._time_column)
 
     def _is_time(self, name: str | None) -> bool:
-        return bool(name) and name == self._main._time_column
+        # by source column: the display name can change while the window is open (54.4)
+        return bool(name) and self._main._alias_sources.get(name, name) == self._main._time_column
+
+    def used_variable_names(self) -> set[str]:
+        """Names this window currently plots (for MainWindow's alias re-resolution, 54.4)."""
+        return {self._x_combo.currentText(), self._z_combo.currentText(), *self.selected_y()} - {""}
 
     # -- settings panel ------------------------------------------------------------
 
@@ -350,7 +390,7 @@ class XYPlotWindow(AnalysisWindow):
         lay = QHBoxLayout(box)
         lay.setContentsMargins(0, 0, 0, 0)
         label = QLabel(label_text)
-        lay.addWidget(label, 0, Qt.AlignmentFlag.AlignTop if isinstance(widget, QListWidget) else Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(label, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(widget)
         flow.addWidget(box)
         return box, label
@@ -366,16 +406,10 @@ class XYPlotWindow(AnalysisWindow):
         self._x_combo.addItems(names)
         self._x_combo.setCurrentText(self._init_x if self._init_x in names else (data_names[0] if data_names else ""))
         self._group(flow, tr("xy.x"), self._x_combo)
-        self._y_list = QListWidget()
-        self._y_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        self._y_list.setMaximumHeight(72)
-        self._y_list.setMinimumWidth(130)
-        self._y_list.setMaximumWidth(220)
-        self._y_list.addItems(names)
-        for i in range(self._y_list.count()):
-            if self._y_list.item(i).text() in self._init_y:
-                self._y_list.item(i).setSelected(True)
-        self._y_group, self._y_label = self._group(flow, tr("xy.y"), self._y_list)
+        self._y_picker = NamePicker()  # button -> searchable checkbox list (44.5)
+        self._y_picker.set_candidates(names)
+        self._y_picker.set_selected(self._init_y)
+        self._y_group, self._y_label = self._group(flow, tr("xy.y"), self._y_picker)
         self._z_combo = QComboBox()
         self._z_combo.addItems(names)
         self._z_combo.setCurrentText(self._default_z(data_names))
@@ -418,9 +452,10 @@ class XYPlotWindow(AnalysisWindow):
         for mode in _DISPLAY_MODES:
             self._display_combo.addItem(tr(f"xy.display_{mode}"), mode)
         self._display_group, _lab = self._group(flow, tr("xy.display"), self._display_combo)
+        self._build_map_controls(flow)
 
         self._x_combo.currentIndexChanged.connect(self._on_setting_changed)
-        self._y_list.itemSelectionChanged.connect(self._on_setting_changed)
+        self._y_picker.selectionChanged.connect(self._on_setting_changed)
         self._color_combo.currentIndexChanged.connect(self._on_setting_changed)
         self._z_combo.currentIndexChanged.connect(self._on_setting_changed)
         self._display_combo.currentIndexChanged.connect(self._on_setting_changed)
@@ -447,7 +482,7 @@ class XYPlotWindow(AnalysisWindow):
             return
         names = self._candidates()
         x, z, ys = self._x_combo.currentText(), self._z_combo.currentText(), set(self.selected_y())
-        widgets = (self._x_combo, self._y_list, self._z_combo)
+        widgets = (self._x_combo, self._y_picker, self._z_combo)
         for wdg in widgets:
             wdg.blockSignals(True)
         self._x_combo.clear()
@@ -456,17 +491,14 @@ class XYPlotWindow(AnalysisWindow):
         self._z_combo.clear()
         self._z_combo.addItems(names)
         self._z_combo.setCurrentIndex(names.index(z) if z in names else -1)
-        self._y_list.clear()
-        self._y_list.addItems(names)
-        for i in range(self._y_list.count()):
-            if self._y_list.item(i).text() in ys:
-                self._y_list.item(i).setSelected(True)
+        self._y_picker.set_candidates(names)
+        self._y_picker.set_selected(ys)
         for wdg in widgets:
             wdg.blockSignals(False)
         self._apply_color_constraints()
 
     def selected_y(self) -> list[str]:
-        return [i.text() for i in self._y_list.selectedItems()]
+        return self._y_picker.selected()
 
     def _color_mode(self) -> str:
         return self._color_combo.currentData()
@@ -496,7 +528,11 @@ class XYPlotWindow(AnalysisWindow):
         self._z_combo.setEnabled(mode3d or (single_y and self._color_mode() == "z"))
 
     def _on_setting_changed(self, *_a) -> None:
+        self._forget_grids_if_variables_changed()
         self._apply_color_constraints()
+        self._apply_map_constraints()
+        self._exclude.on_variables_maybe_changed()
+        self._update_map_controls()
         self.recompute(keep_range=True)
 
     # -- 2D / 3D toggle (25.5) -----------------------------------------------------
@@ -517,29 +553,32 @@ class XYPlotWindow(AnalysisWindow):
         self._mode = mode
         self._mode_buttons[mode].setChecked(True)
         three = mode == "3d"
-        self._y_list.blockSignals(True)
+        self._y_picker.blockSignals(True)
         if three:
             ys = self.selected_y()
             keep = ys[0] if ys else None
             if keep is None:
                 data = self._data_names()
                 keep = data[1] if len(data) > 1 else None
-            self._y_list.clearSelection()
-            self._y_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-            for i in range(self._y_list.count()):
-                if self._y_list.item(i).text() == keep:
-                    self._y_list.item(i).setSelected(True)
+            self._y_picker.set_single(True)
+            self._y_picker.set_selected([keep] if keep else [])
         else:
-            self._y_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        self._y_list.blockSignals(False)
+            self._y_picker.set_single(False)
+        self._y_picker.blockSignals(False)
         self._y_label.setText(tr("xy.y_single") if three else tr("xy.y"))
         self._z_label.setText(tr("xy.z_axis") if three else tr("xy.z"))
         self._display_group.setVisible(not three)
         self._apply_color_constraints()
+        self._apply_map_constraints()
+        self._exclude.remember_variables()  # the 2D/3D switch itself keeps the excluded rows (44.13)
+        self._update_map_controls()
         self._stack.setCurrentIndex(1 if three else 0)
         if three:
             self._ensure_view3d()
             self._cursor_item.setData([], [])
+        self._overlays.rebuild_menu()
+        self._overlays.remove_items()
+        self._overlays.entries()  # curves stay selected but are not drawn in 3D (44.10); redrawn after the recompute
         if recompute:
             self.recompute(keep_range=True)
 
@@ -556,14 +595,26 @@ class XYPlotWindow(AnalysisWindow):
         self._stack = QStackedWidget()
         self._glw = pg.GraphicsLayoutWidget()
         self._plot = self._glw.addPlot(
-            row=0, col=0, axisItems={"bottom": _TimeAxis("bottom"), "left": _TimeAxis("left")}
+            row=0, col=0, axisItems={"bottom": _TimeAxis("bottom"), "left": _TimeAxis("left")},
+            viewBox=ExcludeViewBox(),
         )
+        self._plot.vb.exclude_handler = self._exclude  # left click / drag pick points while the mode is on (44.13)
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._legend = self._plot.addLegend()
+        self._legend.sigSampleClicked.connect(self._on_legend_clicked)
         self._colorbar = pg.ColorBarItem(values=(0, 1), colorMap=_colormap(), interactive=False)
         self._glw.addItem(self._colorbar, row=0, col=1)
         self._colorbar.setVisible(False)
-        self._stack.addWidget(self._glw)
+        page = QWidget()  # the 2D plot with the map's hover readout in a normal label below (44.3)
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addWidget(self._glw, 1)
+        self._hover_label = QLabel("")
+        self._hover_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        lay.addWidget(self._hover_label)
+        self._stack.addWidget(page)
+        self._plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         return self._stack
 
     # -- compute -------------------------------------------------------------------
@@ -586,6 +637,8 @@ class XYPlotWindow(AnalysisWindow):
         return columns
 
     def make_job(self, row_start: int, row_end: int, cancelled):
+        if self._map_selected():
+            return self._make_job_map(row_start, row_end, cancelled)
         if self._mode == "3d":
             return self._make_job_3d(row_start, row_end, cancelled)
         x_name = self._x_combo.currentText()
@@ -600,7 +653,8 @@ class XYPlotWindow(AnalysisWindow):
         needed = [x_name, *y_names, *([z_name] if use_z else [])]
         columns = self._resolve_columns(needed)
         times = main._time_values
-        time_name = main._time_column
+        time_name = self._time_name()
+        hidden = set(self._hidden_y) & set(y_names)
 
         def fetch(name: str, a: int, b: int) -> np.ndarray:
             return columns[name].window(a, b)
@@ -611,7 +665,7 @@ class XYPlotWindow(AnalysisWindow):
         )
         return lambda: compute_xy(
             fetch, x_name, y_names, z_name, color, display, row_start, row_end, times, cancelled=cancelled,
-            time_name=time_name,
+            time_name=time_name, hidden=frozenset(hidden),
         )
 
     def _make_job_3d(self, row_start: int, row_end: int, cancelled):
@@ -622,7 +676,7 @@ class XYPlotWindow(AnalysisWindow):
         main = self._main
         columns = self._resolve_columns(list(names))
         times = main._time_values
-        time_name = main._time_column
+        time_name = self._time_name()
         log_op("xyz_3d_compute", x=names[0], y=names[1], z=names[2], color=color,
                row_start=row_start, row_end=row_end)
         return lambda: compute_xyz(
@@ -630,9 +684,22 @@ class XYPlotWindow(AnalysisWindow):
             cancelled=cancelled, time_name=time_name,
         )
 
+    def _prune_hidden(self, y_names: list[str], colour_mapped: bool) -> None:
+        """Hidden series follow the selection (a deselected Y is forgotten); with a colour-mapped
+        single series there is no legend entry to bring it back, so nothing stays hidden."""
+        self._hidden_y &= set(y_names)
+        if colour_mapped:
+            self._hidden_y.clear()
+
     def on_result(self, result) -> None:
         self._result = result
+        if isinstance(result, xm.XYMapResult):
+            self._show_map(result)
+            return
+        self._hover_label.setText("")
+        self._update_export_action()
         if isinstance(result, XYResult):
+            self._prune_hidden(result.y_names, result.color != "single")
             self._draw(result)
             self._update_status(result)
             self._on_cursors_changed(self._main.plot_grid.cursor_times())
@@ -664,11 +731,26 @@ class XYPlotWindow(AnalysisWindow):
             parts.append(tr("xy.status_density"))
         if r.thinned:
             parts.append(tr("xy.status_thinned", shown=r.thinned[0], total=r.thinned[1]))
+        if self._map_notice:
+            parts.append(self._map_notice)
         self.set_status("  |  ".join(parts))
 
     # -- 3D display ----------------------------------------------------------------
 
     def _show_3d(self, r: Xyz3DResult) -> None:
+        self._draw_scene_3d(r)
+        self._overlays.refresh(rebase=False)
+        self._update_status_3d(r)
+
+    def _draw_scene_3d(self, r) -> None:
+        """The 3D base scene of a points or map result; its Z range is widened to fit the overlaid maps (44.7)."""
+        if isinstance(r, xm.XYMapResult):
+            view = self._ensure_view3d()
+            if not r.grids or r.n_valid == 0 or r.no_data:
+                view.clear()
+            else:
+                self._show_map_3d_scene(r, view)
+            return
         view = self._ensure_view3d()
         labels = (r.x_name, r.y_name, r.z_name)
         if r.valid:
@@ -682,11 +764,10 @@ class XYPlotWindow(AnalysisWindow):
                 colors = colors_for(r.c, lo, hi)
                 c_is_time = r.color == "time" or (r.color == "z" and r.z_name == r.time_name)
                 view.set_colorbar(r.color_range, time_ticks=c_is_time)
-            view.set_scatter(r.x, r.y, r.z, colors, bounds=r.bounds, labels=labels,
+            view.set_scatter(r.x, r.y, r.z, colors, bounds=self._overlays.widened_bounds(r.bounds), labels=labels,
                              times=r.c if r.color == "time" else None, time_axes=time_axes)
         else:
             view.clear()
-        self._update_status_3d(r)
 
     def _update_status_3d(self, r: Xyz3DResult) -> None:
         parts = [
@@ -699,14 +780,97 @@ class XYPlotWindow(AnalysisWindow):
             parts.append(tr("xy.status_thinned", shown=r.thinned[0], total=r.thinned[1]))
         self.set_status("  |  ".join(parts))
 
+    # -- overlay of registered maps / curves (analysis.ja.md 44.7, 44.12) ---------------------------
+    # State, menu, drawing and levels live in `XYOverlayController` (`self._overlays`); these are the
+    # public entry points the main window, the image export and the tests call, plus the `OverlayHost`
+    # interface the controller draws through.
+
+    def overlay_names(self) -> list[str]:
+        return self._overlays.names()
+
+    def set_overlay(self, name: str, on: bool) -> None:
+        """Add / remove a registered table as an overlay (44.7)."""
+        self._overlays.set_overlay(name, on)
+
+    def set_contour_spec(self, spec: LevelSpec) -> None:
+        self._overlays.set_contour_spec(spec)
+
+    def contour_spec(self) -> LevelSpec:
+        return self._overlays.state.contour_spec
+
+    def choose_contour_levels(self) -> bool:
+        """The "Contour levels..." dialog; the accepted spec applies to every overlaid map (and the image)."""
+        return self._overlays.choose_contour_levels()
+
+    def contour_plan(self) -> dict[str, list[float]]:
+        """The contour values per visible overlaid map, as drawn and as exported."""
+        return self._overlays.contour_plan()
+
+    def on_registry_changed(self) -> None:
+        """The main window's maps changed (edit / delete / overwrite, 27.8): redraw or drop overlays."""
+        self._overlays.on_registry_changed()
+
+    # OverlayHost (xy_overlay_controller.py)
+
+    @property
+    def result(self):
+        return self._result
+
+    @property
+    def plot(self):
+        return self._plot
+
+    @property
+    def legend(self):
+        return self._legend
+
+    @property
+    def view3d(self):
+        return self._view3d
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def status_core(self) -> str:
+        return self._status_core
+
+    def x_name(self) -> str:
+        return self._x_combo.currentText()
+
+    def registry_tables(self) -> dict:
+        return dict(self._main.function_registry.maps)
+
+    def add_legend_entry(self, proxy, label: str) -> None:
+        self._add_legend_entry(proxy, label)
+
+    def redraw_scene_3d(self, r) -> None:
+        self._draw_scene_3d(r)
+
+    def map_bounds_3d(self, r) -> dict:
+        return self._map_bounds_3d(r)
+
+    def dialog_parent(self):
+        return self
+
+
+    def set_status(self, text: str) -> None:
+        """The status line = the display's own text plus the overlay notice (44.7)."""
+        self._status_core = text
+        notice = self._overlays.state.notice
+        if notice and text and self._result is not None:
+            text = f"{text}  |  {notice}"
+        super().set_status(text)
+
     # -- 2D display ----------------------------------------------------------------
 
     def _draw(self, r: XYResult) -> None:
         plot = self._plot
-        for item in list(plot.items):
-            if item is not self._cursor_item and isinstance(item, (pg.ScatterPlotItem, pg.ImageItem)):
-                plot.removeItem(item)
+        self._clear_plot_items()
         self._legend.clear()
+        self._series_items.clear()
+        self._legend_proxies.clear()
         self._colorbar.setVisible(False)
         plot.setLabel("bottom", r.x_name)
         plot.setLabel("left", ", ".join(r.y_names))
@@ -720,6 +884,7 @@ class XYPlotWindow(AnalysisWindow):
             self._draw_scatter(r, cmap)
         if r.x_bounds and r.y_bounds:
             plot.setRange(xRange=self._pad(r.x_bounds), yRange=self._pad(r.y_bounds), padding=0)
+        self._overlays.refresh()
 
     @staticmethod
     def _pad(bounds: tuple[float, float]) -> tuple[float, float]:
@@ -731,6 +896,65 @@ class XYPlotWindow(AnalysisWindow):
     def _color_is_time(r: XYResult) -> bool:
         """The colour bar reads as time when colouring by time, or by a Z that is the time column."""
         return r.color == "time" or (r.color == "z" and r.z_name is not None and r.z_name == r.time_name)
+
+    def _legend_series_visible(self, name: str) -> bool:
+        return name not in self._hidden_y
+
+    def _add_legend_entry(self, proxy, name: str) -> None:
+        """Legend entry whose name text toggles the series like the swatch does (44.5; pyqtgraph's
+        `sigSampleClicked` only fires on the swatch)."""
+        self._legend.addItem(proxy, name)
+        sample, label = self._legend.items[-1]
+
+        def on_click(event, proxy=proxy, sample=sample) -> None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                proxy.setVisible(not proxy.isVisible())  # what the swatch's own click does first
+                sample.update()
+                self._on_legend_clicked(proxy)
+            event.accept()
+
+        label.mouseClickEvent = on_click  # found by the scene's click dispatch via hasattr
+
+    def _on_legend_clicked(self, proxy) -> None:
+        """A click on a legend entry (44.5). pyqtgraph's `ItemSample` has already flipped the
+        swatch's visibility; mirror that onto the real series and remember it by name."""
+        oname = self._overlays.proxies.get(proxy)
+        if oname is not None:
+            hide = not proxy.isVisible()
+            log_op("xy_plot_series_visibility", y=oname, hidden=hide, overlay=True)
+            self.set_overlay_hidden(oname, hide)
+            return
+        name = self._legend_proxies.get(proxy)
+        if name is None:
+            return
+        hide = not proxy.isVisible()
+        log_op("xy_plot_series_visibility", y=name, hidden=hide)
+        self.set_series_hidden(name, hide)
+
+    def set_series_hidden(self, name: str, hidden: bool) -> None:
+        """Hide / show one Y's series: not drawn, not highlighted by the cursors, not in the image."""
+        if hidden:
+            self._hidden_y.add(name)
+        else:
+            self._hidden_y.discard(name)
+        for proxy, n in self._legend_proxies.items():
+            if n == name:
+                proxy.setVisible(not hidden)
+        item = self._series_items.get(name)
+        if item is not None:
+            for it in item if isinstance(item, (list, tuple)) else [item]:
+                it.setVisible(not hidden)
+        for sample, _label in self._legend.items:  # repaint the swatch's eye icon
+            sample.update()
+        self._on_cursors_changed(self._main.plot_grid.cursor_times())
+
+    def set_overlay_hidden(self, name: str, hidden: bool) -> None:
+        """Hide / show one overlay (legend click, 44.7). Levels are planned over the visible maps only,
+        so the lines are redrawn."""
+        self._overlays.set_hidden(name, hidden)
+
+    def hidden_series(self) -> set[str]:
+        return set(self._hidden_y)
 
     def _draw_scatter(self, r: XYResult, cmap: pg.ColorMap) -> None:
         for i, s in enumerate(r.scatter):
@@ -746,11 +970,15 @@ class XYPlotWindow(AnalysisWindow):
                 kwargs["brush"] = pg.mkBrush(base)
             item = pg.ScatterPlotItem(s.x, s.y, size=3, pen=None, pxMode=True, **kwargs)
             self._plot.addItem(item)
+            self._series_items[s.name] = item
+            item.setVisible(self._legend_series_visible(s.name))
             if not isinstance(kwargs["brush"], list):  # colour-mapped: the colour bar says it
                 # Legend swatch from a data-less proxy with a bigger marker: the plotted
                 # points are 3 px, too small to read as a legend sample.
                 proxy = pg.ScatterPlotItem(size=LEGEND_MARKER_SIZE, pen=None, brush=pg.mkBrush(base))
-                self._legend.addItem(proxy, s.name)
+                proxy.setVisible(self._legend_series_visible(s.name))
+                self._legend_proxies[proxy] = s.name
+                self._add_legend_entry(proxy, s.name)
         if r.color != "single" and r.color_range:
             self._set_colorbar(r.color_range, time_ticks=self._color_is_time(r))
 
@@ -803,21 +1031,28 @@ class XYPlotWindow(AnalysisWindow):
 
     def _on_cursors_changed(self, times_list) -> None:
         """Highlight the point at each cursor's time (25.2). Cursors outside the computed
-        row range are ignored. Only the 2D display has the highlight (the 3D view has none)."""
+        row range are ignored. Only the 2D display has the highlight (the 3D view has none); a 2D
+        map / curve shows the cursor row's measured (x, y) too (44.3)."""
         if self._closed:
             return
         r = self._result
         pts_x, pts_y = [], []
         main = self._main
         tv = main._time_values
-        if isinstance(r, XYResult) and tv is not None and len(tv) and r.row_end > r.row_start:
+        # a scatter / density, or the 2D map / curve (44.3: the same marker; the 3D view has none)
+        shown = isinstance(r, XYResult) or (isinstance(r, xm.XYMapResult) and not r.is_3d and not r.no_data)
+        if shown and tv is not None and len(tv) and r.row_end > r.row_start:
+            skip_hidden = not (isinstance(r, XYResult) and r.mode == "density")
+            y_list = r.y_names[:1] if isinstance(r, xm.XYMapResult) and not r.is_curve else r.y_names
             for t in times_list:
                 row = self.nearest_row(tv, t)
                 if row is None or not (r.row_start <= row < r.row_end):
                     continue
                 try:
                     xv = self._value_at(r.x_name, row)
-                    for y_name in r.y_names:
+                    for y_name in y_list:
+                        if y_name in self._hidden_y and skip_hidden:
+                            continue
                         yv = self._value_at(y_name, row)
                         if np.isfinite(xv) and np.isfinite(yv):
                             pts_x.append(xv)
@@ -853,10 +1088,23 @@ class XYPlotWindow(AnalysisWindow):
 
     # -- export --------------------------------------------------------------------
 
-    def export_stamp_extra(self) -> str | None:
+    def export_stamp_extra(self):
+        lines = self._export_stamp_base()
+        names = [n for n in self.overlay_names() if not self._overlays.is_hidden(n)]
+        if lines is None or not names:
+            return lines
+        lines = [lines] if isinstance(lines, str) else list(lines)
+        return [*lines, tr("xy.overlay_stamp", names=", ".join(names))]
+
+    def _export_stamp_base(self):
         r = self._result
         if r is None:
             return None
+        if isinstance(r, xm.XYMapResult):
+            text = f"X: {r.x_name}  Y: {', '.join(r.y_names)}"
+            if r.z_name:
+                text += f"  Z: {r.z_name}"
+            return [text, r.describe_grid()]
         if isinstance(r, Xyz3DResult):
             return f"X: {r.x_name}  Y: {r.y_name}  Z: {r.z_name}"
         text = f"X: {r.x_name}  Y: {', '.join(r.y_names)}"
@@ -865,23 +1113,41 @@ class XYPlotWindow(AnalysisWindow):
         return text
 
     def build_export_figure(self, stamp_lines: list[str], size_px: tuple[int, int]):
+        fig = self._build_base_figure(stamp_lines, size_px)
+        if fig is None or not self.overlay_names():
+            return fig
+        entries = [e for e in self._overlays.entries() if not self._overlays.is_hidden(e.name)]
+        plan = self._overlays.planned_levels(entries)  # the same levels as on screen (44.7)
+        xo.apply_overlays_to_figure(fig, entries, plan, is_3d=self._mode == "3d")
+        return fig
+
+    def _build_base_figure(self, stamp_lines: list[str], size_px: tuple[int, int]):
         r = self._result
         if r is None:
             return None
+        if isinstance(r, xm.XYMapResult):
+            if r.no_data or not r.grids:
+                return None
+            angles = self._view3d.view_angles() if (r.is_3d and self._view3d is not None) else (25.0, -60.0)
+            return xm.build_xy_map_figure(r, stamp_lines, size_px, self._hidden_y, angles,
+                                          show_points=self._points_check.isChecked())
         if isinstance(r, Xyz3DResult):
             if not r.valid or self._view3d is None:
                 return None
             elev, azim = self._view3d.view_angles()
             return build_xyz_figure(r, stamp_lines, size_px, elev, azim)
-        return build_xy_figure(r, stamp_lines, size_px)
+        return build_xy_figure(r, stamp_lines, size_px, hidden=self._hidden_y)
 
 
-def build_xy_figure(r: XYResult, stamp_lines, size_px):
+def build_xy_figure(r: XYResult, stamp_lines, size_px, hidden=frozenset()):
     """matplotlib Figure of an XYResult (25.2). Scatter is rasterized so SVG/PDF stay small.
     A time-axis column used as X/Y (or as the colour) reads as local time (25.5)."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
     from matplotlib.ticker import FuncFormatter
+
+    if r.mode == "density":
+        hidden = frozenset()  # no legend in the density: every selected Y is drawn (44.5)
 
     def time_formatter(bounds):
         lo, hi = bounds if bounds else (0.0, 1.0)
@@ -909,6 +1175,8 @@ def build_xy_figure(r: XYResult, stamp_lines, size_px):
                 cb.update_ticks()
         else:
             for i, s in enumerate(r.scatter):
+                if s.name in hidden:  # hidden by a legend click (44.5)
+                    continue
                 color = _COLOR_CYCLE[i % len(_COLOR_CYCLE)]
                 if s.c is not None and len(s.c):
                     sc = ax.scatter(s.x, s.y, s=2, c=s.c, cmap="viridis", vmin=r.color_range[0], vmax=r.color_range[1],
@@ -920,10 +1188,10 @@ def build_xy_figure(r: XYResult, stamp_lines, size_px):
                 if c_is_time and r.color_range:
                     cb.formatter = time_formatter(r.color_range)
                     cb.update_ticks()
-            elif r.scatter:
+            elif any(s.name not in hidden for s in r.scatter):
                 ax.legend(loc="upper right", fontsize=8, framealpha=0.7, markerscale=4)
         ax.set_xlabel(r.x_name)
-        ax.set_ylabel(", ".join(r.y_names))
+        ax.set_ylabel(", ".join(n for n in r.y_names if n not in hidden) or ", ".join(r.y_names))
         if r.time_name is not None:
             if r.x_name == r.time_name:
                 ax.xaxis.set_major_formatter(time_formatter(r.x_bounds))

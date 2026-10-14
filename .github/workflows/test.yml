@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:  # run on any pushed branch: gh workflow run test.yml --ref <branch> (app 51.1)
 
 jobs:
   pytest:
@@ -30,5 +31,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
+      # Fails faster than the tests (app 52.3).
+      - name: Lint
+        run: uv run ruff check
+
       - name: Run tests
-        run: uv run pytest
+        run: uv run pytest -n auto

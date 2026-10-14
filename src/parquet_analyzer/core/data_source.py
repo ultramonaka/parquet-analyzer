@@ -63,6 +63,12 @@ class ParquetDataSource:
     def columns(self) -> list[str]:
         return list(self._schema.names())
 
+    def is_datetime(self, name: str) -> bool:
+        """True when column `name` is a date / datetime column (its time axis shows as wall-clock
+        time; a numeric column is just seconds). Used by the histogram's bucket export (42.8)."""
+        dtype = self._schema.get(name)
+        return dtype is not None and dtype.base_type() in (pl.Datetime, pl.Date)
+
     def row_count(self) -> int:
         return self._lazy.select(pl.len()).collect().item()
 

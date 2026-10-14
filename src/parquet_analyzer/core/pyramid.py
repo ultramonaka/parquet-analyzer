@@ -43,7 +43,7 @@ def build_pyramid(
     Wired into the UI as of detailed_specification.md 13.5.1 Phase D:
     `core.column.WindowedColumn.request_pyramid()` returns this as a zero-arg
     job, which `TimePlotWidget._maybe_start_pyramid_build` runs on a background
-    thread via `core/background_worker.py`'s `BackgroundWorker`, the same way
+    thread via `core/background_worker.py`'s `WorkerHub`, the same way
     downsampling/FFT/stats already do — this function itself has no threading of
     its own, by design, so it stays trivially testable.
     """

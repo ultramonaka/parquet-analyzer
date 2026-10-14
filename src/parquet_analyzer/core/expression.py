@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import ast
 import unicodedata
-from typing import TYPE_CHECKING, Mapping
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .analysis import delta, rolling_mean, rolling_nanmean
+from .analysis import delta, rolling_mean, rolling_nanmean, trailing_mean, trailing_nanmean
 
 if TYPE_CHECKING:
     from .functions import FunctionRegistry
@@ -24,6 +25,50 @@ _ALLOWED_UNARYOPS = {
     ast.UAdd: np.positive,
     ast.USub: np.negative,
 }
+# Conditionals (expressions.ja.md 43.1). One definition shared by _eval_node,
+# check_allowed_syntax and _margin so the three cannot drift (6.1). `is`/`in` are absent on purpose.
+_ALLOWED_CMPOPS = {
+    ast.Lt: np.less,
+    ast.LtE: np.less_equal,
+    ast.Gt: np.greater,
+    ast.GtE: np.greater_equal,
+    ast.Eq: np.equal,
+    ast.NotEq: np.not_equal,
+}
+_ALLOWED_BOOLOPS = (ast.And, ast.Or)
+# arithmetic unary operators plus logical `not`
+_ALLOWED_UNARY_TYPES = (*_ALLOWED_UNARYOPS, ast.Not)
+
+
+def _scalar_or_array(x):
+    """0-d results become plain floats ("all scalar in -> scalar out"); arrays stay float64."""
+    return float(x) if np.ndim(x) == 0 else np.asarray(x, dtype=np.float64)
+
+
+def _truth(x):
+    """(truth, unknown) of a condition value: nonzero = true, 0 = false, NaN = unknown (43.1)."""
+    x = np.asarray(x, dtype=np.float64)
+    unknown = np.isnan(x)
+    return (x != 0) & ~unknown, unknown
+
+
+def _truth_result(truth, unknown):
+    """float64 1.0/0.0 with NaN where unknown."""
+    return _scalar_or_array(np.where(unknown, np.nan, np.where(truth, 1.0, 0.0)))
+
+
+def _where(cond, a, b):
+    """where(c, a, b) / `a if c else b`: NaN condition -> NaN; NaN in a/b passes through (43.1)."""
+    truth, unknown = _truth(cond)
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    return _scalar_or_array(np.where(unknown, np.nan, np.where(truth, a, b)))
+
+
+def _isnan(x):
+    """1.0 for NaN, 0.0 otherwise (also for +-inf); never NaN."""
+    return _scalar_or_array(np.isnan(np.asarray(x, dtype=np.float64)).astype(np.float64))
+
 
 def _delta_expr(y):
     """delta() for expressions: a scalar means "the same value at every time", so its
@@ -54,6 +99,14 @@ def _rolling_nanmean_expr(y, window):
     return rolling_nanmean(y, _window_arg("rolling_nanmean", window))
 
 
+def _trailing_mean_expr(y, window):
+    return trailing_mean(y, _window_arg("trailing_mean", window))
+
+
+def _trailing_nanmean_expr(y, window):
+    return trailing_nanmean(y, _window_arg("trailing_nanmean", window))
+
+
 # name -> (expected positional arg count, implementation).
 # The arity is enforced *before* calling, not just the name whitelisted: abs/sqrt are
 # numpy ufuncs whose 2nd positional argument is the `out=` buffer, so an unchecked
@@ -80,8 +133,12 @@ _ALLOWED_FUNCS: dict[str, tuple[int, object]] = {
     "min": (2, np.minimum),
     "max": (2, np.maximum),
     "clip": (3, np.clip),
+    "where": (3, _where),
+    "isnan": (1, _isnan),
     "rolling_mean": (2, _rolling_mean_expr),
     "rolling_nanmean": (2, _rolling_nanmean_expr),
+    "trailing_mean": (2, _trailing_mean_expr),
+    "trailing_nanmean": (2, _trailing_nanmean_expr),
 }
 
 
@@ -110,13 +167,23 @@ def _rolling_margin(args):
     return (int(w) - 1, int(w) - 1)
 
 
+def _trailing_margin(args):
+    w = _const_number(args[1]) if len(args) == 2 else None
+    if w is None or not np.isfinite(w) or int(w) < 1:
+        return None  # non-constant / invalid window: full evaluation (and its error)
+    # A past-only window needs w-1 before and 0 after (expressions.ja.md 31.2, data 36.6 C).
+    return (int(w) - 1, 0)
+
+
 _FUNC_MARGINS: dict[str, object] = {
     **{n: (lambda args: _ELEMENTWISE) for n in (
-        "abs", "sqrt", "sin", "cos", "tan", "exp", "log", "log10", "sign", "floor", "ceil", "round", "min", "max", "clip"
+        "abs", "sqrt", "sin", "cos", "tan", "exp", "log", "log10", "sign", "floor", "ceil", "round", "min", "max", "clip", "where", "isnan"
     )},
     "delta": lambda args: (1, 0),
     "rolling_mean": _rolling_margin,
     "rolling_nanmean": _rolling_margin,
+    "trailing_mean": _trailing_margin,
+    "trailing_nanmean": _trailing_margin,
 }
 
 
@@ -168,13 +235,19 @@ def check_allowed_syntax(tree: ast.AST) -> None:
         if isinstance(node, ast.BinOp):
             ok = type(node.op) in _ALLOWED_BINOPS
         elif isinstance(node, ast.UnaryOp):
-            ok = type(node.op) in _ALLOWED_UNARYOPS
+            ok = type(node.op) in _ALLOWED_UNARY_TYPES
+        elif isinstance(node, ast.cmpop):
+            ok = type(node) in _ALLOWED_CMPOPS
         elif isinstance(node, ast.Call):
             ok = isinstance(node.func, ast.Name)
         elif isinstance(node, ast.Constant):
             ok = _is_number_constant(node)
         else:
-            ok = isinstance(node, (ast.Expression, ast.Name, ast.Load, ast.keyword, ast.operator, ast.unaryop))
+            ok = isinstance(
+                node,
+                (ast.Expression, ast.Name, ast.Load, ast.keyword, ast.operator, ast.unaryop,
+                 ast.Compare, ast.BoolOp, ast.boolop, ast.IfExp),
+            )
         if not ok:
             raise ExpressionError(f"expression not allowed: {type(node).__name__}")
 
@@ -182,7 +255,7 @@ def check_allowed_syntax(tree: ast.AST) -> None:
 def evaluate_expression(
     expr: str,
     variables: Mapping[str, np.ndarray],
-    registry: "FunctionRegistry | None" = None,
+    registry: FunctionRegistry | None = None,
 ) -> np.ndarray:
     """Evaluate `expr` over `variables`.
 
@@ -221,9 +294,9 @@ def referenced_functions(expr: str) -> set[str]:
 
 def expression_margin(
     expr: str,
-    registry: "FunctionRegistry | None",
-    name_margins: Mapping[str, "tuple[int, int] | None"],
-) -> "tuple[int, int] | None":
+    registry: FunctionRegistry | None,
+    name_margins: Mapping[str, tuple[int, int] | None],
+) -> tuple[int, int] | None:
     """(before, after): how many rows of the variables around an output row `expr` needs
     (detailed_specification.md 36.6 C), or None if that cannot be determined statically
     (unknown name/function, builtin without a margin entry, non-constant rolling window...).
@@ -249,8 +322,15 @@ def _margin(node, registry, env, depth):
         return None
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
         return _combine([_margin(node.left, registry, env, depth), _margin(node.right, registry, env, depth)])
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARY_TYPES:
         return _margin(node.operand, registry, env, depth)
+    # conditionals are elementwise: the margin is the max over the children (43.2)
+    if isinstance(node, ast.Compare) and all(type(o) in _ALLOWED_CMPOPS for o in node.ops):
+        return _combine([_margin(n, registry, env, depth) for n in (node.left, *node.comparators)])
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, _ALLOWED_BOOLOPS):
+        return _combine([_margin(n, registry, env, depth) for n in node.values])
+    if isinstance(node, ast.IfExp):
+        return _combine([_margin(n, registry, env, depth) for n in (node.test, node.body, node.orelse)])
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return (0, 0)
     if isinstance(node, ast.Name):
@@ -302,6 +382,56 @@ def _eval_node(node: ast.AST, variables: Mapping[str, np.ndarray], registry=None
 
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
         return _ALLOWED_UNARYOPS[type(node.op)](_eval_node(node.operand, variables, registry, depth))
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        truth, unknown = _truth(_eval_node(node.operand, variables, registry, depth))
+        return _truth_result(~truth, unknown)
+
+    if isinstance(node, ast.Compare) and all(type(o) in _ALLOWED_CMPOPS for o in node.ops):
+        # a < b < c == (a < b) and (b < c), each operand evaluated once (43.1)
+        # operands are evaluated outside the try so UnknownFunctionError etc. keep their type (43.5)
+        left = np.asarray(_eval_node(node.left, variables, registry, depth), dtype=np.float64)
+        truth = unknown = None
+        for op, comp in zip(node.ops, node.comparators):
+            right = np.asarray(_eval_node(comp, variables, registry, depth), dtype=np.float64)
+            try:
+                t = _ALLOWED_CMPOPS[type(op)](left, right)
+                u = np.isnan(left) | np.isnan(right)  # numpy says False for NaN; we say "unknown"
+                truth, unknown = (t, u) if truth is None else (truth & t, unknown | u)
+            except (TypeError, ValueError) as e:  # arrays of different lengths
+                raise ExpressionError(f"comparison: {e}") from e
+            left = right
+        return _truth_result(truth, unknown)
+
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, _ALLOWED_BOOLOPS):
+        # Kleene three-valued logic (43.5): `or` is true if any operand is true, `and` is false
+        # if any is false; otherwise NaN if any operand is unknown.
+        is_and = isinstance(node.op, ast.And)
+        decided = any_unknown = None  # decided: any true (or) / any false (and)
+        for v in node.values:
+            t, u = _truth(_eval_node(v, variables, registry, depth))
+            d = (~t & ~u) if is_and else t
+            try:
+                if decided is None:
+                    decided, any_unknown = d, u
+                else:
+                    decided = decided | d
+                    any_unknown = any_unknown | u
+            except (TypeError, ValueError) as e:  # arrays of different lengths
+                raise ExpressionError(f"{type(node.op).__name__.lower()}: {e}") from e
+        unknown = any_unknown & ~decided
+        truth = ~decided if is_and else decided
+        return _truth_result(truth, unknown)
+
+    if isinstance(node, ast.IfExp):
+        # both branches are always computed (no short circuit), like where() (43.1)
+        test = _eval_node(node.test, variables, registry, depth)
+        body = _eval_node(node.body, variables, registry, depth)
+        orelse = _eval_node(node.orelse, variables, registry, depth)
+        try:
+            return _where(test, body, orelse)
+        except (TypeError, ValueError) as e:
+            raise ExpressionError(f"conditional expression: {e}") from e
 
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name):

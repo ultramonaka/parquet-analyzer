@@ -9,12 +9,12 @@ import statistics
 import threading
 import time
 import weakref
-from pathlib import Path
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QObject, QThreadPool, Signal
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from parquet_analyzer import config
@@ -472,18 +472,18 @@ def test_viewer_prints_timeline_with_changes_jobs_messages_and_exceptions(win):
     assert oplog_view.main([str(path)], out=out) == 0
     text = out.getvalue()
     lines = text.splitlines()
-    assert any(l.startswith("#") and "load_parquet" in l for l in lines)
-    i_op = next(i for i, l in enumerate(lines) if "overlay_variable" in l and l.startswith("#"))
+    assert any(ln.startswith("#") and "load_parquet" in ln for ln in lines)
+    i_op = next(i for i, ln in enumerate(lines) if "overlay_variable" in ln and ln.startswith("#"))
     # the op's consequences (child ops) and its result are indented under it
     i_res = next(i for i in range(i_op + 1, len(lines)) if lines[i].startswith("    -> result"))
-    assert all(l.startswith("    ") for l in lines[i_op + 1 : i_res])
-    assert any(l.startswith("        plots.") and ".series" in l for l in lines[i_res:])
+    assert all(ln.startswith("    ") for ln in lines[i_op + 1 : i_res])
+    assert any(ln.startswith("        plots.") and ".series" in ln for ln in lines[i_res:])
     assert "message [info/status] note" in text and "EXCEPTION ValueError: oops" in text
     assert text.splitlines()[0].startswith("=== session start")
 
     out = io.StringIO()
     oplog_view.main([str(path), "--last", "1"], out=out)
-    last_ops = [l for l in out.getvalue().splitlines() if l.startswith("#")]
+    last_ops = [ln for ln in out.getvalue().splitlines() if ln.startswith("#")]
     assert len(last_ops) == 1
     out = io.StringIO()
     oplog_view.main([str(path), "--session"], out=out)
@@ -636,7 +636,7 @@ def test_last_n_cuts_by_position_in_a_multi_session_file(tmp_path):
     f.write_text("\n".join(json.dumps(r) for r in lines))
     out = io.StringIO()
     oplog_view.main([str(f), "--last", "3"], out=out)
-    ops = [l.split()[2] for l in out.getvalue().splitlines() if l.startswith("#")]
+    ops = [ln.split()[2] for ln in out.getvalue().splitlines() if ln.startswith("#")]
     assert ops == ["s1_b", "s2_a", "s2_b"]
 
 

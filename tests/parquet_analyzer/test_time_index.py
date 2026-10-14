@@ -269,7 +269,7 @@ def test_view_save_load_with_index(qapp, isolated_config, monkeypatch, big):
     _wait(qapp, win)
     plot.getViewBox().setXRange(sec[1000], sec[2000], padding=0)
     _wait(qapp, win)
-    monkeypatch.setattr(mw.QInputDialog, "getText", lambda *a, **k: ("v1", True))
+    monkeypatch.setattr(mw.QInputDialog, "getItem", lambda *a, **k: ("v1", True))
     monkeypatch.setattr(mw.messages, "information", lambda *a, **k: None)
     win.save_view_dialog()
     saved = view_io.load_view("v1")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping
+from collections.abc import Mapping
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QListWidget, QListWidgetItem, QMenu
@@ -19,6 +19,7 @@ class VariablePanel(QListWidget):
     variableDoubleClicked = Signal(str)
     editDerivedRequested = Signal(str)
     deleteDerivedRequested = Signal(str)
+    aliasRequested = Signal(str)  # "Add alias..." / "Edit alias..." on a file column (persistence 54.3)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -26,12 +27,24 @@ class VariablePanel(QListWidget):
         self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.itemDoubleClicked.connect(lambda item: self.variableDoubleClicked.emit(item.text()))
         self._derived: dict[str, str] = {}
+        self._aliases: dict[str, str] = {}  # alias -> source column of the open file
 
-    def set_variables(self, names: list[str], derived: Mapping[str, str] | None = None) -> None:
+    def set_variables(
+        self,
+        names: list[str],
+        derived: Mapping[str, str] | None = None,
+        aliases: Mapping[str, str] | None = None,
+    ) -> None:
+        """`names` are the display names (aliased columns appear under their alias only, 54.2);
+        `aliases` (alias -> source) gives those items a tooltip naming the source column."""
         self.clear()
         self._derived = {}
+        self._aliases = dict(aliases or {})
         for name in names:
-            self.addItem(QListWidgetItem(name))
+            item = QListWidgetItem(name)  # text is the alias itself: it is used as the variable name
+            if name in self._aliases:
+                item.setToolTip(tr("variable.alias_source", source=self._aliases[name]))
+            self.addItem(item)
         for name, expression in (derived or {}).items():
             self.add_variable(name, expression)
 
@@ -57,10 +70,15 @@ class VariablePanel(QListWidget):
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt override)
         item = self.itemAt(event.pos())
-        if item is None or item.text() not in self._derived:
-            return  # file columns are real data, not formulas: nothing to edit/delete
+        if item is None:
+            return
         name = item.text()
         menu = QMenu(self)
+        if name not in self._derived:  # a file column: real data, no formula to edit (alias only, 54.3)
+            label = tr("variable.alias_edit") if name in self._aliases else tr("variable.alias_add")
+            menu.addAction(label, lambda: self.aliasRequested.emit(name))
+            menu.exec(event.globalPos())
+            return
         menu.addAction(tr("variable.edit_expression"), lambda: self.editDerivedRequested.emit(name))
         menu.addAction(tr("variable.delete"), lambda: self.deleteDerivedRequested.emit(name))
         menu.exec(event.globalPos())

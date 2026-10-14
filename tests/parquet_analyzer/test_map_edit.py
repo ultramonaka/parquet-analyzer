@@ -6,11 +6,10 @@ import json
 
 import pytest
 from PySide6.QtWidgets import QDialog
+from test_functions_maps_ui import CURVE, MAP, _csv, _fill, boxes, flags_on, win  # noqa: F401  (fixtures/helpers)
 
 from parquet_analyzer.io import maps as maps_io
 from parquet_analyzer.ui.map_manager import MapEditDialog
-
-from test_functions_maps_ui import CURVE, MAP, _csv, _fill, boxes, flags_on, win  # noqa: F401  (fixtures/helpers)
 
 
 def _open(win, tmp_path):

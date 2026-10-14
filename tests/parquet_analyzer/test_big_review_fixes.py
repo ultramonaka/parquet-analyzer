@@ -5,8 +5,8 @@ the navigator re-sync, pyramid completion for every waiting plot, and the regist
 from __future__ import annotations
 
 import threading
-import warnings
 import time
+import warnings
 
 import numpy as np
 import pyarrow as pa
@@ -20,7 +20,7 @@ from parquet_analyzer.core.column import DerivedColumn, WindowedColumn
 from parquet_analyzer.core.data_source import ParquetDataSource
 from parquet_analyzer.core.functions import FunctionRegistry, UserFunction
 from parquet_analyzer.core.time_index import TimeIndex
-from parquet_analyzer.ui import main_window as mw_module
+from parquet_analyzer.ui import navigator_sync as ns_module
 from parquet_analyzer.ui import plot_widget as pw_module
 from parquet_analyzer.ui.main_window import MainWindow
 
@@ -57,7 +57,7 @@ def _wait(qapp, win, seconds=15.0):
 
 def _open(qapp, path, monkeypatch):
     monkeypatch.setattr(pw_module, "_PYRAMID_PREFERRED_ROW_THRESHOLD", 5_000)
-    monkeypatch.setattr(mw_module, "_DERIVED_NAV_DIRECT_ROWS", 5_000)
+    monkeypatch.setattr(ns_module, "_DERIVED_NAV_DIRECT_ROWS", 5_000)
     win = MainWindow()
     win.settings.eager_load_limit_mb = 0
     assert win.load_parquet(path)
@@ -108,7 +108,7 @@ def test_navigator_overview_from_built_pyramid(qapp, isolated_config, monkeypatc
         while col.pyramid is None and time.time() < end:  # the wide first view builds the pyramid
             _wait(qapp, win)
         assert col.pyramid is not None
-        win._refresh_navigator_overview()  # NameError: lazy_t on the old code
+        win._nav_sync.refresh()  # NameError: lazy_t on the old code
         _wait(qapp, win)
         ox, oy = win.navigator._curve.getData()
         assert len(ox) > len(col.pyramid.row_starts) and np.isfinite(ox).all() and np.isfinite(oy).all()
@@ -116,7 +116,7 @@ def test_navigator_overview_from_built_pyramid(qapp, isolated_config, monkeypatc
         assert 0.9 < oy.max() <= 1.0 + 1e-9  # the real envelope, not a flat line
         # the same call without a pyramid (footer-stats branch): row-group starts, O(1) on a TimeIndex
         col._pyramid = None
-        x, y = win._windowed_navigator_overview(col)
+        x, y = win._nav_sync._windowed_navigator_overview(col)
         assert np.isfinite(x).all() and len(x) == 2 * 10 + 2
     finally:
         win.close()

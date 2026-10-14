@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
 import logging
 from collections import ChainMap
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping
 
 import numpy as np
-from PySide6.QtCore import QThreadPool, QTimer, Qt
+from PySide6.QtCore import Qt, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
@@ -21,12 +21,14 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QToolBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import __version__, features
+from ..core import oplog
 from ..core.analysis import basic_stats, chunked_stats, fft, sampling_report
 from ..core.background_worker import WorkerHub
 from ..core.column import (
@@ -48,28 +50,38 @@ from ..core.expression import (
 )
 from ..core.functions import FunctionRegistry
 from ..core.numeric import NonNumericColumnError, check_time_order, to_numeric
-from ..core.pyramid import thin_column
-from ..core.time_index import ANCHOR_ROWS, TimeIndex
-from ..core import oplog
 from ..core.oplog import log_op
+from ..core.signal_aliases import (
+    AliasProblem,
+    aliases_by_source,
+    display_name,
+    resolve_aliases,
+    validate_entry,
+    visible_names,
+)
+from ..core.time_index import TimeIndex
 from ..core.variable import DerivedVariable, dependency_order, dependents_of
 from ..io import maps as maps_io
+from ..io import signal_aliases as alias_io
 from ..io import user_functions as uf_io
 from ..io import view as view_io
 from ..io.settings import Settings, load_settings, push_recent_folder, save_settings
+from . import messages
 from .expression_bar import ExpressionBar
 from .folder_picker import pick_parquet_file
-from .image_export import EXPORT_FORMATS, export_plots_image
-from . import messages
 from .i18n import set_language, tr
+from .image_export import EXPORT_FORMATS, export_plots_image
 from .navigator import NavigatorWidget
+from .navigator_sync import NavigatorSync
 from .plot_grid import PlotGridWidget
 from .settings_dialog import SettingsDialog
 from .stats_dialog import StatsDialog
-from .view_manager import ViewManagerDialog, view_error_text
 from .variable_panel import VariablePanel
+from .view_manager import ViewManagerDialog, view_error_text
 
 _APP_TITLE = f"Parquet Analyzer v{__version__}"
+# QMainWindow.saveState version (app 48.3): 1 = file_view_toolbar + analysis_toolbar layout.
+_STATE_VERSION = 1
 logger = logging.getLogger(__name__)
 
 # FFT over the whole file is both memory-heavy (materializes the full column) and, for
@@ -80,9 +92,6 @@ logger = logging.getLogger(__name__)
 # (detailed_specification.md 13.5.1), with this cap so an accidental zoomed-way-out
 # request doesn't reintroduce the same memory problem.
 _FFT_MAX_ROWS = 8_000_000
-# Navigator overview of a windowed column: fewer row groups than this -> refine with a thinned read (data 40).
-_NAV_FEW_ROW_GROUPS = 200
-_DERIVED_NAV_DIRECT_ROWS = 2_000_000  # 36.6 C: a windowed derived series up to this long is computed directly for the navigator
 
 
 class MainWindow(QMainWindow):
@@ -119,10 +128,20 @@ class MainWindow(QMainWindow):
         # referenced by an expression, or selected for stats) — see
         # detailed_specification.md 13.5.1 Phase C and core/column.py.
         self._file_columns: dict[str, Column] = {}
+        # Signal aliases (persistence 54): the app-wide dictionary {alias: [candidate sources]} and, for
+        # the open file, {alias: source}. An alias is also a key of _file_columns holding the SAME
+        # Column object as its source (no copy). _time_column stays the SOURCE name; use
+        # _display_name() wherever a name is shown, logged or saved.
+        self._aliases: dict[str, list[str]] = {}
+        self._alias_disabled: set[str] = set()  # aliases with enabled=false (54.9)
+        self._alias_sources: dict[str, str] = {}
+        self._alias_by_source: dict[str, list[str]] = {}
+        self._skipped_alias_entries: list[object] = []  # raw items that failed to load; re-saved verbatim
+        self._aliases_saveable = True  # False when the file existed but was unreadable
+        self._alias_manager = None
         self._time_column: str | None = None
-        self._time_values: "np.ndarray | TimeIndex | None" = None
+        self._time_values: np.ndarray | TimeIndex | None = None
         self._time_indexes: dict[str, TimeIndex] = {}  # 36.6 D: per-file cache of built indexes
-        self._nav_pyramid_column: "DerivedColumn | None" = None  # 36.6 C: waited on for the navigator overview
         self._raw_variables: dict[str, Column] = {}  # _file_columns minus the current time column
         self._derived: dict[str, DerivedVariable] = {}
         # Name of the view the current layout was loaded from / saved as, for the
@@ -139,8 +158,9 @@ class MainWindow(QMainWindow):
         self._stats_hub = WorkerHub(self._analysis_thread_pool)
         self._fft_hub = WorkerHub(self._analysis_thread_pool)
         self._analysis_hub = WorkerHub(self._analysis_thread_pool)  # XY etc. (analysis_window.py)
-        self._navigator_hub = WorkerHub(self._analysis_thread_pool)  # windowed-column overview (40)
-        self._navigator_overview_gen = 0
+        # Bumped when load_parquet commits to a new file; stats/FFT results carry the value from
+        # request time and are dropped if it changed (app 46.5 S-5/F-5).
+        self._file_generation: int = 0
         self._busy_sources: set[str] = set()  # e.g. {"plot_grid", "fft", "stats"}
         # Live, per-session (not persisted to Settings — saved per-View instead, like
         # x/y axis ranges) toggle for TimePlotWidget/PlotGridWidget.set_downsample_enabled.
@@ -156,6 +176,17 @@ class MainWindow(QMainWindow):
             scroll_bindings=self.settings.scroll_bindings,
         )
         self.navigator = NavigatorWidget()
+        self._nav_sync = NavigatorSync(  # overview + region in one place (plots 24.9)
+            self.navigator,
+            WorkerHub(self._analysis_thread_pool),  # windowed-column overview (40)
+            time_values=lambda: self._time_values,
+            raw_variables=lambda: self._raw_variables,
+            data_source=lambda: self._data_source,
+            anchor_plot=self.plot_grid.anchor_plot,
+            group_range=self._group_x_range,
+            set_busy=self._set_busy,
+            time_finite_bounds=self._time_finite_bounds,
+        )
         self.variable_panel = VariablePanel()
         self.expression_bar = ExpressionBar(self._on_add_derived_variable)
 
@@ -174,13 +205,16 @@ class MainWindow(QMainWindow):
 
         self._build_layout()
         self._load_functions_and_maps()
+        self._load_signal_aliases()
+        if self.startup_warnings:  # one notice for functions, maps and aliases together
+            self._show_notice(" / ".join(self.startup_warnings), 20_000)
         self._build_actions()
         self._wire_signals()
 
         # Captured *before* restoring any saved layout, so "reset to default" has
         # something to go back to (specification.md 5.11).
         self._default_geometry = self.saveGeometry()
-        self._default_state = self.saveState()
+        self._default_state = self.saveState(_STATE_VERSION)
         self._restore_layout()
         # Operation log (detailed_specification.md 30.2): results are recorded from this.
         oplog.set_state_provider(self.state_snapshot, self._is_settling)
@@ -252,9 +286,29 @@ class MainWindow(QMainWindow):
         self._actions[key] = action
         return action
 
+    def _make_menu_button(self, toolbar, name: str, text: str, tooltip: str) -> tuple[QToolButton, QMenu]:
+        """A QToolButton + QMenu (InstantPopup) on `toolbar`, built like the "Graphs" button
+        (analysis 25.5; app 48.1). `name` gives `<name>_button` / `<name>_menu`."""
+        menu = QMenu(self)
+        menu.setObjectName(f"{name}_menu")
+        menu.setToolTipsVisible(True)
+        button = QToolButton()
+        button.setObjectName(f"{name}_button")
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.setMenu(menu)
+        toolbar.addWidget(button)
+        return button, menu
+
     def _build_actions(self) -> None:
-        toolbar = self.addToolBar("main")
-        toolbar.setObjectName("main_toolbar")  # needed for saveState/restoreState
+        """Two top toolbars (app 5.41 / 48.1): file & view, and analysis. Handlers, `_actions`
+        keys and shortcut ids are unchanged by the split."""
+        toolbar = self.addToolBar(tr("toolbar.file_view_title"))
+        toolbar.setObjectName("file_view_toolbar")  # needed for saveState/restoreState
+        analysis_toolbar = QToolBar(tr("toolbar.analysis_title"), self)
+        analysis_toolbar.setObjectName("analysis_toolbar")
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, analysis_toolbar)
 
         self._add_action("open_parquet", tr("toolbar.open"), toolbar, self.open_parquet_dialog)
         toolbar.addSeparator()
@@ -265,29 +319,22 @@ class MainWindow(QMainWindow):
         self.time_axis_combo.currentTextChanged.connect(self.set_time_column)
         toolbar.addWidget(self.time_axis_combo)
         toolbar.addSeparator()
-        self._add_action("home", tr("toolbar.home"), toolbar, self.plot_grid.go_home)
+        # "View" drop-down: save / manage views (48.1)
+        self.view_button, self.view_menu = self._make_menu_button(
+            toolbar, "view", tr("toolbar.view_menu"), tr("toolbar.view_menu_tooltip")
+        )
+        for key, label_key, callback in (
+            ("save_view", "toolbar.save_view", self.save_view_dialog),
+            ("load_view", "toolbar.load_view", self.load_view_dialog),
+        ):
+            self.addAction(self._add_action(key, tr(label_key), self.view_menu, callback))  # shortcut live while closed
+        self._add_action("export_image", tr("toolbar.export_image"), toolbar, self.export_image_dialog)
+        toolbar.addSeparator()
+        home_action = self._add_action("home", tr("toolbar.home"), toolbar, self.plot_grid.go_home)
+        home_action.setToolTip(tr("toolbar.home_tooltip"))
         self._add_action("redraw", tr("toolbar.redraw"), toolbar, self.plot_grid.redraw)
         toolbar.addSeparator()
         self._add_action("add_plot", tr("toolbar.add_plot"), toolbar, lambda: self.plot_grid.add_plot())
-        toolbar.addSeparator()
-        # lambda: QAction.triggered(bool) must not leak `checked` into _on_stats_requested's `plot` arg
-        self._add_action("stats", tr("toolbar.stats"), toolbar, lambda *_: self._on_stats_requested())
-        self._build_graphs_menu(toolbar)
-        toolbar.addSeparator()
-        if features.is_enabled("user_functions"):  # developer feature flag, detailed_specification.md 21
-            self._add_action("user_functions", tr("toolbar.functions"), toolbar, lambda *_: self.open_function_manager())
-        if features.is_enabled("maps"):
-            self._add_action("maps", tr("toolbar.maps"), toolbar, lambda *_: self.open_map_manager())
-        self._add_action("save_view", tr("toolbar.save_view"), toolbar, self.save_view_dialog)
-        self._add_action("load_view", tr("toolbar.load_view"), toolbar, self.load_view_dialog)
-        self._add_action("export_image", tr("toolbar.export_image"), toolbar, self.export_image_dialog)
-        toolbar.addSeparator()
-        downsample_action = self._add_action(
-            "toggle_downsample", tr("toolbar.toggle_downsample"), toolbar, self._on_toggle_downsample_enabled
-        )
-        downsample_action.setCheckable(True)
-        downsample_action.setChecked(self._downsample_enabled)
-        downsample_action.setToolTip(tr("toolbar.toggle_downsample_tooltip"))
         toolbar.addSeparator()
         cursor_action = self._add_action("cursor", tr("toolbar.cursor"), toolbar, self._on_toggle_cursor_mode)
         cursor_action.setCheckable(True)
@@ -297,7 +344,47 @@ class MainWindow(QMainWindow):
         hover_action.setChecked(self.settings.hover_values_enabled)
         hover_action.setToolTip(tr("toolbar.hover_values_tooltip"))
         self.plot_grid.set_hover_enabled(self.settings.hover_values_enabled)
-        toolbar.addSeparator()
+
+        # -- analysis toolbar --
+        # lambda: QAction.triggered(bool) must not leak `checked` into _on_stats_requested's `plot` arg
+        self._add_action("stats", tr("toolbar.stats"), analysis_toolbar, lambda *_: self._on_stats_requested())
+        self._build_graphs_menu(analysis_toolbar)
+        has_user_items = features.is_enabled("user_functions") or features.is_enabled("maps")
+        if has_user_items:
+            analysis_toolbar.addSeparator()
+        if features.is_enabled("user_functions"):  # developer feature flag, detailed_specification.md 21
+            self._add_action("user_functions", tr("toolbar.functions"), analysis_toolbar, lambda *_: self.open_function_manager())
+        if features.is_enabled("maps"):
+            self._add_action("maps", tr("toolbar.maps"), analysis_toolbar, lambda *_: self.open_map_manager())
+        if not has_user_items:
+            analysis_toolbar.addSeparator()
+        self._add_action(
+            "signal_aliases", tr("toolbar.signal_aliases"), analysis_toolbar, lambda *_: self.open_signal_alias_manager()
+        )
+        analysis_toolbar.addSeparator()
+        # gear drop-down: rarely used options (48.1)
+        self.settings_button, self.settings_menu = self._make_menu_button(
+            analysis_toolbar, "settings", "\u2699", tr("toolbar.settings_menu_tooltip")
+        )
+        downsample_action = self._add_action(
+            "toggle_downsample", tr("toolbar.toggle_downsample"), self.settings_menu, self._on_toggle_downsample_enabled
+        )
+        self.addAction(downsample_action)
+        downsample_action.setCheckable(True)
+        downsample_action.setChecked(self._downsample_enabled)
+        downsample_action.setToolTip(tr("toolbar.toggle_downsample_tooltip"))
+        aliases_action = self._add_action(
+            "toggle_signal_aliases", tr("toolbar.toggle_signal_aliases"), self.settings_menu, self._on_toggle_signal_aliases
+        )
+        aliases_action.setCheckable(True)
+        aliases_action.setChecked(self.settings.signal_aliases_enabled)
+        self.settings_menu.addSeparator()
+        settings_action = QAction(tr("toolbar.settings_item"), self)
+        settings_action.triggered.connect(self.open_settings_dialog)
+        self.settings_menu.addAction(settings_action)
+        reset_layout_action = QAction(tr("toolbar.reset_layout"), self)
+        reset_layout_action.triggered.connect(self.reset_layout)
+        self.settings_menu.addAction(reset_layout_action)
 
         # Window-level only (no toolbar button): removes the selected series (23.3). QLineEdit
         # claims Delete/Backspace via ShortcutOverride, so typing in the expression bar is safe.
@@ -309,19 +396,12 @@ class MainWindow(QMainWindow):
         self.addAction(remove_series_action)
         self._actions["remove_series"] = remove_series_action
 
-        settings_action = QAction(tr("toolbar.settings"), self)
-        settings_action.triggered.connect(self.open_settings_dialog)
-        toolbar.addAction(settings_action)
-
-        reset_layout_action = QAction(tr("toolbar.reset_layout"), self)
-        reset_layout_action.triggered.connect(self.reset_layout)
-        toolbar.addAction(reset_layout_action)
-
     def _wire_signals(self) -> None:
         self.variable_panel.variableDoubleClicked.connect(self.expression_bar.insert_variable_name)
         self.expression_bar.reference_requested.connect(lambda: self.open_function_reference())
         self.variable_panel.editDerivedRequested.connect(self._on_edit_derived_requested)
         self.variable_panel.deleteDerivedRequested.connect(self._on_delete_derived_requested)
+        self.variable_panel.aliasRequested.connect(self._on_alias_requested)
         self.plot_grid.rangeChanged.connect(lambda r: self.navigator.set_selected_range(*r))
         self.navigator.rangeSelected.connect(lambda lo, hi: self.plot_grid.set_x_range(lo, hi))
         self.plot_grid.plotAdded.connect(self._wire_plot)
@@ -382,8 +462,10 @@ class MainWindow(QMainWindow):
         file_info: dict = {
             "path": str(ds.path) if ds is not None else None,
             "rows": len(self._time_values) if self._time_values is not None else 0,
-            "time_column": self._time_column,
+            "time_column": self._display_name(self._time_column),
         }
+        if self._alias_sources:  # 54.2: set after load_parquet's start record, so it shows in the result
+            file_info["aliases"] = dict(self._alias_sources)
         report = getattr(self, "_time_order_report", None)  # chapter 29, when present
         if report is not None:
             file_info["time_order"] = {
@@ -486,10 +568,10 @@ class MainWindow(QMainWindow):
         self._time_order_label.setToolTip(tip)
         self._time_order_label.setVisible(True)
         messages.status_notice(text, "warning")
-        logger.warning("time axis %r: %s", self._time_column, text)
+        logger.warning("time axis %r: %s", self._display_name(self._time_column), text)
         log_op(
             "time_order_warning",
-            time_column=self._time_column,
+            time_column=self._display_name(self._time_column),
             nan_count=report.nan_count,
             decreasing_count=report.decreasing_count,
             first_decreasing_index=report.first_decreasing_index,
@@ -558,19 +640,25 @@ class MainWindow(QMainWindow):
                     file_columns[name] = WindowedColumn(data_source, name)
                 else:
                     file_columns[name] = LazyColumn(data_source, name)
+            # Aliases (54.2): the same Column object under another name, never a copy.
+            alias_sources = resolve_aliases(columns, self._effective_aliases())
+            for alias, source in alias_sources.items():
+                file_columns[alias] = file_columns[source]
         except Exception as e:  # noqa: BLE001 (surfaced to the user, not swallowed)
             logger.exception("failed to load parquet file: %s", path)
             messages.critical(self, tr("error.load_failed_title"), tr("error.load_failed_body", error=e))
             return False
 
         self._close_analysis_windows()  # their variables belong to the previous file (25.1)
+        self._file_generation += 1  # in-flight stats/FFT results of the previous file get dropped (46.5)
         self._data_source = data_source
         self._file_columns = file_columns
         self._time_column = time_column
         self._time_values = time_values  # already materialized (or an index) above; free
         self._time_indexes = time_indexes
-        self._raw_variables = {k: v for k, v in file_columns.items() if k != time_column}
+        self._set_alias_sources(alias_sources)
         self._derived = {}
+        self._rebuild_raw_variables()
         self._view_name = None
         self.expression_bar.cancel_edit()
         # downsample_enabled is per-view state (like x/y axis range), not a persisted
@@ -580,14 +668,10 @@ class MainWindow(QMainWindow):
 
         self._clear_plot_grid()
 
-        self.time_axis_combo.blockSignals(True)
-        self.time_axis_combo.clear()
-        self.time_axis_combo.addItems(columns)
-        self.time_axis_combo.setCurrentText(time_column)
-        self.time_axis_combo.blockSignals(False)
-
-        self.variable_panel.set_variables(list(self._raw_variables.keys()))
-        self._refresh_navigator_overview()
+        self._fill_time_axis_combo()
+        self._refresh_variable_panel()
+        self._refresh_alias_manager()
+        self._nav_sync.refresh(home=True)  # file load: home
 
         push_recent_folder(self.settings, str(Path(path).resolve().parent))
         save_settings(self.settings)
@@ -601,7 +685,7 @@ class MainWindow(QMainWindow):
         """Same size test load_parquet uses to choose WindowedColumn over LazyColumn."""
         return self._data_source.row_count() * 8 > self.settings.eager_load_limit_mb * 1024 * 1024
 
-    def _build_time_index(self, data_source, column: str, over_threshold: bool) -> "TimeIndex | None":
+    def _build_time_index(self, data_source, column: str, over_threshold: bool) -> TimeIndex | None:
         """36.6 D: a TimeIndex for `column` if the flag is on, the column is over the eager-load
         threshold and ascending/finite (29.1); None -> the caller keeps the fully resident path
         (any failure also falls back, correctness first)."""
@@ -634,14 +718,9 @@ class MainWindow(QMainWindow):
         self.plot_grid.clear_selection()
 
     def _on_grid_layout_changed(self) -> None:
-        """Plots/series/links changed: refresh the overview, then put the navigator's
-        region back on the linked group's current range -- set_overview_data() resets the
-        region to the full extent, which would otherwise undo the re-sync after a link
-        toggle, reorder or removal (detailed_specification.md 24.1)."""
-        self._refresh_navigator_overview()
-        group = self._group_x_range()
-        if group is not None:
-            self.navigator.set_selected_range(group[1], group[2])
+        """Plots/series/links changed: refresh the overview; NavigatorSync keeps the
+        navigator's region on the linked group's current range (24.1 / 24.9)."""
+        self._nav_sync.refresh()
 
     def _group_x_range(self):
         """(plot, x_lo, x_hi) of the X-linked group's range, read from its first non-empty
@@ -654,273 +733,6 @@ class MainWindow(QMainWindow):
                 return p, lo, hi
         return None
 
-    def _refresh_navigator_overview(self) -> None:
-        """The navigator shows an example waveform just for overall shape/scale, not
-        any specific analysis — prefer the anchor (topmost time-domain) plot's first
-        series (what the user is actually looking at) over an arbitrary file column,
-        falling back to the file's first raw variable when nothing has been plotted at
-        all yet. Uses plot_grid.anchor_plot(), not plots[0]: a frequency-domain (FFT)
-        plot's series are in Hz, not aligned with self._time_values at all.
-        """
-        self._detach_nav_pyramid_listener()
-        if self._time_values is None:
-            return
-        first_plot = self.plot_grid.anchor_plot()
-        series_names = first_plot.visible_series_names() if first_plot is not None else []
-        if series_names:
-            # Read back the plotted series' own stored data rather than re-resolving
-            # the name through variable_values: a plotted series stays valid even if
-            # its name is no longer a "known variable" (e.g. the user just switched
-            # the time axis to a column that's also currently plotted as a series —
-            # it drops out of _raw_variables, but the already-plotted series is fine).
-            name = series_names[0]
-            _x, y, _color = first_plot.series_data(name)
-            if y is None:  # windowed series (Phase D): no resident y to show as-is
-                source = first_plot.series_source(name)
-                if source is None:
-                    return  # shouldn't happen (y is None only for a windowed series)
-                y_source, _y_bounds = source
-                if isinstance(y_source, DerivedColumn):
-                    self._set_derived_navigator_overview(y_source)
-                    return
-                self._set_windowed_navigator_overview(y_source)
-                return
-        elif self._raw_variables:
-            column = self._first_plottable_column()
-            if column is None:  # every raw column is non-numeric: nothing to preview
-                self.navigator.set_overview_data(np.array([], dtype=np.float64), np.array([], dtype=np.float64))
-                return
-            if isinstance(column, DerivedColumn):
-                self._set_derived_navigator_overview(column)
-                return
-            if isinstance(column, WindowedColumn):
-                # Coarse row-group min/max envelope from footer statistics (Phase
-                # B), not the flat single (min, max) column_bounds() would give —
-                # keeps real shape (e.g. this test data's daily on/off bursts)
-                # visible without materializing this WindowedColumn's whole self
-                # just to preview it (detailed_specification.md 13.5.1 Phase D).
-                self._set_windowed_navigator_overview(column)
-                return
-            # Materializes one column (the file's first raw variable) even though
-            # nothing has been plotted yet — an eager read Phase C doesn't remove
-            # for a LazyColumn under the size threshold. Wiring this to Phase B's
-            # footer-stats/pyramid unconditionally (not just for the
-            # over-threshold case above) was deliberately deferred rather than
-            # folded into this already-broad change — see detailed_specification.md
-            # 13.5.1's Phase B note.
-            y = column.values()
-        else:
-            return
-        tv = self._time_values
-        if isinstance(tv, TimeIndex):
-            # Lazy axis: per-anchor-interval min/max envelope of the resident y at the held anchor times.
-            y = np.asarray(y, dtype=np.float64)
-            starts = np.arange(0, min(len(y), len(tv)), ANCHOR_ROWS)
-            if len(starts):
-                mins, maxs = np.fmin.reduceat(y, starts), np.fmax.reduceat(y, starts)
-                t = tv.take(starts)
-                x = np.repeat(t, 2)
-                yy = np.empty(len(t) * 2)
-                yy[0::2], yy[1::2] = mins, maxs
-                lo, hi = tv.finite_min_max()  # end points so the bounds cover the whole axis
-                x = np.concatenate([[lo], x, [hi]])
-                yy = np.concatenate([[yy[0]], yy, [yy[-1]]])
-                self.navigator.set_overview_data(x, yy)
-            return
-        self.navigator.set_overview_data(tv, y)
-
-    def _first_plottable_column(self):
-        """The first raw variable whose data can be a numeric series, for the navigator's
-        "nothing plotted yet" preview. A file whose second column is a string/list column
-        (common: a label next to the signals) must still open (data 29.5),
-        so an unusable column is skipped rather than raised; None if there is none."""
-        for column in self._raw_variables.values():
-            if isinstance(column, (WindowedColumn, DerivedColumn)):
-                return column  # footer statistics only; an unusable dtype just has no envelope
-            try:
-                column.values()
-            except NonNumericColumnError:
-                continue
-            return column
-        return None
-
-    def _set_derived_navigator_overview(self, column: DerivedColumn) -> None:
-        """Navigator overview of a windowed derived series (36.6 C). A computed column has no
-        footer statistics: show its pyramid envelope once one exists (the plot builds it when
-        zoomed far out; otherwise a background build is requested here), until then a flat line
-        spanning the time axis; a short file is just computed."""
-        self._navigator_overview_gen += 1
-        self._set_busy("navigator", False)
-        tv = self._time_values
-        lazy_t = isinstance(tv, TimeIndex)  # 36.6 D: lazy axis, no resident array (D x C)
-        if lazy_t:
-            t_lo, t_hi = tv.finite_min_max()
-        else:
-            finite_t = tv[np.isfinite(tv)]
-            if not len(finite_t):
-                self.navigator.set_overview_data(np.array([], dtype=np.float64), np.array([], dtype=np.float64))
-                return
-            t_lo, t_hi = float(finite_t.min()), float(finite_t.max())
-        pyramid = column.pyramid
-        if pyramid is None and len(tv) <= _DERIVED_NAV_DIRECT_ROWS:
-            self.navigator.set_overview_data(tv if not lazy_t else tv[0:len(tv)], column.values())
-            return
-        if pyramid is None:
-            self.navigator.set_overview_data(
-                np.array([t_lo, t_hi], dtype=np.float64), np.array([0.0, 0.0], dtype=np.float64)
-            )
-            column.add_pyramid_listener("navigator", self._on_derived_pyramid_for_navigator)  # one-shot
-            self._nav_pyramid_column = column
-            job = column.request_pyramid()
-            if job is not None:
-                gen = self._navigator_overview_gen
-                self._set_busy("navigator", True)
-                self._navigator_hub.submit(
-                    job,
-                    lambda p, c=column, g=gen: self._on_derived_overview_built(c, g, p),
-                    lambda msg, c=column, g=gen: self._on_derived_overview_failed(c, g, msg),
-                    job="navigator_overview",
-                    target="derived",
-                )
-            return
-        xs: list[float] = []
-        ys: list[float] = []
-        keep = (pyramid.row_starts < len(tv)) & np.isfinite(pyramid.mins) & np.isfinite(pyramid.maxs)
-        t_starts = tv.take(pyramid.row_starts[keep]) if lazy_t else tv[pyramid.row_starts[keep]]  # anchors: O(1)
-        for t_start, mn, mx in zip(t_starts, pyramid.mins[keep], pyramid.maxs[keep]):
-            xs += [float(t_start), float(t_start)]
-            ys += [mn, mx]
-        y_first = ys[0] if ys else 0.0
-        y_last = ys[-1] if ys else 0.0
-        self.navigator.set_overview_data(
-            np.array([t_lo, *xs, t_hi], dtype=np.float64), np.array([y_first, *ys, y_last], dtype=np.float64)
-        )
-        group = self._group_x_range()
-        if group is not None:
-            self.navigator.set_selected_range(group[1], group[2])
-
-    def _on_derived_pyramid_for_navigator(self, ok: bool) -> None:
-        # The pyramid of a derived series landed (or its build failed). One-shot listener: it is
-        # gone now. Refresh through the full re-sync, which also puts the region back on the
-        # linked group's range (set_overview_data resets it to the full extent, 24.1).
-        self._nav_pyramid_column = None
-        if ok and self._time_values is not None:
-            self._on_grid_layout_changed()
-
-    def _detach_nav_pyramid_listener(self) -> None:
-        """The overview is being re-decided: the column that was waiting for its pyramid on the
-        navigator's behalf only gets to keep waiting if _set_derived_navigator_overview asks again."""
-        column, self._nav_pyramid_column = self._nav_pyramid_column, None
-        if column is not None:
-            column.remove_pyramid_listener("navigator")
-
-    def _on_derived_overview_built(self, column: DerivedColumn, gen: int, pyramid) -> None:
-        self._set_busy("navigator", False)
-        column.set_pyramid(pyramid)  # fires on_pyramid_ready -> refresh (a no-op if superseded)
-
-    def _on_derived_overview_failed(self, column: DerivedColumn, gen: int, message: str) -> None:
-        self._set_busy("navigator", False)
-        column.pyramid_failed()
-        logger.warning("derived navigator overview failed: %s", message)
-
-    def _set_windowed_navigator_overview(self, column: WindowedColumn) -> None:
-        """Show `column`'s overview in the navigator at once (no data I/O), then -- for a
-        file with few row groups and no pyramid yet -- refine it with an evenly thinned
-        read on a background job (detailed_specification.md 40)."""
-        self._navigator_overview_gen += 1  # drops a still-running refinement for an older request
-        self._set_busy("navigator", False)
-        x, y = self._windowed_navigator_overview(column)
-        self.navigator.set_overview_data(x, y)
-        if column.pyramid is not None or self._data_source is None:
-            return
-        row_groups = self._data_source.row_groups()
-        if not (0 < len(row_groups) < _NAV_FEW_ROW_GROUPS):
-            return  # many row groups: the footer-stats envelope is already the overview
-        gen = self._navigator_overview_gen
-        time_values = self._time_values
-        path = self._data_source.path
-        name = column.name
-
-        def job() -> tuple[np.ndarray, np.ndarray]:
-            return thin_column(path, name)  # captures no resident array (37.3)
-
-        self._set_busy("navigator", True)
-        self._navigator_hub.submit(
-            job,
-            lambda result, g=gen, tv=time_values: self._on_navigator_overview_ready(g, tv, result),
-            lambda msg, g=gen: self._on_navigator_overview_failed(g, msg),
-            job="navigator_overview",
-            target=name,
-        )
-
-    def _on_navigator_overview_ready(self, gen: int, time_values, result) -> None:
-        if gen != self._navigator_overview_gen or time_values is not self._time_values:
-            return  # superseded; the newer request owns the busy flag
-        self._set_busy("navigator", False)
-        idx, vals = result
-        keep = idx < len(time_values)
-        if isinstance(time_values, TimeIndex):
-            x, y = time_values.approx_take(idx[keep]), vals[keep]  # coarse overview: no per-row disk reads
-            bounds = time_values.finite_min_max()
-        else:
-            x, y = time_values[idx[keep]], vals[keep]
-            fin = time_values[np.isfinite(time_values)]
-            bounds = (fin.min(), fin.max()) if len(fin) else None
-        if bounds is not None and len(y):  # end points: bounds = the time axis' finite min/max
-            x = np.concatenate([[bounds[0]], x, [bounds[1]]])
-            y = np.concatenate([[y[0]], y, [y[-1]]])
-        self.navigator.set_overview_data(x, y)
-        # set_overview_data() resets the region to the full extent: put it back on the
-        # linked group's range (the 24.1 re-sync rule).
-        group = self._group_x_range()
-        if group is not None:
-            self.navigator.set_selected_range(group[1], group[2])
-
-    def _on_navigator_overview_failed(self, gen: int, message: str) -> None:
-        if gen != self._navigator_overview_gen:
-            return
-        self._set_busy("navigator", False)
-        logger.warning("navigator overview read failed: %s", message)  # the coarse overview stays (28.2)
-
-    def _windowed_navigator_overview(self, column: WindowedColumn) -> tuple[np.ndarray, np.ndarray]:
-        """A coarse overview for `column` without data I/O (detailed_specification.md 40):
-        the built pyramid's per-bucket (min, max) if there is one, otherwise the footer
-        per-row-group (min, max) envelope. x comes from the resident time column; the
-        overview always spans the time axis' finite min/max (end points added), so the
-        navigator's bounds / initial selection never collapse to a point.
-        """
-        tv = self._time_values
-        bounds = self._time_finite_bounds()
-        if bounds is None:
-            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-        t_lo, t_hi = bounds
-        xs: list[float] = []
-        ys: list[float] = []
-        pyramid = column.pyramid
-        lazy_t = isinstance(tv, TimeIndex)  # 36.6 D: lazy axis, no resident array
-        if pyramid is not None:
-            keep = pyramid.row_starts < len(tv)
-            # a bucket start is a multiple of DEFAULT_BUCKET_ROWS == ANCHOR_ROWS: an O(1) anchor lookup
-            t_starts = tv.take(pyramid.row_starts[keep]) if lazy_t else tv[pyramid.row_starts[keep]]
-            for t_start, mn, mx in zip(t_starts, pyramid.mins[keep], pyramid.maxs[keep]):
-                xs += [float(t_start), float(t_start)]
-                ys += [mn, mx]
-        else:
-            stats = self._data_source.column_stats(column.name)
-            for (row_offset, _row_count), (mn, mx, _null_count) in zip(self._data_source.row_groups(), stats):
-                if mn is None or row_offset >= len(tv):
-                    continue
-                t_off = float(tv[row_offset])  # a TimeIndex pins every row-group start (O(1))
-                xs += [t_off, t_off]
-                ys += [mn, mx]
-        bounds = column.bounds()
-        mid = (bounds[0] + bounds[1]) / 2 if bounds else 0.0
-        y_first = ys[0] if ys else mid
-        y_last = ys[-1] if ys else mid
-        x = np.array([t_lo, *xs, t_hi], dtype=np.float64)
-        y = np.array([y_first, *ys, y_last], dtype=np.float64)
-        return x, y
-
     @oplog.compound
     def set_time_column(self, name: str) -> None:
         """Switch which loaded column is used as the time (X) axis.
@@ -930,9 +742,13 @@ class MainWindow(QMainWindow):
         time-domain plot is re-fit to the new X data — its scale/extent may be
         completely different from the old time column's.
         """
-        if not name or self._time_values is None or name == self._time_column or name not in self._file_columns:
+        if not name or self._time_values is None or name not in self._file_columns:
             return
-        log_op("set_time_column", name=name)
+        name = self._alias_sources.get(name, name)  # the combo passes the displayed (alias) text
+        if name == self._time_column:
+            self._sync_time_axis_combo()  # e.g. another alias of the same column was picked
+            return
+        log_op("set_time_column", name=self._display_name(name))
         # Materializes `name` if it was still a LazyColumn (e.g. never plotted) —
         # unavoidable, the time axis needs real data now for searchsorted/navigator.
         # Done before anything is changed: a column that cannot be a time axis (string,
@@ -945,7 +761,7 @@ class MainWindow(QMainWindow):
             new_time_values = index if index is not None else self._file_columns[name].values()
         except Exception as e:  # noqa: BLE001 (reported to the user, state untouched)
             logger.exception("cannot use %r as the time axis", name)
-            self._show_notice(tr("time_axis.failed", name=name, message=e), 8_000)
+            self._show_notice(tr("time_axis.failed", name=self._display_name(name), message=e), 8_000)
             self._sync_time_axis_combo()
             return
         if index is not None:
@@ -953,23 +769,309 @@ class MainWindow(QMainWindow):
         self._close_analysis_windows()  # row ranges/times of open analysis windows are now stale (25.1)
         self._time_column = name
         self._time_values = new_time_values
-        derived_cache = {n: self._raw_variables[n] for n in self._derived if n in self._raw_variables}
-        self._raw_variables = {k: v for k, v in self._file_columns.items() if k != name}
-        self._raw_variables.update(derived_cache)
-
-        self.variable_panel.set_variables(list(self._raw_variables.keys()), self._derived_expressions())
-        self._refresh_navigator_overview()
+        self._rebuild_raw_variables(keep_derived=True)
+        self._refresh_variable_panel()
+        self._nav_sync.refresh(home=True)  # new time axis: home
         self.plot_grid.set_time_axis_data(self._time_values)
         self._update_time_order_warning()
 
-        self._sync_time_axis_combo()
+        self._fill_time_axis_combo()  # the listed alias of the time column follows the axis
 
     def _sync_time_axis_combo(self) -> None:
         """Make the toolbar's time-axis combo show the column actually in use."""
-        if self._time_column is not None and self.time_axis_combo.currentText() != self._time_column:
+        shown = self._display_name(self._time_column)
+        if shown is not None and self.time_axis_combo.currentText() != shown:
             self.time_axis_combo.blockSignals(True)
-            self.time_axis_combo.setCurrentText(self._time_column)
+            self.time_axis_combo.setCurrentText(shown)
             self.time_axis_combo.blockSignals(False)
+
+    # -- signal aliases (persistence 54) --------------------------------------------------------
+
+    def _set_alias_sources(self, alias_sources: dict[str, str]) -> None:
+        self._alias_sources = dict(alias_sources)
+        self._alias_by_source = aliases_by_source(self._alias_sources)
+
+    def _display_name(self, source: str | None) -> str | None:
+        """The name shown / logged / saved in views for a source column: its first alias (by
+        name), else the source itself (54.2). The one place that decides it."""
+        return None if source is None else display_name(source, self._alias_by_source)
+
+    def _time_excluded_names(self) -> set[str]:
+        """The time column's source and all its aliases: none of them is a variable (54.2)."""
+        tc = self._time_column
+        return set() if tc is None else {tc, *self._alias_by_source.get(tc, ())}
+
+    def _rebuild_raw_variables(self, *, keep_derived: bool = False) -> None:
+        """The one place `_raw_variables` is built from `_file_columns` (54.2): everything but the
+        time column and its aliases; `keep_derived` re-adds the cached derived columns."""
+        cache = {n: self._raw_variables[n] for n in self._derived if n in self._raw_variables} if keep_derived else {}
+        excluded = self._time_excluded_names()
+        self._raw_variables = {k: v for k, v in self._file_columns.items() if k not in excluded}
+        self._raw_variables.update(cache)
+
+    def visible_column_names(self, *, include_time: bool = False, include_derived: bool = True) -> list[str]:
+        """The one list of variable names to offer (variable list, time-axis combo, XY / histogram
+        choices; 54.2): file columns with aliased sources replaced by their aliases, minus the time
+        column (unless `include_time`), then the derived variables. Source names stay usable in
+        expressions and views; they are just not listed."""
+        if self._data_source is None:
+            return []
+        names = visible_names(self._data_source.columns, self._alias_by_source)
+        if not include_time:
+            excluded = self._time_excluded_names()
+            names = [n for n in names if n not in excluded]
+        if include_derived:
+            names += [n for n in self._derived if n not in names]
+        return names
+
+    def _fill_time_axis_combo(self) -> None:
+        self.time_axis_combo.blockSignals(True)
+        self.time_axis_combo.clear()
+        shown = self._display_name(self._time_column)
+        # the time column is listed once (its display name): picking another of its aliases would snap back
+        hide = self._time_excluded_names() - {shown}
+        names = [n for n in self.visible_column_names(include_time=True, include_derived=False) if n not in hide]
+        self.time_axis_combo.addItems(names)
+        if shown is not None:
+            self.time_axis_combo.setCurrentText(shown)
+        self.time_axis_combo.blockSignals(False)
+
+    def _refresh_alias_manager(self) -> None:
+        if self._alias_manager is not None:
+            self._alias_manager.refresh_status()
+
+    def _refresh_variable_panel(self) -> None:
+        self.variable_panel.set_variables(
+            self.visible_column_names(), self._derived_expressions(), aliases=self._alias_sources
+        )
+
+    def _load_signal_aliases(self) -> None:
+        """Startup: read the alias dictionary (54.1). Problems become a status-bar notice."""
+        warnings: list[str] = []
+        try:
+            self._aliases, self._alias_disabled, alias_warnings, self._skipped_alias_entries = (
+                alias_io.load_signal_aliases_ex(self.callable_names())
+            )
+            for w in alias_warnings:
+                if isinstance(w, str):
+                    detail = w
+                else:
+                    number, problem = w
+                    detail = tr("alias.warn_item", n=number, reason=tr(problem.key, **problem.params))
+                warnings.append(tr("startup.alias_warning", detail=detail))
+        except alias_io.SignalAliasesUnreadable as e:
+            self._aliases_saveable = False
+            warnings.append(tr("startup.aliases_unreadable", error=e))
+        self.startup_warnings = [*self.startup_warnings, *warnings]
+
+    def _effective_aliases(
+        self, aliases: Mapping[str, list[str]] | None = None, disabled: set[str] | None = None, enabled: bool | None = None
+    ) -> dict[str, list[str]]:
+        """The aliases that attach to files (54.9): none while the global switch is off, else the
+        enabled ones. Name-clash checks use `self._aliases` (all of them) instead."""
+        if not (self.settings.signal_aliases_enabled if enabled is None else enabled):
+            return {}
+        aliases = self._aliases if aliases is None else aliases
+        off = self._alias_disabled if disabled is None else disabled
+        return {a: s for a, s in aliases.items() if a not in off}
+
+    @property
+    def signal_aliases_disabled(self) -> set[str]:
+        return set(self._alias_disabled)
+
+    @property
+    def signal_aliases_enabled(self) -> bool:
+        return self.settings.signal_aliases_enabled
+
+    @property
+    def signal_aliases(self) -> dict[str, list[str]]:
+        """A copy of the alias dictionary (alias -> candidate sources, priority order)."""
+        return {a: list(s) for a, s in self._aliases.items()}
+
+    @property
+    def signal_aliases_saveable(self) -> bool:
+        return self._aliases_saveable
+
+    def signal_alias_columns(self) -> list[str]:
+        """The open file's real columns (for the editor's candidate combo)."""
+        return list(self._data_source.columns) if self._data_source is not None else []
+
+    def signal_alias_status(self, alias: str) -> tuple[str, str | None]:
+        """How `alias` stands in the open file: ("source", column) / ("same_name", None) when a real
+        column has that name / ("none", None) when no candidate exists (or no file is open). Also
+        ("off", None) while the global switch is off and ("disabled", None) for a disabled alias (54.9)."""
+        if not self.settings.signal_aliases_enabled:
+            return "off", None
+        if self._data_source is None:
+            return "none", None
+        if alias in self._alias_disabled:
+            return "disabled", None
+        if alias in self._alias_sources:
+            return "source", self._alias_sources[alias]
+        if alias in self._data_source.columns:
+            return "same_name", None
+        return "none", None
+
+    def open_signal_alias_manager(self, select: str | None = None, new_source: str | None = None) -> None:
+        """Non-modal singleton (54.4). `select`: show that alias; `new_source`: start a new alias
+        with that column as its first candidate."""
+        log_op("open_signal_alias_manager", select=select, new_source=new_source)
+        from .signal_alias_manager import SignalAliasManagerWindow
+
+        if self._alias_manager is None:
+            self._alias_manager = SignalAliasManagerWindow(self)
+            self._alias_manager.destroyed.connect(lambda *_: setattr(self, "_alias_manager", None))
+        self._alias_manager.show()
+        self._alias_manager.raise_()
+        self._alias_manager.activateWindow()
+        if select is not None:
+            self._alias_manager.select_alias(select)
+        elif new_source is not None:
+            self._alias_manager.start_new(new_source)
+
+    def _on_alias_requested(self, name: str) -> None:
+        """Context menu of a file column in the variable list (54.3)."""
+        if name in self._alias_sources:
+            self.open_signal_alias_manager(select=name)
+        else:
+            self.open_signal_alias_manager(new_source=name)
+
+    def _alias_usage(self, names: set[str]) -> list[str]:
+        """Where the aliases in `names` are in use (plotted, in a derived formula, time axis)."""
+        used: list[str] = []
+        for i, plot in enumerate(self.plot_grid.plots):
+            for n in plot.series_names():
+                if n in names:
+                    used.append(tr("alias.used_series", alias=n, plot=i + 1))
+        for dn, d in self._derived.items():
+            try:
+                refs = referenced_names(d.expression)
+            except ExpressionError:
+                continue
+            used.extend(tr("alias.used_derived", alias=a, name=dn) for a in sorted(refs & names))
+        shown = self._display_name(self._time_column)
+        if shown in names:
+            used.append(tr("alias.used_time", alias=shown))
+        return used
+
+    def _alias_change_check(
+        self, aliases: Mapping[str, list[str]], disabled: set[str], enabled: bool
+    ) -> tuple[dict[str, str], set[str], list[str]]:
+        """What a change of the dictionary / the enabled flags / the global switch would do to the
+        open file: (new `{alias: source}`, aliases that disappear or retarget, where those are in
+        use). Nothing is changed."""
+        if self._data_source is None:
+            return {}, set(), []
+        new_res = resolve_aliases(
+            self._data_source.columns, self._effective_aliases(aliases, disabled, enabled)
+        )
+        affected = {a for a, src in self._alias_sources.items() if new_res.get(a) != src}
+        return new_res, affected, self._alias_usage(affected)
+
+    def save_signal_aliases(self, new: Mapping[str, list[str]], disabled: set[str] | None = None) -> str:
+        """Validate, check against the open file, persist and apply a new dictionary (54.4).
+        `disabled`: aliases with enabled=false (None = unchanged; names not in `new` are dropped).
+        Returns "" on success, else the reason it was refused (nothing is changed then)."""
+        old = self._aliases
+        new_disabled = set(self._alias_disabled if disabled is None else disabled) & set(new)
+        log_op(
+            "signal_alias_save",
+            added=[a for a in new if a not in old],
+            removed=[a for a in old if a not in new],
+            changed=[a for a in new if a in old and list(new[a]) != old[a]],
+            enabled_changed=[a for a in new if a in old and (a in new_disabled) != (a in self._alias_disabled)],
+        )
+        if not self._aliases_saveable:
+            return self._alias_refused(tr("alias.save_disabled"))
+        reserved = self.callable_names()
+        checked: dict[str, list[str]] = {}
+        try:
+            for alias, sources in new.items():
+                a, srcs = validate_entry(alias, sources, reserved=reserved, others=checked.keys())
+                checked[a] = srcs
+        except AliasProblem as e:
+            return self._alias_refused(tr(e.key, **e.params))
+        new_disabled &= set(checked)
+        new_res, affected, used = self._alias_change_check(checked, new_disabled, self.settings.signal_aliases_enabled)
+        if used:
+            return self._alias_refused(tr("alias.refused", list="\n".join(used)), used_in=used)
+        for a in checked:  # the dictionary is app-wide: a derived name clashes whether attached here or not
+            if a in self._derived:
+                return self._alias_refused(tr("alias.clash_derived", alias=a), derived=a)
+        try:
+            alias_io.save_signal_aliases(checked, self._skipped_alias_entries, new_disabled)
+        except OSError as e:
+            logger.exception("failed to save signal aliases")
+            return self._alias_refused(tr("alias.save_failed", error=e))
+        self._aliases = checked
+        self._alias_disabled = new_disabled
+        if self._data_source is not None:
+            self._apply_alias_resolution(new_res, affected)
+        return ""
+
+    def set_signal_aliases_enabled(self, enabled: bool) -> str:
+        """The global switch "use signal aliases" (54.9): saved to the settings and applied to the
+        open file at once. Returns "" or the reason it was refused (an in-use alias would detach)."""
+        enabled = bool(enabled)
+        log_op("signal_aliases_toggle", enabled=enabled)
+        if enabled == self.settings.signal_aliases_enabled:
+            return ""
+        new_res, affected, used = self._alias_change_check(self._aliases, self._alias_disabled, enabled)
+        if used:
+            return self._alias_refused(
+                tr("alias.toggle_refused", list="\n".join(used)), reason="toggle", used_in=used
+            )
+        self.settings.signal_aliases_enabled = enabled
+        save_settings(self.settings)
+        if self._data_source is not None:
+            self._apply_alias_resolution(new_res, affected)
+        else:
+            self._refresh_alias_manager()
+        self._sync_alias_toggle_ui()
+        return ""
+
+    def _on_toggle_signal_aliases(self, checked: bool = False) -> None:
+        """The gear menu's checkable action."""
+        reason = self.set_signal_aliases_enabled(checked)
+        if reason:
+            messages.warning(self, tr("alias.manager_title"), reason)
+        self._sync_alias_toggle_ui()
+
+    def _sync_alias_toggle_ui(self) -> None:
+        """Gear-menu action and the editor's checkbox always show the setting."""
+        action = self._actions.get("toggle_signal_aliases")
+        if action is not None and action.isChecked() != self.settings.signal_aliases_enabled:
+            action.blockSignals(True)
+            action.setChecked(self.settings.signal_aliases_enabled)
+            action.blockSignals(False)
+        if self._alias_manager is not None:
+            self._alias_manager.sync_global_checkbox()
+
+    def _alias_refused(self, text: str, *, reason: str | None = None, **detail: object) -> str:
+        """Log a refusal (`reason` defaults to the text) and return the text."""
+        extra = {"text": text} if reason else {}
+        log_op("signal_alias_save_refused", reason=reason or text, **extra, **detail)
+        return text
+
+    def _apply_alias_resolution(self, new_res: dict[str, str], affected: set[str]) -> None:
+        """Put a re-resolved alias set into the open file (54.4): columns, variable list and
+        time-axis combo are rebuilt; plots are untouched (so no navigator re-sync is needed).
+        Analysis windows using a changed / no longer listed name are closed, as on reopen (25.1)."""
+        for alias in self._alias_sources:
+            self._file_columns.pop(alias, None)
+        for alias, source in new_res.items():
+            self._file_columns[alias] = self._file_columns[source]
+        self._set_alias_sources(new_res)
+        listed = set(self.visible_column_names(include_time=True))
+        for window in list(self._analysis_windows):
+            used_names = getattr(window, "used_variable_names", None)
+            used = used_names() if used_names is not None else set()
+            if used & affected or used - listed:
+                window.close()
+        self._rebuild_raw_variables(keep_derived=True)
+        self._refresh_variable_panel()
+        self._fill_time_axis_combo()
+        self._refresh_alias_manager()
 
     # Implementation lives in core/numeric.py (core/pyramid.py needs the identical
     # conversion and core/ must not depend on ui/) — re-exported under this name
@@ -1057,6 +1159,8 @@ class MainWindow(QMainWindow):
             raise ExpressionError(tr("error.open_file_first"))
         if name in self._raw_variables:
             raise ExpressionError(tr("error.duplicate_variable_name", name=name))
+        if name in self._aliases or name in self._alias_sources:  # any alias of the app-wide dictionary (54.1)
+            raise ExpressionError(tr("error.derived_alias_name", name=name))
         # Evaluate eagerly (via _all_arrays()'s lazy mapping, so this only
         # materializes the specific source columns the expression references, not
         # every loaded column) so a typo surfaces immediately instead of at plot time.
@@ -1094,15 +1198,10 @@ class MainWindow(QMainWindow):
         for n, column in overlay.items():
             self._raw_variables[n] = column
         self.variable_panel.add_variable(name, expression)
-        anchor = self.plot_grid.anchor_plot()
-        anchor_affected = False
-        for plot in self._time_plots():
+        for plot in self._time_plots():  # the grid re-syncs the navigator via seriesChanged (plots 50.2)
             for n in plot.series_names():
                 if n in overlay:
                     self._replace_plot_series(plot, n, overlay[n])
-                    anchor_affected |= plot is anchor
-        if anchor_affected:
-            self._refresh_navigator_overview()
 
     # -- user functions / maps (detailed_specification.md 26, 27) ---------------------
 
@@ -1124,16 +1223,19 @@ class MainWindow(QMainWindow):
         except uf_io.UserFunctionsUnreadable as e:
             self._user_functions_saveable = False
             warnings.append(tr("startup.functions_unreadable", error=e))
-        self.startup_warnings = warnings
-        if warnings:
-            self._show_notice(" / ".join(warnings), 20_000)
+        self.startup_warnings = warnings  # shown by __init__ once the alias file is read too
 
-    def reserved_names(self) -> set[str]:
-        """Names a new function / map must not take: every registry name plus the names of
-        functions that failed to load and are still in the file (they come back once fixed)."""
+    def callable_names(self) -> set[str]:
+        """Every registry name plus the names of functions that failed to load and are still in
+        the file (they come back once fixed). A signal alias must not take these (54.1)."""
         names = self._function_registry.all_names()
         names.update(n for n in map(uf_io.skipped_entry_name, self.skipped_function_entries) if n)
         return names
+
+    def reserved_names(self) -> set[str]:
+        """Names a new function / map must not take: `callable_names()` plus every alias of the
+        dictionary, attached to the open file or not (it attaches in another file; 54.1)."""
+        return self.callable_names() | set(self._aliases)
 
     def save_functions(self, functions: Mapping[str, object]) -> None:
         """Write the function file: the valid ones, then the skipped raw entries unchanged."""
@@ -1303,15 +1405,17 @@ class MainWindow(QMainWindow):
         self._refresh_function_reference()
         for n, column in overlay.items():
             self._raw_variables[n] = column  # DerivedColumns hold `candidate` (an immutable snapshot, 36.6 C)
-        anchor = self.plot_grid.anchor_plot()
-        anchor_affected = False
-        for plot in self._time_plots():
+        for plot in self._time_plots():  # the grid re-syncs the navigator via seriesChanged (plots 50.2)
             for n in plot.series_names():
                 if n in overlay:
                     self._replace_plot_series(plot, n, overlay[n])
-                    anchor_affected |= plot is anchor
-        if anchor_affected:
-            self._refresh_navigator_overview()
+        for window in list(self._analysis_windows):  # XY windows redraw / drop their map overlays (44.7)
+            hook = getattr(window, "on_registry_changed", None)
+            if hook is not None:
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001 - the registry is already committed; a window's redraw must not undo that
+                    logger.exception("analysis window failed to follow a registry change")
         return []
 
     def delete_derived_variable(self, name: str) -> None:
@@ -1327,19 +1431,13 @@ class MainWindow(QMainWindow):
         ]
         if users:
             raise ExpressionError(tr("error.derived_in_use", name=name, users=", ".join(users)))
-        anchor = self.plot_grid.anchor_plot()
-        anchor_affected = False
-        for plot in self._time_plots():
-            if name in plot.series_names():
-                plot.remove_series(name)
-                anchor_affected |= plot is anchor
         del self._derived[name]
         self._raw_variables.pop(name, None)
         self.variable_panel.remove_variable(name)
         if self.expression_bar.editing_name == name:
             self.expression_bar.cancel_edit()
-        if anchor_affected:
-            self._refresh_navigator_overview()
+        # Last, so the navigator's re-sync never falls back to the deleted variable (plots 50.2).
+        self.plot_grid.remove_series_everywhere(name)
 
     def _time_plots(self) -> list:
         # FFT plots hold static "<name> (FFT...)" results, never live variable references.
@@ -1379,8 +1477,6 @@ class MainWindow(QMainWindow):
             logger.warning("cannot plot %r: %s", name, e)
             self._show_notice(tr("variable.not_numeric", name=name), 8_000)
             return
-        if self.plot_grid.plots and plot is self.plot_grid.plots[0]:
-            self._refresh_navigator_overview()
 
     def _add_variable_to_plot(self, plot, name: str, color: str | None = None) -> None:
         """Plot `name` on `plot`, choosing add_series() (a resident array) or
@@ -1426,6 +1522,9 @@ class MainWindow(QMainWindow):
             label = tr("graphs.xy_3d") if features.is_enabled("xyz_3d") else tr("graphs.xy")
             action = self._add_action("xy_plot", label, menu, lambda *_: self.open_xy_plot())
             self.addAction(action)  # keep the shortcut live although the menu is closed
+        if features.is_enabled("histogram"):  # analysis 5.33 / ch.42
+            action = self._add_action("histogram", tr("graphs.histogram"), menu, lambda *_: self.open_histogram())
+            self.addAction(action)
         if features.is_enabled("fft"):
             action = self._add_action("fft", tr("graphs.fft"), menu, lambda *_: self._on_fft_requested())
             self.addAction(action)
@@ -1463,6 +1562,22 @@ class MainWindow(QMainWindow):
         self._analysis_windows.append(window)
         window.show()
         if (x_name and y_names) or window.mode == "3d":
+            window.recompute()
+        return window
+
+    def open_histogram(self):
+        """Open a new histogram window (analysis 5.33 / 42.1); several may be open at once. The
+        variables selected in the variable panel become its initial targets."""
+        if self._data_source is None:
+            messages.information(self, tr("graphs.histogram"), tr("error.open_file_first"))
+            return None
+        from .histogram_window import HistogramWindow
+
+        selected = [item.text() for item in self.variable_panel.selectedItems() if item.text() in self._raw_variables]
+        window = HistogramWindow(self, selected)
+        self._analysis_windows.append(window)
+        window.show()
+        if selected:
             window.recompute()
         return window
 
@@ -1521,10 +1636,11 @@ class MainWindow(QMainWindow):
         label = f"{name} (FFT: {x[0]:.3f}–{x[-1]:.3f}s)" if len(x) else f"{name} (FFT)"
 
         self._set_busy("fft", True)
+        gen = self._file_generation
         self._fft_hub.submit(
             lambda: fft(x, y),
-            lambda result, lbl=label: self._on_fft_finished(lbl, *result),
-            self._on_fft_failed,
+            lambda result, lbl=label, g=gen: self._on_fft_finished(lbl, *result, generation=g),
+            lambda message, g=gen: self._on_fft_failed(message, generation=g),
             job="fft",
             target=name,
         )
@@ -1563,14 +1679,23 @@ class MainWindow(QMainWindow):
     def _stats_workers(self) -> dict:
         return self._stats_hub.pending
 
-    def _on_fft_failed(self, message: str) -> None:
+    def _on_fft_failed(self, message: str, generation: int | None = None) -> None:
         """detailed_specification.md 28.2: clear the busy flag and
-        tell the user (modal is fine: FFT is an explicit one-shot action)."""
+        tell the user (modal is fine: FFT is an explicit one-shot action).
+        A failure of the previous file's job is dropped silently (app 46.5 F-5)."""
         self._set_busy("fft", bool(self._fft_workers))
+        if generation is not None and generation != self._file_generation:
+            logger.info("fft: dropped a failure for the previous file: %s", message)
+            return
         messages.warning(self, tr("toolbar.fft"), tr("fft.failed", message=message))
 
-    def _on_fft_finished(self, label: str, freqs: np.ndarray, amps: np.ndarray) -> None:
+    def _on_fft_finished(
+        self, label: str, freqs: np.ndarray, amps: np.ndarray, generation: int | None = None
+    ) -> None:
         self._set_busy("fft", bool(self._fft_workers))
+        if generation is not None and generation != self._file_generation:
+            logger.info("fft: dropped the result for %r (another file was opened meanwhile)", label)
+            return  # app 46.5 F-5
         plot = self.plot_grid.add_plot(x_axis_datetime=False)  # X is frequency, not time
         plot.setLabel("bottom", "Frequency", units="Hz")
         plot.add_series(label, freqs, amps)
@@ -1630,13 +1755,15 @@ class MainWindow(QMainWindow):
         # no longer resolve to one, and skipping it here keeps `pending`'s
         # name/result bookkeeping consistent from the start instead of needing to
         # patch it up mid-flight.
-        resolved: dict[str, np.ndarray | DerivedColumn] = {}
+        resolved: dict[str, np.ndarray | DerivedColumn | WindowedColumn] = {}
         errors: dict[str, str] = {}
         for name in candidate_names:
             try:
                 column = self._raw_variables.get(name)
-                if isinstance(column, DerivedColumn):
-                    resolved[name] = column  # aggregated per window in the worker (36.6 C)
+                if isinstance(column, (DerivedColumn, WindowedColumn)):
+                    # Aggregated per window in the worker (36.6 C; 53.2): a big column is never
+                    # read as a whole, and nothing is read on the UI thread.
+                    resolved[name] = column
                     continue
                 resolved[name] = self.variable_window(name, row_start, row_end)
             except (ExpressionError, KeyError):
@@ -1658,22 +1785,29 @@ class MainWindow(QMainWindow):
         if not resolved:
             self._show_stats_dialog(pending)
             return
+        gen = self._file_generation
         for name, y in resolved.items():
             self._set_busy("stats", True)
             self._stats_hub.submit(
                 (lambda col=y: chunked_stats(col.window, row_start, row_end))
                 if isinstance(y, DerivedColumn)
+                else (lambda col=y: chunked_stats(col.read_uncached, row_start, row_end))
+                if isinstance(y, WindowedColumn)
                 else (lambda y=y: basic_stats(y)),
-                lambda stats, n=name, batch=pending: self._on_stats_finished(n, stats, batch),
-                lambda msg, n=name, batch=pending: self._on_stats_finished(n, {"error": msg}, batch),
+                lambda stats, n=name, batch=pending, g=gen: self._on_stats_finished(n, stats, batch, g),
+                lambda msg, n=name, batch=pending, g=gen: self._on_stats_finished(n, {"error": msg}, batch, g),
                 job="stats",
                 target=name,
             )
 
-    def _on_stats_finished(self, name: str, stats: dict, batch: dict) -> None:
+    def _on_stats_finished(self, name: str, stats: dict, batch: dict, generation: int | None = None) -> None:
         # `stats` is {"error": msg} for a variable whose worker failed (28.2); the
         # remaining variables still show normally.
         self._set_busy("stats", bool(self._stats_workers))
+        if generation is not None and generation != self._file_generation:
+            # Another file was opened since the request: drop the whole batch (app 46.5 S-5).
+            logger.info("stats: dropped the result for %r (another file was opened meanwhile)", name)
+            return
         batch["results"][name] = stats
         batch["remaining"] -= 1
         if batch["remaining"] > 0:
@@ -1698,12 +1832,35 @@ class MainWindow(QMainWindow):
 
     # -- views -----------------------------------------------------------------------
 
+    def _ask_view_name(self) -> str | None:
+        """Ask for the view name: a saved view is picked from the list, or a new one typed (persistence 49.1).
+
+        Returns None on cancel or a blank name; the name is stripped."""
+        items = view_io.list_views()
+        if self._view_name in items:
+            current = items.index(self._view_name)
+        else:
+            items = [""] + items  # nothing selected yet: start from an empty entry
+            current = 0
+        name, ok = QInputDialog.getItem(
+            self, tr("toolbar.save_view_title"), tr("view.name_label"), items, current, editable=True
+        )
+        if not ok or not name.strip():
+            return None
+        return name.strip()
+
     def save_view_dialog(self) -> None:
         if self._data_source is None:
-            messages.information(self, tr("toolbar.save_view"), tr("error.open_file_first"))
+            messages.information(self, tr("toolbar.save_view_title"), tr("error.open_file_first"))
             return
-        name, ok = QInputDialog.getText(self, tr("toolbar.save_view"), tr("view.name_label"))
-        if not ok or not name.strip():
+        name = self._ask_view_name()
+        if name is None:
+            return
+        # An existing name is always confirmed, even the current view's own name (persistence 5.42).
+        overwrite = name in view_io.list_views()
+        if overwrite and messages.question(
+            self, tr("toolbar.save_view_title"), tr("view.overwrite_confirm", name=name)
+        ) != QMessageBox.StandardButton.Yes:
             return
 
         plots = []
@@ -1743,7 +1900,7 @@ class MainWindow(QMainWindow):
                 path_type="absolute",
                 relative_path=view_io.relative_source_path(name.strip(), str(self._data_source.path)),
             ),
-            time_column=self._time_column,
+            time_column=self._display_name(self._time_column),
             plots=plots,
             x_axis_range=x_axis_range,
             # Dependency order, not insertion order: an edit can make an earlier
@@ -1757,23 +1914,22 @@ class MainWindow(QMainWindow):
         try:
             path = view_io.save_view(view)
         except ValueError as e:
-            messages.warning(self, tr("toolbar.save_view"), tr("view.invalid_name", error=e))
+            messages.warning(self, tr("toolbar.save_view_title"), tr("view.invalid_name", error=e))
             return
         except OSError as e:  # name too long for the file system, unwritable data folder, disk full (persistence 35.1)
             logger.exception("failed to save view: %s", view.view_name)
-            messages.warning(self, tr("toolbar.save_view"), tr("view.save_failed", error=e))
+            messages.warning(self, tr("toolbar.save_view_title"), tr("view.save_failed", error=e))
             return
-        log_op("save_view", name=view.view_name, path=str(path))
+        log_op("save_view", name=view.view_name, path=str(path), overwrite=overwrite)
         self._view_name = view.view_name
-        messages.information(self, tr("toolbar.save_view"), tr("view.saved", path=path))
+        messages.information(self, tr("toolbar.save_view_title"), tr("view.saved", path=path))
 
     def load_view_dialog(self) -> None:
         """Open the view management window (detailed_specification.md 20.3)."""
         # Minus the time column: load_view resolves against _raw_variables, which
         # never holds it, so a view referencing it gets that item skipped (20.2).
-        available = (
-            {c for c in self._file_columns if c != self._time_column} if self._data_source is not None else None
-        )
+        excluded = self._time_excluded_names()  # the time column's source and its aliases (54.5)
+        available = {c for c in self._file_columns if c not in excluded} if self._data_source is not None else None
         all_columns = set(self._file_columns) if self._data_source is not None else None
         dialog = ViewManagerDialog(
             available,
@@ -1781,6 +1937,8 @@ class MainWindow(QMainWindow):
             all_columns=all_columns,
             available_functions=self._function_registry.all_names(),
             registry=self._function_registry,
+            aliases=self._alias_sources,
+            alias_names=set(self._aliases),
         )
         dialog.viewDeleted.connect(self._on_view_deleted)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1823,10 +1981,10 @@ class MainWindow(QMainWindow):
                 same_file=Path(self._data_source.path).resolve() == source_path.resolve(),
             )
             self._clear_plot_grid()
-            self._raw_variables = {k: v for k, v in self._file_columns.items() if k != self._time_column}
             self._derived = {}
+            self._rebuild_raw_variables()
             self.expression_bar.cancel_edit()
-            self.variable_panel.set_variables(list(self._raw_variables.keys()))
+            self._refresh_variable_panel()
         elif not self.load_parquet(str(source_path)):
             return  # load_parquet already showed an error dialog
 
@@ -1840,12 +1998,13 @@ class MainWindow(QMainWindow):
         # derived variable/series/plot too. `skipped` collects what didn't make it, for
         # one consolidated warning at the end instead of per-item dialogs.
         skipped: list[str] = []
+        skipped_derived: set[str] = set()  # their series aren't listed again (persistence 8.1)
         try:
             # Time axis first (persistence 33): saved X ranges are in that column's units, and
             # set_time_column go_home()s the plots, so it must precede the layout rebuild.
             if view.time_column is not None:
                 if view.time_column in self._file_columns:
-                    if view.time_column != self._time_column:
+                    if self._alias_sources.get(view.time_column, view.time_column) != self._time_column:
                         self.set_time_column(view.time_column)
                 else:
                     skipped.append(tr("view.time_column_missing", name=view.time_column))
@@ -1859,8 +2018,10 @@ class MainWindow(QMainWindow):
                     self._on_add_derived_variable(derived.name, derived.expression)
                 except UnknownFunctionError as e:
                     skipped.append(f"{derived.name} ({tr('error.unknown_function', name=e.name)})")
+                    skipped_derived.add(derived.name)
                 except (ExpressionError, KeyError):
                     skipped.append(derived.name)
+                    skipped_derived.add(derived.name)
 
             # The grid was already cleared above (either branch) down to a single plot,
             # which is guaranteed time-domain: PlotGridWidget.remove_plot() refuses to
@@ -1880,7 +2041,12 @@ class MainWindow(QMainWindow):
                         if not series.visible:
                             plot.set_series_visible(series.variable, False)
                     except (ExpressionError, KeyError, NonNumericColumnError):
-                        skipped.append(series.variable)
+                        if series.variable in skipped_derived:
+                            pass  # already listed, with its reason, as a derived variable
+                        elif series.variable not in self._file_columns and series.variable not in saved:
+                            skipped.append(f"{series.variable} ({tr('view.skipped_not_in_file')})")
+                        else:
+                            skipped.append(series.variable)
                 if plot is not first_plot and not plot.series_names():
                     # Every series meant for this plot failed to apply — drop the empty
                     # plot itself rather than leaving a blank pane in the grid.
@@ -1924,7 +2090,7 @@ class MainWindow(QMainWindow):
             )
         else:
             if skipped:
-                logger.info("view %r: skipped variables not present in the open file: %s", name, skipped)
+                logger.info("view %r: items not restored: %s", name, skipped)
                 messages.warning(
                     self,
                     tr("toolbar.load_view"),
@@ -1937,9 +2103,8 @@ class MainWindow(QMainWindow):
         finally:
             # Whatever ended up on plot 1 (fully applied, partially applied, or
             # untouched) is what the navigator should reflect -- and its region must stay
-            # on the restored group range: the overview refresh resets the region to the
-            # full extent (same issue _on_grid_layout_changed handles; found via the op log,
-            # detailed_specification.md 24.1/30).
+            # on the restored group range (NavigatorSync re-syncs it; found via the op log,
+            # detailed_specification.md 24.1/24.9/30).
             self._on_grid_layout_changed()
 
     # -- image export ------------------------------------------------------------------
@@ -2083,7 +2248,9 @@ class MainWindow(QMainWindow):
                     self.restoreGeometry(self._default_geometry)
                     self.settings.window_geometry = None
             if self.settings.window_state:
-                self.restoreState(base64.b64decode(self.settings.window_state))
+                # State version 1 = the two-toolbar layout (app 48.3); an older state (version 0,
+                # with `main_toolbar`) is rejected by Qt and silently dropped -> default layout.
+                self.restoreState(base64.b64decode(self.settings.window_state), _STATE_VERSION)
         except Exception:
             logger.exception("failed to restore saved window layout; using the default")
             self.settings.window_geometry = None
@@ -2097,7 +2264,7 @@ class MainWindow(QMainWindow):
 
     def _save_layout(self) -> None:
         self.settings.window_geometry = base64.b64encode(bytes(self.saveGeometry())).decode("ascii")
-        self.settings.window_state = base64.b64encode(bytes(self.saveState())).decode("ascii")
+        self.settings.window_state = base64.b64encode(bytes(self.saveState(_STATE_VERSION))).decode("ascii")
 
     def reset_layout(self) -> None:
         """Discard any saved window/dock layout and restore the built-in default
@@ -2105,7 +2272,7 @@ class MainWindow(QMainWindow):
         """
         log_op("reset_layout")
         self.restoreGeometry(self._default_geometry)
-        self.restoreState(self._default_state)
+        self.restoreState(self._default_state, _STATE_VERSION)
         self.settings.window_geometry = None
         self.settings.window_state = None
         save_settings(self.settings)

@@ -6,7 +6,7 @@
 
 **Scope of this domain**: the main window's plots (multiple plots, overlays), the navigator,
 zoom/pan interaction, time-axis formatting, cursors, plot height / reordering / time labels,
-per-series select / remove / show-hide, independent X axes per plot.
+per-series select / remove / show-hide, independent X axes per plot, the "A" button (fit Y).
 
 ## Requirements
 
@@ -178,6 +178,26 @@ per-series select / remove / show-hide, independent X axes per plot.
 - It looks different from placed cursors (5.13), and the labels don't overlap. Not included in image
   export. Mouse movement isn't written to the operation log (only on/off is recorded).
 - Details in [ch. 39](#39-showing-the-values-under-the-mouse-hover-readout-added-2026-10-03-user-request).
+
+#### 5.40 The "A" button (fit Y) (added 2026-10-08, from a real-machine bug report)
+
+- Pressing the "A" button at the bottom left of a plot (the auto-range button that comes with pyqtgraph, shown when the mouse
+  hovers) fits **only that plot's Y**, **once**, to the series visible in the current X range. X does not change (the navigator and
+  other linked plots stay as they are). After pressing, auto-range does not turn on again, and pan and zoom work as before.
+- Bug (2026-10-08, reported by the user): with a cursor placed, pressing "A" made the Y range keep widening and broke the plot.
+  Even without a cursor, pressing it left pyqtgraph's auto-range on.
+- Details in [ch. 47](#47-the-a-button-fit-y-added-2026-10-08-from-a-real-machine-bug-report).
+
+#### 5.43 Decimation setting for new plots, and navigator picture follows the series (added 2026-10-13, from the state-owner investigation)
+
+- The current "Allow fast display" (decimation) setting in the "⚙ ▾" of the toolbar also applies to **plots created later**
+  ("＋ Add plot", "Split into a new plot", and plots created by loading a view).
+- The navigator picture (the first shown series of the linked top plot, the anchor) shows the current series after any operation that changes
+  that series. This is also true when the top plot is unlinked.
+- Bugs (2026-10-13, found by the investigation of state owners, reproduced without a screen; idea.md "result of the state-owner investigation"):
+  (1) If decimation is turned OFF and then a plot is added, only the new plot is decimated. Loading a view saved with decimation OFF, the second and
+  later plots are decimated. (2) With the top plot unlinked, dropping a variable onto the anchor does not change the navigator picture.
+- Details in [ch. 50](#50-decimation-setting-for-new-plots-and-navigator-picture-follows-the-series-added-2026-10-13-from-the-state-owner-investigation).
 
 ## Design
 
@@ -682,6 +702,10 @@ only the switching UI (menu item, chain icon) is hidden; the internal mechanism 
     (anchor's) current range** (found in review: the routine that rebuilds the overview waveform on every
     layout change reset the selection to the whole data; an existing bug that also happened with ch. 22's
     reordering).
+  - (2026-10-06) The range is put back inside the overview update. On the synchronous path, `_refresh_navigator_overview` returns the
+    selection to the linked group's range every time (when derived variables are added, edited or deleted, when maps or functions change,
+    or on a drop onto the top plot; this was the 6th recurrence, backlog 14). Opening a file and switching the time-axis column keep the
+    whole range with `keep_region=False` (home).
 - Switching the time-axis column (`set_time_axis_data`) replaces the X values of every time-domain plot,
   unlinked ones included, and does `go_home` (as before; linking states are kept).
 - `go_home()` calls `go_home()` on every plot (as before). Unlinked plots return to their full range too.
@@ -791,6 +815,93 @@ Test plan: `test_plots_errors.py` (degenerate series and ranges, the navigator, 
 linking in the grid, cursors, switching the time axis, real clicks and wheel). A bug fix comes with a
 regression test that fails before the fix.
 
+#### 24.9 One place for navigator synchronization (`NavigatorSync`) (added 2026-10-08, backlog 20)
+
+Purpose: prevent, by **structure** rather than by caller discipline, the bug "the navigator selection jumps to the whole range while the plots stay zoomed"
+(24.1; recurred 6 times; LEARNINGS 2026-10-02 and 2026-10-06). This is the first of the splits of `main_window.py` (2155 lines). The screen's look and
+behaviour do not change (refactoring plus the latent bug fix below).
+
+Cause pattern: `NavigatorWidget.set_overview_data` resets the selection to the whole range each time, and the paths in `main_window.py` that draw the
+overview (3 synchronous and 2 asynchronous kinds; `set_overview_data` is called in 9 places) each had to restore the range. The restore happens in
+2 places, after `_refresh_navigator_overview` and inside `_on_navigator_overview_ready`; each new path can forget it.
+
+**(1) `NavigatorWidget` (`ui/navigator.py`)**
+
+- `set_overview_data(x, y, *, keep_region: bool = True)`: updates the overview curve and the bounds of the range.
+  - `keep_region=True` (default): the selection stays **at its current range** (any part outside the new bounds is clamped to them).
+    On the first call (no previous overview), or when the current range does not overlap the new bounds at all, the whole range is used.
+  - `keep_region=False`: the whole range (home).
+  - If there is no finite X, the curve is emptied as before and the range is left alone (29.4).
+- **Changing bounds or range does not emit `rangeSelected`**: pyqtgraph's `LinearRegionItem.setBounds` moves the line and emits `sigRegionChanged` if
+  the current range is outside the new bounds. The current code calls `setBounds` without blocking signals, so on this path the plot range can move
+  (a latent bug). `setBounds` and the range setting are done with signals blocked (the same treatment as `set_selected_range`).
+- The docstring states the rule that `rangeSelected` is emitted only for the user's drag or click.
+
+**(2) `NavigatorSync` (`ui/navigator_sync.py`, new)**
+
+Moves the following `MainWindow` methods and state (the code is almost unchanged):
+`_refresh_navigator_overview`, `_refresh_navigator_overview_impl`, `_first_plottable_column`,
+`_set_derived_navigator_overview`, `_on_derived_pyramid_for_navigator`, `_detach_nav_pyramid_listener`,
+`_on_derived_overview_built`, `_on_derived_overview_failed`, `_set_windowed_navigator_overview`,
+`_on_navigator_overview_ready`, `_on_navigator_overview_failed`, `_windowed_navigator_overview`;
+state `_navigator_overview_gen`, `_nav_pyramid_column`, `_navigator_hub` (`WorkerHub`).
+
+- Construction: `NavigatorSync(navigator, hub, *, time_values, raw_variables, data_source, anchor_plot, group_range,
+  set_busy, time_finite_bounds)`. Each is a function that returns the current value when called (not the whole `MainWindow`; dependencies are
+  visible as arguments). `group_range` is `MainWindow._group_x_range` (the "one place" of 24.2 stays in `MainWindow`, since statistics, view saving
+  and image saving also use it).
+- Public API:
+  - `refresh(home: bool = False)`: rebuilds the overview (today's `_refresh_navigator_overview(keep_region=not home)`). The hub (`WorkerHub`) is
+    still created by `MainWindow` and passed in.
+- **Range restore in one place**: only `NavigatorSync._apply(x, y)` hands an overview to `navigator` (all synchronous and asynchronous paths;
+  no other place calls `set_overview_data` directly). `_apply` does:
+  1. `navigator.set_overview_data(x, y, keep_region=not self._home)`;
+  2. if not at home (`_home` is false) and the linked group has a range (`group_range()`) that is finite, set the selection to it (no signal).
+  `_home` is true only while the synchronous part of `refresh(home=True)` draws (restored in `try/finally`). Asynchronous results that arrive later
+  are handled by step 2, aligning to the linked group's range (right after opening a file the plots are empty, so `group_range()` is `None` and the
+  whole range stays; after a time-axis switch the plots have already been `go_home`d, so the linked group's range is the whole range).
+  - (Changed in review, 2026-10-08) The first version also ran step 2 while at home. Switching the time axis calls `refresh(home=True)` **before**
+    `set_time_axis_data` (the plots' `go_home`), so at that moment the linked group's range was still based on the old time axis. Clamping to the new
+    bounds gave a zero-width range (it was only corrected by a later `rangeChanged` from `go_home`, a hidden dependency on signal order). Home is
+    the whole range by definition, so step 2 is skipped while at home.
+- The generation counter, `WorkerHub` jobs, `_set_busy("navigator", …)` and the one-shot listener for a derived variable's pyramid keep their rules
+  (data 36.6 C, 37, 40). Stale generation results are discarded; success and failure are each reported once.
+- On the `MainWindow` side:
+  - `_refresh_navigator_overview(keep_region=True)` is removed; callers (opening a file, switching the time axis, adding/editing/deleting a derived
+    variable, changing a function or map, `_on_grid_layout_changed`) are replaced by `self._nav_sync.refresh(...)`. Home is used only at the two places
+    (opening a file, switching the time axis; `home=True`).
+  - The connections `navigator.rangeSelected` → `plot_grid.set_x_range` and `plot_grid.rangeChanged` → `navigator.set_selected_range` stay in
+    `MainWindow` (each is one line; relaying the displayed range remains `MainWindow`'s job).
+  - The operation log's state (`navigator` in `state_snapshot`) still reads `navigator.selected_range()`.
+- Add `navigator_sync` to the module diagram (PlantUML in overview 5.1) and to the directory list (in the same commit).
+
+**(3) Moves and commits**
+
+- CLAUDE.md rule 7: separate the "move only" commit (methods moved to `NavigatorSync` and delegated from `MainWindow`; behaviour unchanged, all tests
+  pass) from the "content change" commit (making `keep_region` the default, collecting into `_apply`, blocking signals in `setBounds`, removing the delegation).
+
+**Test plan** (`tests/parquet_analyzer/test_navigator_sync.py`, new; the existing `test_navigator_resync.py` must also pass)
+
+1. `NavigatorWidget` alone: set a partial range → `set_overview_data` (default) leaves the range unchanged. `keep_region=False` gives the whole range.
+   New bounds narrower than the current range → the range is clamped to the bounds, and **`rangeSelected` is never emitted** (must fail before the fix).
+   First call or non-overlapping → whole range. No finite X → range unchanged.
+2. After every synchronous path (opening a file, switching the time axis, adding/removing/reordering series, changing linking, adding/editing/deleting a
+   derived variable, changing maps), if the plots are zoomed the navigator range equals the linked group's range. After opening a file or switching the
+   time axis, the whole range.
+3. **Asynchronous paths** (decided in backlog 20): with a windowed column (`WindowedColumn`, a file with few row groups), when the refined overview from
+   `_on_navigator_overview_ready` arrives while plots are zoomed, the range stays at the linked group's range. Same when a derived variable's pyramid
+   arrives. If another overview is requested before a result arrives, the stale result is dropped (generation counter). On failure the coarse overview
+   stays and `busy` is cleared. Tests wait for worker results in real time (CLAUDE.md: no fixed-count loops).
+4. Structure: `main_window.py` contains no call to `navigator.set_overview_data` (a simple source-reading test). In `navigator_sync.py`, only `_apply`
+   calls `set_overview_data`.
+5. Real operations: with zoom on, run each path above, then drag the navigator range (real mouse events) and confirm the plots do not jump to the whole range.
+
+Scale: large (Sonnet plus reviewer). Touches WorkerHub and the navigator invariants.
+
+- Added 2026-10-08: when the overview shape is re-decided (the start of `_refresh_impl`), `_gen` is always bumped on every path, which clears the
+  navigator's "drawing" mark. Previously the bump did not happen on the in-memory column path, so a decimation read from the previous file kept the mark
+  on (found in A2; [data 28.4](./data.md)).
+
 ### 39. Showing the values under the mouse (hover readout) (added 2026-10-03, user request)
 
 Requirement: 5.32. In the discussion in `idea.md`, all five open questions were decided with the
@@ -845,6 +956,135 @@ recommended options (2026-10-03).
   setting.
 - No exception with a time axis containing NaN or not ascending. Not included in image export.
 - Drive MainWindow headlessly and check the look of the hover in a screenshot.
+
+### 47. The "A" button (fit Y) (added 2026-10-08, from a real-machine bug report)
+
+Requirement: [5.40](#540-the-a-button-fit-y-added-2026-10-08-from-a-real-machine-bug-report).
+
+#### 47.0 Cause of the bug
+
+- `TimePlotWidget` turns off pyqtgraph's auto-range (4/5: curves are drawn only for the visible range, so with auto-range the
+  plot keeps shrinking to fit the cut-out curve). However, the `PlotItem` "A" button (`autoBtn`, `PlotItem.autoBtnClicked`) remains,
+  and pressing it calls `enableAutoRange()`, leaving **auto-range on**.
+- The cursor line and value label (16, `add_cursor`'s `pg.InfiniteLine` and `pg.TextItem`) are added without `ignoreBounds`, so they take part in the
+  auto-range calculation. The label sits at the top edge of the visible range, so the range widens → the label moves up → it widens again, and so on
+  (reproduced without a screen: Y from ±1.04 to −200,000 … 5,000,000 after 2 seconds).
+
+#### 47.1 Behaviour
+
+- Disconnect `autoBtn`'s click from `PlotItem.autoBtnClicked` and connect it to `TimePlotWidget.fit_y()`. The button's appearance (shown on hover)
+  stays pyqtgraph's.
+- `fit_y()`: write `log_op("fit_y", plot=...)` first. From the **drawn curves** (`curve.getData()`), take only the points that lie in the current X range
+  `[x_min, x_max]`, get the finite minimum and maximum Y of the visible (`visible`) series, and change only Y with `setRange(yRange=..., padding=0.02)`
+  (the same padding as `go_home`).
+  - Why use the drawn curves: the screen thread does not read arrays (the same for windowed series and for `TimeIndex` time axes; data 36.8, overview §2).
+    Fitting to the drawn points means the visible line is never cut. Fine peaks dropped by decimation (LTTB) are not visible, so they are not fitted.
+    If a redraw is in progress when pressed, fit to the curve at that moment.
+  - The drawn curves extend one point beyond each side, so points outside the X range are not used.
+  - If there is no point to fit (no series, all hidden, or all NaN in range), do nothing (no exception; never pass a non-finite range, 24.8).
+  - If the minimum equals the maximum (a constant value), leave it to pyqtgraph's handling of zero width (as in 24.8).
+- After pressing, `getViewBox().state["autoRange"]` stays `[False, False]`.
+- X is not changed, so navigator resync (24.9) is not needed. Y of other linked plots is not changed either.
+- FFT plots (`fft` is OFF) stay as they are.
+
+#### 47.2 Removing cursors from range calculation
+
+- Add the cursor's line and label with `addItem(..., ignoreBounds=True)` in `add_cursor` (as the hover line, 39.1). Even though 47.1 means auto-range
+  no longer turns on, cursors must not enter other paths that use the data range (such as `ViewBox.childrenBounds`).
+
+#### 47.3 Test plan (`test_plot_widget.py` / `test_plots_errors.py`)
+
+Confirm that each regression test fails before the fix. Press the button through the real path (`autoBtn` appears only on hover, so hover first, or make
+it visible, then `QTest.mouseClick` on the button's position in the viewport).
+
+- **With a cursor**: draw `sine`, place one cursor, press "A" → Y becomes the data range (around ±1), and stays unchanged after running the event loop.
+  Auto-range stays OFF (before the fix it keeps widening).
+- **While zoomed**: narrow X to part of `sine` (around 0 to 0.5), move Y far off, then press "A" → Y fits the values in that range.
+  X and the navigator frame do not change.
+- Hidden series are not fitted. With all hidden or no series, nothing changes.
+- A series that is all NaN in range only → nothing changes, no exception.
+- A windowed series (`add_windowed_series`) is fitted to the drawn curve, and `window()` is not called on the screen thread.
+- With two linked plots, pressing one changes only its Y.
+- The cursor's line and label are `ignoreBounds` (cursor positions do not enter `vb.addedItems` range calculation or `childrenBounds`).
+- `fit_y` is recorded in the operation log.
+- With `MainWindow` driven without a screen, take an image after pressing "A" with a cursor on and zoomed, and confirm visually.
+
+### 50. Decimation setting for new plots, and navigator picture follows the series (added 2026-10-13, from the state-owner investigation)
+
+Requirement: [5.43](#543-decimation-setting-for-new-plots-and-navigator-picture-follows-the-series-added-2026-10-13-from-the-state-owner-investigation).
+Approach: where **several paths write the same state and each path syncs it by hand**, move the state to **one owner** and fix it there (items (1) and (2) of
+idea.md "result of the state-owner investigation"). No big-bang rewrite.
+
+#### 50.0 Cause of the bugs
+
+1. `PlotGridWidget` copies `auto_redraw`, `downsample_pixel_ratio`, `scroll_bindings`, hover and cursor mode to a new plot in `add_plot`, but it does not
+   hold the decimation on/off state and so does not copy it. `TimePlotWidget` always starts with `_downsample_enabled = True`. `MainWindow._apply_downsample_enabled`
+   delivers to **only the plots that exist at that moment**. `load_view` builds plots after applying the decimation setting
+   (`_apply_downsample_enabled(view.downsample_enabled, …)` in `main_window.py`), so the second and later plots of a view are decimated.
+2. Adding a series does not emit `layoutChanged`, so the `MainWindow` caller calls `_nav_sync.refresh()` by hand. The decision differs per path:
+   `_on_variable_dropped` checks `plot is plots[0]` (not the anchor). Editing a derived variable, changing a function or map, and deleting a derived variable
+   each compute `anchor_affected` themselves (3 places).
+
+#### 50.1 `PlotGridWidget` owns the decimation setting
+
+- `PlotGridWidget` holds `_downsample_enabled: bool = True`. `set_downsample_enabled(enabled)` rewrites it and then delivers to the current plots (as now).
+  `add_plot` copies `plot.set_downsample_enabled(self._downsample_enabled)` to a new plot (in the same place as hover and cursor mode). Add
+  `downsample_enabled()` for reading.
+- FFT plots (`x_axis_datetime=False`) get the same copy (the current `set_downsample_enabled` also delivers to all plots).
+- `MainWindow._downsample_enabled` stays (the toolbar item, view saving and the operation log read it). Its value always equals `plot_grid`'s
+  (`_apply_downsample_enabled` is the only place that writes both).
+- Every path that creates a new plot ("＋ Add plot", "Split into a new plot", "Split series into a new plot", `load_view`, FFT) goes through `add_plot`,
+  so this covers all of them. The order inside `load_view` does not need to change.
+
+#### 50.2 When the anchor's picture changes, the grid emits `layoutChanged`
+
+- Add `seriesChanged = Signal(object, str)` (self, name) to `TimePlotWidget`, emitted when a series is **added or replaced**: at the end of
+  `_install_series` (both `add_series` and `add_windowed_series` go through it; this includes replacement under the same name), and at the end of
+  `replace_series_y` and `replace_series_source`. Removal, moving and visibility change keep using `seriesRemoved` and `seriesVisibilityChanged`
+  (the grid already emits `layoutChanged` from these).
+- `PlotGridWidget.add_plot` connects `plot.seriesChanged` to `_on_series_changed(plot, name)`. `_on_series_changed` emits `layoutChanged` only when
+  `plot is self.anchor_plot()` and `name` is the first of `plot.visible_series_names()`.
+  - Reason: the navigator picture is decided only by the anchor's first visible series (`_refresh_impl` in 24.9). Rebuilding on other series' additions or
+    replacements would, during view loading (which adds many series to the anchor), run the overview calculation on the screen thread once per series.
+    The decision lives only in this one place.
+- Remove the manual `_nav_sync.refresh()` calls from `MainWindow`:
+  - The `plot is self.plot_grid.plots[0]` check in `_on_variable_dropped` and its `refresh`.
+  - The `anchor_affected` calculation and `refresh` in `edit_derived_variable`, `update_registry` (function/map change) and `delete_derived_variable`.
+  - Deletion is left to a new `PlotGridWidget.remove_series_everywhere(name)`: it removes `name` from every time-domain plot, and if it removed any, emits
+    `layoutChanged` once. (Changed during implementation, 2026-10-13) The first version assumed that "`remove_series` → `seriesRemoved` already emits
+    `layoutChanged`", but the grid's `_on_series_removed` only clears the selection and emits nothing (only the legend and the right-click removal paths emit).
+    Since `MainWindow` emitting the grid's signals directly goes against the owner principle, it became a grid method.
+    `delete_derived_variable` calls it **last** (after removing the variable from `_raw_variables`, so the navigator does not pick the deleted variable
+    in place of a column).
+  - What remains is three places only: `refresh(home=True)` for opening a file and switching the time axis, and `_on_grid_layout_changed`.
+- The final `_on_grid_layout_changed()` in `load_view` (in `finally`) stays (it aligns once even if a failure happens partway).
+- The operation log and the content of `state_snapshot` do not change.
+
+#### 50.3 Test plan (`tests/parquet_analyzer/test_plot_state_sync.py`, new; the existing `test_navigator_sync.py` and `test_navigator_resync.py` must also pass)
+
+Confirm that each regression test fails before the fix (the reproduction of 50.0: without a screen, `[False, True]`, and the navigator picture stays stale).
+
+Decimation:
+1. Turn "Allow fast display" OFF by really `trigger()`ing it in the toolbar → "＋ Add plot" (a toolbar item) → every plot's `_downsample_enabled` is false
+   (before the fix only the new plot was true).
+2. With it still OFF, "Split into a new plot" and "Split series into a new plot" → the new plots are also false.
+3. With decimation OFF and three plots, save a view → reopen the file (decimation goes back to true) → load the view → all three are false.
+   A view saved with it ON gives all true.
+4. Opening a file sets all plots back to true (as now).
+
+Navigator (the picture is identified with `navigator`'s curve, e.g. the Y maximum; use columns that can be told apart: for example `a` is ±1 and `b` is large):
+5. Two plots, unlink the top one (the anchor is the second) → drop `b` onto the anchor (`_on_variable_dropped`; through a real drop on the plot if
+   possible) → without a manual `refresh` the navigator picture becomes `b` (before the fix it stays stale).
+6. Add a second `b` to an anchor that already has `a` → no `layoutChanged` (the overview is not rebuilt; `NavigatorSync`'s generation number does not
+   increase). If the first series is hidden and then the added series becomes the first visible one, it does emit.
+7. When the anchor's first series is a derived variable, edit its expression → the navigator picture shows the new values. Editing a derived variable or
+   changing a function that is only on a non-anchor plot does not rebuild. Deleting a derived variable changes the picture to the next series (or the file's column).
+8. Structural check (a simple test that reads the source): `main_window.py` has no `anchor_affected`, no place that looks at `plots[0]` and refreshes,
+   and `_nav_sync.refresh(` is called in exactly 3 places (opening a file, switching the time axis, `_on_grid_layout_changed`).
+9. After loading a view (two plots, three series each), the navigator picture = the anchor's first series, and the range = the linked group's range
+   (the same check as the tests of 24.9).
+
+Scale: medium (Sonnet, `implementer`). It touches the navigator invariants (24.9), so before merging into `main`, this session confirms by running headless and with the full test suite.
 
 ## Relations to other domains
 

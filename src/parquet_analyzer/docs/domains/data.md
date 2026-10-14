@@ -69,6 +69,17 @@ the MDF/MATLAB→Parquet conversion tool.
   were adopted and implemented (cache memory management and cancellation were not adopted). The design is
   in [36.8](#368-the-adopted-design-2026-10-04-from-the-367-decision-and-the-reviewers-review).
 
+#### 5.46 Aggregating statistics over a whole column window by window (added 2026-10-13, stage 1 of backlog item 29; external review 2, candidate C)
+- When "Statistics" is pressed on a large file (a windowed column), the rows of the displayed range are not read all
+  at once; they are read in chunks and aggregated as they go. The 4–6 GB needed for statistics over the whole of a
+  100-million-row column (36.7) is brought down to about the amount resident after drawing.
+- The reading is not done on the UI thread but inside background work (today the UI thread reads all rows, so the
+  screen freezes meanwhile).
+- The results (count, missing, min, max, mean, standard deviation, median) are the same as now (the median stays exact).
+- Separating `values()` (the read-everything API) and making it explicit by name is specified later as stage 2
+  (user's decision, 2026-10-13).
+- Details in [ch. 53](#53-aggregating-statistics-over-a-whole-column-window-by-window-added-2026-10-13-stage-1-of-backlog-item-29).
+
 #### 5.30 Reliably releasing background-job parts and protecting UI objects (added 2026-10-03, from the 13.6 investigation)
 - When background work (downsampling, envelopes, statistics, FFT, analysis windows) finishes, the parts
   made for it and the data passed to it are reliably released (previously they weren't, and memory grew
@@ -271,8 +282,7 @@ Requirement: 5.22. Background: `BackgroundWorker.run()` in `core/background_work
 `signals.finished.emit(self._func())`, so if `func` raised, `finished` was never emitted. The caller kept its
 strong reference to the worker, the drawing indicator (the count of `downsampleStarted`/`Finished`,
 `MainWindow._busy_sources`) was never cleared, and `WindowedColumn`'s "envelope being built" mark
-(`_pyramid_building`) stayed `True`, so that column's envelope could never be built again (external review #2
-in `idea.md`, fact-checked).
+(`_pyramid_building`) stayed `True`, so that column's envelope could never be built again (external review 1 #2, fact-checked).
 
 #### 28.1 `BackgroundWorker`
 
@@ -302,8 +312,10 @@ in `idea.md`, fact-checked).
   (`fft.failed`) is shown (a modal is fine, since the user explicitly runs it once).
 - **Future analysis windows** (25.1) follow the same rule (showing the failure in the result display).
 - (Added in review) **Synchronous reads on the UI thread are covered too**: statistics and FFT read the
-  target range with `variable_window(...)` on the UI thread before handing it to the worker. For windowed
-  columns this is where the disk is actually read, so `Exception` is caught per variable; statistics show the
+  target range with `variable_window(...)` on the UI thread before handing it to the worker (from 2026-10-13,
+  statistics of windowed columns and of windowed derived variables read in chunks on the background thread; ch. 53.
+  What follows covers the other columns and FFT). For windowed columns this is where the disk is actually read,
+  so `Exception` is caught per variable; statistics show the
   failure in that variable's row and FFT warns (previously only `ExpressionError`/`KeyError` were caught, and
   read errors were never reported to the user).
 - (Added in review) The downsampling failure notice (`renderFailed`) is emitted only when the series still
@@ -331,6 +343,52 @@ in `idea.md`, fact-checked).
   to empty.
 - FFT: failure → a warning (checked with a monkeypatch), `_busy_sources` back to empty.
 - Confirm each test fails if 28.1's exception handling is removed (the drawing indicator remains, etc.).
+
+#### 28.4 Discarding old results of the previous file (added 2026-10-08, from the A2 results; backlog item 30)
+
+In A2 ([app 46.5](./app.md)), two paths were found through which results of jobs of the previous file got through when
+a file was reopened. Both are marked `xfail(strict=True)` in `test_worker_paths.py`; remove the marks once fixed.
+
+**(1) Generation numbers of series downsampling (`TimePlotWidget`)**
+
+- Cause: the generation number is per series (`entry["generation"]`), and a new series starts from 0 (`_install_series`).
+  When a late result of the previous file's series `a` (generation N) arrives, and the next file's series of the same
+  name `a` is also at generation N, that result is drawn as the new series' result (`_on_downsampled`,
+  `_on_thin_drawn` and `_on_series_worker_failed` look only at the name and the generation).
+- Fix: take the generation number from **one ever-increasing number per plot** (`itertools.count` or similar). Each series
+  keeps the number it last issued in `entry["generation"]`, and a received result is compared with it (the comparison
+  stays as it is now). When a series is rebuilt (`_install_series`), it takes a new number, so it never matches a job of
+  the previous series.
+  - This differs from the earlier "one generation number per plot" (the bug where overlaid series treated each other as
+    stale; see the comment in `_start_series_worker`): only the source of the numbers is shared; the comparison is still
+    per series.
+  - All places that raise the generation (`_start_series_worker`, `_start_thin_draw`, `_render_from_pyramid`,
+    `_install_series`) take it from the same source.
+- The "drawing" mark (the `downsampleStarted`/`downsampleFinished` pair) still always returns once each, even for stale results.
+
+**(2) Generation of the navigator overview (`NavigatorSync`, plots 24.9)**
+
+- Cause: `NavigatorSync._gen` is raised only by the windowed-column and derived-column paths. It is not raised on the
+  paths where the next file's column is held in memory (the final `self._apply(tv, y)` of `_refresh_impl`, the
+  `TimeIndex` path, the paths where nothing is drawn or there is no numeric column). The previous file's thinned read
+  (`_on_navigator_overview_ready`) is discarded because `time_values` has changed, but at that point it does not clear
+  the `navigator` "drawing" mark, so the progress indicator stays visible.
+- Fix: raise `_gen` and clear the `navigator` mark at the **start** of `_refresh_impl` (when the overview is re-determined,
+  any earlier request's result becomes stale on every path). Also raise and clear when `_time_values()` returns `None` and
+  the function exits early. Raising again inside the windowed and derived paths stays as it is now.
+  - With this, the combination "`gen` is the same but `time_values` differs" no longer occurs, but keep the `time_values`
+    comparison just in case. If it is kept, the comment in that branch should say that the mark handling is also correct
+    there (the new request holds the mark).
+
+**Test plan**
+
+- The `xfail` marks of `test_downsample_stale_job_of_previous_file_with_same_series_name` and
+  `test_navigator_stale_refinement_when_next_file_is_eager` are removed and the tests pass.
+- Added: on the same plot, remove series `a` and immediately re-add it under the same name; the result of the previous `a`'s
+  job (whose number may coincidentally match) is not drawn (without changing files; checked with `TimePlotWidget` alone).
+- Added: while a thinned read of the navigator is in progress, switch to a file whose column is held in memory, and switch the
+  time axis, in each case; the `navigator` mark clears (`_busy_sources` goes back to empty).
+- All other combinations in `test_worker_paths.py` (D, N, P) pass. Each test is confirmed to fail when the fix is removed.
 
 ### 29. Checking the time-axis order (added 2026-10-02, from fact-checking an external review)
 
@@ -756,6 +814,8 @@ because the review found violations):
   when the column was built. Function and map changes replace it with a new snapshot through the current
   recompute path (expressions ch. 18/26's "all or nothing" doesn't change).
 - Statistics over the whole (`chunked_stats`) don't fail even with extreme values whose span overflows.
+- (2026-10-13, ch. 53) Statistics also read windowed columns in chunks with `chunked_stats`. The reads use
+  `WindowedColumn.read_uncached` (which does not go through the block cache; only `window` still goes through the cache).
 
 **Test plan** (in addition to what 36.6 and 36.7 added, from the review's findings):
 - The navigator overview after a windowed column's pyramid is built (time axis `TimeIndex` / resident, flags on/off).
@@ -879,13 +939,123 @@ improve the implementation** (it only measures).
   36.1 as "36.4 Measurements (baseline)". For stages that are clearly problematic (tens of seconds or more, several
   GB of memory or more), add an assessment of the cause (fixing it is ch. 36's job).
 
+### 53. Aggregating statistics over a whole column window by window (added 2026-10-13, stage 1 of backlog item 29)
+
+Requirement: 5.46. Sources: idea.md "External review 2" #4, candidate C, and "Remainder of large-data support" (2).
+
+#### 53.1 The current design (fact-checked, `main` as of 2026-10-13)
+
+- The statistics request (the statistics operation in `MainWindow`, where `resolved` is built in `main_window.py`) does, per variable:
+  - `DerivedColumn` (a windowed-computed derived variable, 36.6 C) → in the background, `chunked_stats(col.window, row_start, row_end)`, reading in chunks.
+  - Anything else → **on the UI thread** `variable_window(name, row_start, row_end)`, i.e. `WindowedColumn.window` reads all rows
+    of the displayed range in one go, and that array is passed to the background `basic_stats`.
+- So when a windowed raw column (`WindowedColumn`) is displayed in full and statistics are pressed, a 100-million-row column
+  holds 800 MB of read data plus a copy converted to numbers at the same time, which gives the "whole-column statistics maximum"
+  of 4.3 GB in 36.7. While it reads, the screen also freezes (contrary to the overview's "do not do heavy work on the UI thread").
+- `chunked_stats` computes count, missing, min and max exactly; mean and standard deviation by combining per-chunk moments; and
+  the median exactly with a second pass (counting bins) and a third pass (collecting only the values in the median bin)
+  (at most 3 reads). It was checked against `basic_stats` by the property tests (app 46.2).
+- `WindowedColumn.window` goes through `read_window` (an LRU cache of 100k-row blocks, 64 blocks). Sweeping the displayed range
+  three times in chunks, at 100 million rows, reads 1,000 blocks per pass and pushes out all the blocks the plots were using from the cache.
+
+#### 53.2 Changes
+
+1. **`WindowedColumn` is also aggregated with `chunked_stats`.** For a statistics request, if the column is a `WindowedColumn`,
+   it is not read on the UI thread; as with `DerivedColumn`, the column itself is passed to the background, and there
+   `chunked_stats(<read function>, row_start, row_end)` is called. `MaterializedColumn` and `LazyColumn` (up to
+   `eager_load_limit_mb`, i.e. sizes that may be held in memory) stay as now (slicing with `variable_window` → `basic_stats`).
+   The check is `isinstance`, placed at the statistics request, not inside `variable_window`.
+2. **Reads that bypass the cache.** The read function passed to `chunked_stats` bypasses the block cache (`read_window`):
+   add `read_uncached(row_start, row_end)` (provisional name) to `WindowedColumn`, which returns the range via
+   `ParquetDataSource.read_columns([name], row_start, row_end)` → `_numeric_column` (the same numeric conversion as `window`).
+   - Reason: a three-pass sweep over the whole range should not push out the plots' cache. Reads are in chunks larger than the
+     block size (100k rows) (`chunked_stats`'s default of 4 million rows), so there are fewer calls.
+   - Rows outside the range must not be read (before `row_start` or at/after `row_end`). The range clamping of `read_columns` (data 29.5) still applies.
+   - If the measurements (53.4) show it is slower or uses more memory than the cached path, the reason is written down and the
+     cached path may be restored (report to the main session).
+3. **Failures.** A read failure used to be caught on the UI thread and put into `errors` (28.2). For windowed columns it now
+   arrives as a failure of background work (`{"error": msg}` in `_on_stats_finished`). The error text for that variable in the
+   dialog keeps the same form as now, and the other variables are shown normally. Every path still satisfies "report success or
+   failure exactly once" (overview §2).
+4. **Switching files.** Discarding results when another file is opened during a computation (app 46.5 S-5) stays as it is. The
+   background work keeps reading the old `ParquetDataSource`, so reading a closed file must not crash (same as the current
+   `DerivedColumn` path: a read that raises is reported as a failure and dropped by the generation check).
+5. Not changed in stage 1: the name and API of `values()` (stage 2), the inside of `chunked_stats` (the "median bin becomes large
+   for a column where one value dominates" item of idea.md "Remainder of large-data support" (4); the ±1e308 overflow in backlog is a
+   separate issue and stays as is), and how histogram, XY and FFT read data.
+
+#### 53.3 Test plan
+
+- Match: with `eager_load_limit_mb = 0`, a small file in which every column is a `WindowedColumn` (several hundred thousand rows,
+  spanning several 100k-row blocks, with one column containing NaN/±Inf). Compute the statistics for the whole and for part of the
+  range (with `row_start`/`row_end` straddling block boundaries) and compare with `basic_stats` over the same range
+  (count, missing, min, max and median match exactly; mean and standard deviation to `rtol=1e-9`). Also check the case of several
+  chunks, with the chunk size made small (e.g. `chunk_rows` of `chunked_stats` monkeypatched to tens of thousands of rows).
+- Not read on the UI thread: from pressing statistics until the result appears, the `WindowedColumn` reads (`window`,
+  `read_uncached`, `read_window`, `read_columns`) are not called from the UI thread; verified by recording the calling thread.
+  However, the one-row reads at both ends of the time axis for the range display ("t0 to t1 (N rows)", `TimeIndex`) are excluded
+  (as before; they are cheap; added in review, 2026-10-13).
+- Full-read watch (app 46.6 (2), `test_no_full_read.py`): add the operation "8. Statistics (part of the displayed range)". Also check
+  that rows outside the displayed range are not read. Remove "statistics over the whole displayed column" from the list of
+  excluded operations in the watch, and add it as an operation that checks **no single read exceeds half of the total** (with small chunks).
+  Fix the wording of "not targeted" in 46.6 accordingly.
+- Cache not pushed out: the contents (keys) of `ParquetDataSource`'s block cache do not change before and after the statistics.
+- Failure: make `read_uncached` raise; then only that variable shows the error, the other variables still show values, the busy display
+  (`_set_busy`) clears, and the report happens exactly once (the row of the statistics table in app 46.5 is also used for windowed columns).
+- File switch: open another file while statistics on a windowed column are being computed → the result is discarded (same form as
+  46.5 S-5, on a windowed column).
+- The existing statistics tests (the statistics rows in `test_worker_paths.py`, the statistics dialog) pass. Tests whose preconditions no
+  longer hold because the path changed are repaired while keeping the property they check (not weakened).
+- All tests pass.
+
+#### 53.4 Measurements (before merging)
+
+- With `tests/parquet_analyzer/bench_large_file.py`, measure `stats_full` and `stats_zoom` on `bench_100m.parquet` before the change
+  (`main`) and after it, under the same conditions (median of 2 runs, one configuration at a time, in turn). Record the time (seconds) and
+  peak memory (MB) in this section, in the form of the 36.7 table.
+- Target: the peak memory of `stats_full` stays within the resident memory after drawing (about 1.4 GB) plus a few hundred MB. Time is
+  within 1.5× the time before (reads may go from 1 pass to up to 3, so it may be slower). If it falls outside this, write down the reason and
+  a proposal (e.g. change the chunk size) and report to the main session.
+- `stats_zoom` (the displayed range is 1/1000) is the same or faster.
+- When several variables are selected (added in review, 2026-10-13): each variable becomes one background job, running at the same time in
+  the analysis pool. Per variable, a chunk (4 million rows) of temporary arrays is about 150 MB. With 4 variables at once on 100 million rows,
+  +515 MB (measured by the `reviewer`). With more than 12 it could be +1.5–2 GB, but that is still well below before (where 800 MB per variable
+  was read in one go on the UI thread). If it becomes a problem, make `chunk_rows` smaller.
+
+**Measurement results (2026-10-13)**: `bench_100m.parquet` (100 million rows, 4.62 GB), Apple M4 Pro / 24 GB, median of 2 runs each,
+`bench_large_file.py --stages stats_zoom,stats_full` (`eager_load_limit_mb` both at the default and at 0; at 100 million rows even the
+default makes every column windowed). Before = `main` (8b28cb6); after = `feat/53-chunked-stats`. Time in seconds, memory in MB (peak RSS up to
+that stage). The RSS at the start of the stage was about 1,350 MB (the resident memory after drawing).
+
+| Stage | Setting | Before: time | Before: peak | After: time | After: peak |
+|---|---|---:|---:|---:|---:|
+| `stats_full` | default | 0.75 | 4,332 | 1.02 | 1,592 |
+| `stats_full` | 0 | 2.70 | 3,019 | 1.02 | 1,598 |
+| `stats_zoom` | default | 0.03 | 1,357 | 0.02 | 1,355 |
+| `stats_zoom` | 0 | 0.03 | 1,388 | 0.02 | 1,358 |
+
+- The peak memory of `stats_full` stayed within the resident memory after drawing plus about 250 MB (before, it was +1.7 to 3 GB).
+  This matches the target (resident plus a few hundred MB).
+- Time was 1.36× the earlier default (0.75 s), within the 1.5× target. It is faster than the earlier setting 0 (2.7 s). Before, the times
+  differed greatly between the default and 0; the cause was not investigated (probably a difference in the file-cache state).
+- `stats_zoom` (displayed range 1/1000) is the same or faster.
+- It was not necessary to return to the cached path (`read_uncached` stays).
+
+#### 53.5 Relations to other domains
+
+- **Analysis** (analysis, statistics chapter and the statistics dialog): the displayed values and form are unchanged.
+- **App foundation** (app 46.5, the statistics failure path; 46.6 (2), the watch): remove "statistics over the whole" from the list of
+  excluded operations in 46.6.
+- **36.8 in this document**: the windowed-column read paths gain `read_uncached` (the only way through the cache stays `window`).
+
 ## Relations to other domains
 
 - **Plots** ([plots.md](./plots.md)): drawing series uses this document's downsampling, windowed reads and
   pyramid (`TimePlotWidget._redraw_series`). Switching the time-axis column (4.2) calls `set_x_data`/`go_home`
   on every time-domain plot.
-- **Analysis** ([analysis.md](./analysis.md)): statistics, FFT and XY read raw data of a range with
-  `MainWindow.variable_window` (even windowed columns are never held whole).
+- **Analysis** ([analysis.md](./analysis.md)): FFT and XY read raw data of a range with
+  `MainWindow.variable_window` (even windowed columns are never held whole). Statistics on windowed columns or windowed derived
+  variables are aggregated in chunks in the background with `chunked_stats` (ch. 53); other statistics use `variable_window`.
 - **Expressions** ([expressions.md](./expressions.md)): derived variables are evaluated via `LazyVariables`,
   materializing only the columns the expression refers to.
 - **Persistence** ([persistence.md](./persistence.md)): settings such as `eager_load_limit_mb`, recently used
@@ -901,3 +1071,6 @@ improve the implementation** (it only measures).
   (`set_time_column`).
 - **App foundation** (ch. 30): the start, completion and failure of background work are recorded as `job` in the
   operation log.
+- **Persistence** (persistence ch. 54, 2026-10-14): a signal alias adds the same `Column` under the alias to `_file_columns` after the file
+  is opened (no copy). The time-axis selection and a view's `time_column` are also resolved through the alias. The choices for variables are
+  built from the "names shown in the list" (54.2).

@@ -4,8 +4,8 @@ import json
 import math
 import os
 import sys
-from datetime import datetime
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from .. import config

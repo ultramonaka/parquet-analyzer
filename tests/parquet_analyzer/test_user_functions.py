@@ -8,7 +8,11 @@ import os
 import numpy as np
 import pytest
 
-from parquet_analyzer.core.expression import ExpressionError, evaluate_expression, referenced_functions
+from parquet_analyzer.core.expression import (
+    ExpressionError,
+    evaluate_expression,
+    referenced_functions,
+)
 from parquet_analyzer.core.functions import FunctionRegistry, UserFunction, validate_user_function
 from parquet_analyzer.core.maps import LookupTable
 from parquet_analyzer.io import user_functions as uf_io

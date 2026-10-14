@@ -4,6 +4,7 @@ import gc
 
 import numpy as np
 import pytest
+from waiting import wait_until
 
 from parquet_analyzer.core.expression import ExpressionError
 from parquet_analyzer.ui.main_window import MainWindow
@@ -31,9 +32,8 @@ def test_adding_many_plots_and_waveforms_does_not_crash(qapp, isolated_config, s
         for name in names:
             win._on_variable_dropped(plot, name)
 
-    for _ in range(100):
-        qapp.processEvents()
-
+    # real-time wait (slow CI): every plot's downsample jobs must be delivered and released
+    wait_until(lambda: all(p.pending_downsample_count() == 0 for p in plots) and not win._busy_sources)
     gc.collect()
     for plot in plots:
         assert plot.pending_downsample_count() == 0, "a downsample worker was never released"

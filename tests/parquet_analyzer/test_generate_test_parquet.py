@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pyarrow.parquet as pq
-
 from generate_test_parquet import COLUMNS, generate, parse_size
 
 

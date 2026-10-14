@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
 import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
+from waiting import wait_until
 
 from parquet_analyzer.ui.plot_widget import TimePlotWidget
 
@@ -130,8 +132,7 @@ def test_downsampling_runs_off_thread_and_progress_signals_fire(qapp):
     plot.downsampleFinished.connect(lambda: events.append("finish"))
 
     plot.add_series("a", x, y)  # first series: triggers the initial full-range redraw
-    for _ in range(50):
-        qapp.processEvents()
+    wait_until(lambda: events.count("start") >= 1 and plot.pending_downsample_count() == 0)
 
     assert events.count("start") >= 1
     assert events.count("start") == events.count("finish")
@@ -366,3 +367,188 @@ def test_all_nan_series_falls_back_to_default_range(qapp):
     qapp.processEvents()
     x_range, y_range = plot.getViewBox().viewRange()
     assert all(np.isfinite(x_range)) and all(np.isfinite(y_range))
+
+
+# -- "A" button: fit Y once (plots 5.40 / 47) ---------------------------------------------
+
+
+def _teardown(qapp, *plots):
+    """Let background draws finish and stop the redraw debounce before closing, so no queued
+    timer fires on a closed widget (it would break later tests in the same process)."""
+    assert wait_until(lambda: all(p.pending_downsample_count() == 0 for p in plots))
+    for p in plots:
+        p._redraw_debounce.stop()
+        p.hide()
+
+
+def _click_a_button(qapp, plot):
+    """Press pyqtgraph's "A" button through Qt's real routing (viewport mouse click)."""
+    from PySide6.QtTest import QTest
+
+    btn = plot.getPlotItem().autoBtn
+    # Let queued range/layout events run first: pyqtgraph's updateButtons() hides the button
+    # again on every view-state change (it is only shown while hovered), which on a slower
+    # machine (Ubuntu CI) happened between show() and the click (app 51.2).
+    qapp.processEvents()
+    btn.show()  # force it visible instead of hovering; no event processing until the click
+    scene_pt = btn.mapToScene(btn.boundingRect().center())
+    pos = plot.mapFromScene(scene_pt)
+    assert btn.isVisible()
+    QTest.mouseClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=pos)
+    qapp.processEvents()
+
+
+def _sine_plot(qapp, n=20_000):
+    plot = _make_plot(qapp)
+    x = np.linspace(0.0, 10.0, n)
+    plot.add_series("sine", x, np.sin(x))
+    assert wait_until(lambda: plot.pending_downsample_count() == 0)
+    return plot, x
+
+
+def test_a_button_with_cursor_fits_y_to_data_and_stays_put(qapp):
+    plot, x = _sine_plot(qapp)
+    plot.add_cursor("c1", 5.0)
+    plot.setYRange(-500, 500, padding=0)
+    _click_a_button(qapp, plot)
+    y_lo, y_hi = plot.getViewBox().viewRange()[1]
+    assert -1.2 < y_lo < -0.9 and 0.9 < y_hi < 1.2
+    _drain(qapp, iterations=40)  # an auto range would keep growing here
+    assert plot.getViewBox().viewRange()[1] == pytest.approx([y_lo, y_hi])
+    assert plot.getViewBox().state["autoRange"] == [False, False]
+    _teardown(qapp, plot)
+
+
+def test_a_button_fits_only_visible_x_range_and_leaves_x_alone(qapp):
+    plot, x = _sine_plot(qapp)
+    plot.setXRange(0.0, 0.5, padding=0)
+    plot.setYRange(-50, 50, padding=0)
+    assert wait_until(lambda: plot.pending_downsample_count() == 0)
+    x_before = plot.getViewBox().viewRange()[0]
+    _click_a_button(qapp, plot)
+    (x_lo, x_hi), (y_lo, y_hi) = plot.getViewBox().viewRange()
+    assert [x_lo, x_hi] == pytest.approx(x_before)
+    assert -0.1 < y_lo < 0.05 and 0.4 < y_hi < 0.6  # sin on [0, 0.5] is 0..0.48
+    _teardown(qapp, plot)
+
+
+def test_a_button_ignores_hidden_series_and_does_nothing_when_nothing_to_fit(qapp):
+    plot, x = _sine_plot(qapp)
+    plot.add_series("big", x, np.sin(x) * 100.0)
+    assert wait_until(lambda: plot.pending_downsample_count() == 0)
+    plot.set_series_visible("big", False)
+    plot.setYRange(-500, 500, padding=0)
+    _click_a_button(qapp, plot)
+    assert plot.getViewBox().viewRange()[1][1] < 2.0  # the hidden x100 series is not used
+
+    plot.set_series_visible("sine", False)
+    plot.setYRange(-7, 7, padding=0)
+    _click_a_button(qapp, plot)
+    assert plot.getViewBox().viewRange()[1] == pytest.approx([-7, 7])
+    _teardown(qapp, plot)
+
+
+def test_a_button_without_series_and_with_all_nan_range_does_nothing(qapp):
+    plot = _make_plot(qapp)
+    plot.setYRange(-3, 3, padding=0)
+    _click_a_button(qapp, plot)  # no series: no exception
+    assert plot.getViewBox().viewRange()[1] == pytest.approx([-3, 3])
+    _teardown(qapp, plot)
+
+    plot = _make_plot(qapp)
+    x = np.linspace(0.0, 10.0, 1000)
+    y = np.sin(x)
+    y[x > 5] = np.nan
+    plot.add_series("n", x, y)
+    assert wait_until(lambda: plot.pending_downsample_count() == 0)
+    plot.setXRange(6.0, 9.0, padding=0)
+    assert wait_until(lambda: plot.pending_downsample_count() == 0)
+    plot.setYRange(-4, 4, padding=0)
+    _click_a_button(qapp, plot)
+    assert plot.getViewBox().viewRange()[1] == pytest.approx([-4, 4])
+    _teardown(qapp, plot)
+
+
+def test_a_button_on_windowed_series_uses_drawn_curve_not_window_reads(qapp):
+    class Src:
+        def __init__(self, full):
+            self.full, self.calls = full, []
+            self.pyramid = None
+
+        def window(self, a, b):
+            # Only reads on the UI thread count: a redraw's own worker may legitimately read.
+            if threading.current_thread() is threading.main_thread():
+                self.calls.append((a, b))
+            return self.full[a:b]
+
+        def request_pyramid(self):
+            return None
+
+    plot = _make_plot(qapp)
+    x = np.linspace(0.0, 100.0, 50_000)
+    src = Src(np.sin(x) * 3.0)
+    plot.add_windowed_series("w", x, src, (-3.0, 3.0))
+    assert wait_until(lambda: plot.pending_downsample_count() == 0)
+    plot.setYRange(-100, 100, padding=0)
+    assert wait_until(lambda: plot.pending_downsample_count() == 0)
+    src.calls.clear()
+    _click_a_button(qapp, plot)
+    y_lo, y_hi = plot.getViewBox().viewRange()[1]
+    assert -3.5 < y_lo < -2.5 and 2.5 < y_hi < 3.5
+    assert src.calls == []
+    _teardown(qapp, plot)
+
+
+def test_a_button_changes_only_the_pressed_plot_in_a_linked_grid(qapp):
+    from parquet_analyzer.ui.plot_grid import PlotGridWidget
+
+    grid = PlotGridWidget()
+    grid.resize(900, 700)
+    grid.show()
+    p0 = grid.plots[0]
+    p1 = grid.add_plot()
+    x = np.linspace(0.0, 10.0, 5000)
+    p0.add_series("a", x, np.sin(x))
+    p1.add_series("b", x, np.cos(x) * 10)
+    assert wait_until(lambda: p0.pending_downsample_count() == 0 and p1.pending_downsample_count() == 0)
+    p0.setYRange(-90, 90, padding=0)
+    p1.setYRange(-80, 80, padding=0)
+    x1 = p1.getViewBox().viewRange()[0]
+    _click_a_button(qapp, p0)
+    assert p0.getViewBox().viewRange()[1][1] < 2.0
+    assert p1.getViewBox().viewRange()[1] == pytest.approx([-80, 80])
+    assert p1.getViewBox().viewRange()[0] == pytest.approx(x1)
+    _teardown(qapp, *grid.plots)
+
+
+def test_cursor_items_are_excluded_from_view_bounds(qapp):
+    plot, x = _sine_plot(qapp)
+    plot.add_cursor("c1", 1e6)  # far outside the data
+    vb = plot.getViewBox()
+    cur = plot._cursors["c1"]
+    for item in (cur["line"], cur["label"]):
+        assert item not in vb.addedItems  # ignoreBounds items are not tracked for bounds
+    b = vb.childrenBounds()
+    assert b[0] is None or b[0][1] < 1e5  # X bound does not include the cursor at 1e6
+    _teardown(qapp, plot)
+
+
+def test_a_button_logs_fit_y(qapp, isolated_config):
+    import json
+    from datetime import date
+
+    from parquet_analyzer import config
+    from parquet_analyzer.core import oplog
+
+    oplog.reset()
+    oplog.configure(config.PARQUET_ANALYZER_LOG_DIR, debug=False, app_version="test")
+    try:
+        plot, x = _sine_plot(qapp)
+        _click_a_button(qapp, plot)
+        oplog.flush()
+        text = oplog.log_path_for(date.today()).read_text(encoding="utf-8")
+        ops = [r for r in map(json.loads, text.splitlines()) if r.get("kind") == "op"]
+        assert any(r.get("action") == "fit_y" and r.get("details", {}).get("plot") == "p1" for r in ops)
+        _teardown(qapp, plot)
+    finally:
+        oplog.reset()

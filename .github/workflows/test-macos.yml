@@ -1,0 +1,24 @@
+name: Test (macOS)
+
+# Manual only (app 51.1): the repo is private and macOS minutes count several times
+# Ubuntu's, so this does not run on every push. Run it from the Actions tab or with
+#   gh workflow run test-macos.yml --ref <branch>
+on:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        run: uv run pytest -n auto

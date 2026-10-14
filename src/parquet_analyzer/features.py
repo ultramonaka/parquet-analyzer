@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_FEATURES: dict[str, bool] = {
     "fft": False,  # debugging unfinished (formerly io/settings.py's FFT_ENABLED)
     "independent_x_axis": True,  # turned on 2026-10-02 for the user's real-machine check (ch.24 reviewed)
+    "histogram": True,  # analysis 5.33 / ch.42: ON since 2026-10-06 (user's real-machine check OK)
     "xy_plot": True,  # on 2026-10-03 after review + user check (ch.25 stage 1)
     "xyz_3d": True,  # on 2026-10-03 after review + user check (ch.25.3/25.5)
     "user_functions": True,  # on 2026-10-03 after review + user check (ch.26)
@@ -24,6 +25,8 @@ DEFAULT_FEATURES: dict[str, bool] = {
     "maps": True,  # on 2026-10-03 after review + user check (ch.27)
     "big_c_windowed_derived": True,  # on 2026-10-04: adopted after 36.7 (C: derived variables computed per window)
     "big_d_time_index": True,  # on 2026-10-04: adopted after 36.7 (D: TimeIndex keeps a big ascending time axis on disk)
+    "map_from_xy": True,  # on 2026-10-07 after review + user check of stages 1-2 and 44.9 (ch.44)
+    "map_exclude_points": False,  # analysis 44.13 (8): hidden 2026-10-13 (user found it unclear in the real-machine check)
 }
 
 ENV_VAR = "PARQUET_ANALYZER_FEATURES"

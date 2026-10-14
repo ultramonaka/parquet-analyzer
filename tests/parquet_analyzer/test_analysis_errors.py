@@ -680,7 +680,7 @@ def test_xy_window_without_xy_selection_reports_need_xy(qapp, isolated_config, d
     w = win.open_xy_plot("2d")
     w.recompute()  # incomplete settings: ValueError path -> status, no job
     assert not w.is_computing() and w.status_text()
-    w._y_list.clearSelection()
+    w._y_picker.set_selected([])
     w.recompute()
     assert not w.is_computing()
     assert not slot_errors

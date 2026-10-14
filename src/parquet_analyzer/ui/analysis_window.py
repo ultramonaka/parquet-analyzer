@@ -15,9 +15,9 @@ kept alive by a module-level set until it signals, and the callbacks ignore a cl
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
@@ -107,8 +107,9 @@ class AnalysisWindow(QMainWindow):
     def build_export_figure(self, stamp_lines: list[str], size_px: tuple[int, int]):
         raise NotImplementedError
 
-    def export_stamp_extra(self) -> str | None:
-        """An extra stamp line added before the "exported at" line (25.1)."""
+    def export_stamp_extra(self) -> str | list[str] | None:
+        """Extra stamp line(s) added before the "exported at" line (25.1; the histogram adds
+        several, 42.5)."""
         return None
 
     # -- status --------------------------------------------------------------------
@@ -219,8 +220,10 @@ class AnalysisWindow(QMainWindow):
         lines, metadata = main._image_stamp(datetime.now(), range_override=self._shown_range)
         extra = self.export_stamp_extra()
         if extra:
-            lines.insert(max(len(lines) - 1, 0), extra)
-            metadata["Variables"] = extra
+            extra_lines = [extra] if isinstance(extra, str) else list(extra)
+            at = max(len(lines) - 1, 0)
+            lines[at:at] = extra_lines
+            metadata["Variables"] = " | ".join(extra_lines)
         size_px = (self.width(), self.height())
         try:
             fig = self.build_export_figure(lines, size_px)

@@ -9,12 +9,12 @@ backend interfering with the running Qt app).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Mapping, Sequence
-
 import logging
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ def _to_local_datetime64(x: np.ndarray, offset_s: float) -> np.ndarray:
 def _local_offset_s(x0: float) -> float:
     """Local UTC offset (seconds) at epoch second `x0`."""
     try:
-        return (datetime.fromtimestamp(x0) - datetime.fromtimestamp(x0, timezone.utc).replace(tzinfo=None)).total_seconds()
+        return (datetime.fromtimestamp(x0) - datetime.fromtimestamp(x0, UTC).replace(tzinfo=None)).total_seconds()
     except (OverflowError, OSError, ValueError):
         return 0.0
 

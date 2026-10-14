@@ -93,6 +93,8 @@ def test_notice_does_not_hide_file_or_time_order_labels(qapp, isolated_config, t
 
 
 def test_stats_and_fft_survive_a_failing_synchronous_read(qapp, isolated_config, tmp_path, monkeypatch):
+    # Since data ch.53 only FFT reads synchronously; stats on a windowed column fail inside the worker
+    # (read_uncached), which must look the same in the dialog.
     win = _windowed_win(tmp_path)
     win._on_variable_dropped(win.plot_grid.plots[0], "a")
     _settle(qapp, win)
@@ -102,7 +104,8 @@ def test_stats_and_fft_survive_a_failing_synchronous_read(qapp, isolated_config,
     def bad_window(self, s, e):
         raise OSError("disk gone")
 
-    monkeypatch.setattr(WindowedColumn, "window", bad_window)
+    monkeypatch.setattr(WindowedColumn, "window", bad_window)  # FFT reads through window()
+    monkeypatch.setattr(WindowedColumn, "read_uncached", bad_window)  # stats scans per window in the worker (53.2)
     win.variable_panel.selectAll()
     win._on_stats_requested()  # must not raise
     _wait(qapp, lambda: win.findChildren(StatsDialog))

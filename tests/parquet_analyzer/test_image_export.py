@@ -264,7 +264,7 @@ def test_stamp_includes_view_name_until_a_plain_file_open(win, monkeypatch, samp
 
     from PySide6.QtWidgets import QInputDialog
 
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("myview", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("myview", True)))
     monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
     win.save_view_dialog()
     assert win._image_stamp(datetime.now())[0][0].endswith("|  View: myview")

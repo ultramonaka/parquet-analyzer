@@ -90,7 +90,7 @@ def test_deep_nesting_inside_user_function_body(v):
         ev("deep(a)", v, reg)
 
 
-@pytest.mark.parametrize("func", ["rolling_mean", "rolling_nanmean"])
+@pytest.mark.parametrize("func", ["rolling_mean", "rolling_nanmean", "trailing_mean", "trailing_nanmean"])
 class TestRollingWindow:
     def test_array_window(self, func, v):
         with pytest.raises(ExpressionError, match="scalar"):
@@ -258,9 +258,9 @@ def test_fullwidth_operators_parentheses_and_spaces_mixed(v):
 # -- disallowed syntax: every one an ExpressionError --------------------------------------------
 
 DISALLOWED = [
-    "a < b", "a == b", "a != b", "a <= 1", "a is b", "a in b",
-    "a and b", "a or b", "not a",
-    "a if b else 1", "1 if True else 2",
+    # comparisons / and / or / not / conditional expressions are allowed since 43 (see
+    # test_expression_conditionals.py); `is` / `in` / True stay rejected
+    "a is b", "a in b", "a is not b", "a not in b", "a < b is c", "1 if True else 2",
     "a[0]", "a[1:3]", "a['x']",
     "a.real", "a.sum()", "(1).real",
     "[1, 2]", "(1, 2)", "{1: 2}", "{1, 2}", "[x for x in a]",

@@ -4,7 +4,7 @@ import itertools
 import logging
 import time
 import weakref
-from typing import Callable
+from collections.abc import Callable
 
 from PySide6.QtCore import QObject, QThreadPool, Signal
 

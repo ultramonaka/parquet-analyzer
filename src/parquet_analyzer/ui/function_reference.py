@@ -12,8 +12,8 @@ opened from (`target_provider`; the expression bar or the function manager's exp
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
@@ -42,6 +42,8 @@ BUILTIN_DOCS: dict[str, tuple[str, str, str]] = {
     "delta": ("analysis", "delta(a)", "delta(sine)"),
     "rolling_mean": ("analysis", "rolling_mean(a, n)", "rolling_mean(sine, 20)"),
     "rolling_nanmean": ("analysis", "rolling_nanmean(a, n)", "rolling_nanmean(with_nan, 20)"),
+    "trailing_mean": ("analysis", "trailing_mean(a, n)", "trailing_mean(sine, 20)"),
+    "trailing_nanmean": ("analysis", "trailing_nanmean(a, n)", "trailing_nanmean(with_nan, 20)"),
     "sin": ("trig", "sin(a)", "sin(sine)"),
     "cos": ("trig", "cos(a)", "cos(cosine)"),
     "tan": ("trig", "tan(a)", "tan(sine)"),
@@ -55,6 +57,8 @@ BUILTIN_DOCS: dict[str, tuple[str, str, str]] = {
     "min": ("compare", "min(a, b)", "min(sine, cosine)"),
     "max": ("compare", "max(a, b)", "max(sine, 0)"),
     "clip": ("compare", "clip(x, lo, hi)", "clip(sine, -0.5, 0.5)"),
+    "where": ("conditional", "where(c, a, b)", "where(sine > 0, sine, 0)"),
+    "isnan": ("conditional", "isnan(a)", "isnan(with_nan)"),
 }
 
 # operator -> (description key suffix, example)
@@ -66,9 +70,14 @@ OPERATORS: dict[str, tuple[str, str]] = {
     "**": ("pow", "sine ** 2"),
     "%": ("mod", "ramp % 60"),
     "//": ("floordiv", "ramp // 60"),
+    # conditionals (expressions.ja.md 43.3); these keys are also used as the signature text
+    "< <= > >= == !=": ("compare", "sine > 0"),
+    "and / or / not": ("logic", "sine > 0 and cosine > 0"),
+    "a if c else b": ("ifexp", "sine if sine > 0 else 0"),
 }
+_ARITHMETIC_OPERATORS = ("+", "-", "*", "/", "**", "%", "//")
 
-_BUILTIN_CATEGORIES = ("basic", "analysis", "trig", "explog", "round", "compare")
+_BUILTIN_CATEGORIES = ("basic", "analysis", "trig", "explog", "round", "compare", "conditional")
 _ALL_CATEGORIES = _BUILTIN_CATEGORIES + ("operator", "user", "curve", "map")
 
 
@@ -104,7 +113,8 @@ def build_entries(registry) -> list[ReferenceEntry]:
         cat, sig, example = BUILTIN_DOCS[name]
         entries.append(ReferenceEntry(cat, name, sig, tr(f"fnref.desc.{name}"), example))
     for op, (key, example) in OPERATORS.items():
-        entries.append(ReferenceEntry("operator", op, f"a {op} b", tr(f"fnref.op.{key}"), example))
+        sig = f"a {op} b" if op in _ARITHMETIC_OPERATORS else op
+        entries.append(ReferenceEntry("operator", op, sig, tr(f"fnref.op.{key}"), example))
     for name, fn in registry.user_functions.items():
         sig = f"{name}({', '.join([*fn.params, *(f'{c}={_fmt(v)}' for c, v in fn.constants)])})"
         entries.append(

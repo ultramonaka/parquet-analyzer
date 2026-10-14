@@ -87,6 +87,33 @@ settings file and settings menu, persisting the window layout.
   exception text and hard to understand). Low priority.
 - Details in [ch. 35](#35-validating-the-shape-of-view-files-added-2026-10-02-from-fact-checking-an-external-review).
 
+#### 5.42 Overwriting an existing view by choosing it when saving (added 2026-10-13, user request)
+- Today, "View ▾ → Save..." requires typing the name every time, and overwriting the same view means typing the same name again.
+  Also, typing a name that already exists **overwrites it without confirmation**.
+- In the save dialog, the user can **type a new name**, or **choose an existing view from the list**.
+  - The initial value is the name of the current view (the view last loaded or saved). If there is no current view, it is empty.
+  - When an existing name is chosen (or typed), **an overwrite confirmation is always shown**, even when it is the same name as the current view
+    (2026-10-13, user decision).
+- The content saved, the file format and the naming rules do not change.
+- Details in [ch. 49](#49-overwriting-an-existing-view-by-choosing-it-when-saving-added-2026-10-13-user-request).
+
+#### 5.47 Signal aliases (names that exist only inside this app) (added 2026-10-14, user request)
+- Even for the same kind of measurement, the signal name can differ between files (for example `EngSpd` and `NE_rpm`). Each time, a view's
+  signal is not found (today only a warning is shown), and the view has to be rebuilt by hand. Also, the user wants to refer to hard-to-read
+  column names by another name that exists only inside this app.
+- **One dictionary of aliases** for the whole app (2026-10-14, user decision): a list of "alias ← candidate original column names (in priority order)".
+  When a file is opened, the first candidate that exists in that file gives the alias. The file itself is not rewritten.
+  - Views are saved with the alias, so the same view works as is on files whose signal names differ.
+- For a column that has an alias, the variable list and similar places show **only the alias** (the original name can be seen in the tooltip).
+  The original name can still be used in expressions.
+- The dictionary is edited (added, edited, deleted) in a **dedicated editing window** ("Signal aliases"). It can also be opened from the right-click
+  "Add alias..." on a column in the variable list.
+- When a view is loaded and a signal is not found, the warning offers "**Assign a substitute signal...**", which lets the user choose a column of the
+  current file for each missing name. The chosen assignments are added to the dictionary, and the view is reloaded.
+- Each alias can be turned on or off as "enabled", and a global switch "Use signal aliases" turns them all off at once (the definitions are kept;
+  2026-10-14, user request, 54.9).
+- Details in [ch. 54](#54-signal-aliases-added-2026-10-14-user-request).
+
 ## Design
 
 ### 8. View JSON schema
@@ -183,6 +210,14 @@ recording a 1-minute burst at 10 ms intervals every 16 hours, about 13.15 millio
   file's values. Regression tests:
   `test_load_view_applies_matching_variables_even_when_others_are_missing`,
   `test_load_view_recomputes_derived_variables_from_the_newly_opened_file`
+  (`tests/parquet_analyzer/test_load_robustness.py`).
+- **Wording of the grouped warning** (2026-10-09, backlog item 33; found by the tests of old views in A4): previously, a derived variable that
+  could not be restored appeared **twice**, once as "derived variable" and once as "the series that drew it", and the heading did not fit when
+  the cause was a missing function or map. The fixed form: the heading is "View "…": the following items could not be restored (the rest has been
+  restored)". Each item appears once (a derived variable that was skipped does not also list its series). Items whose reason is known get it in
+  parentheses: a missing function or map → "function/map "…" is missing"; a series that is in neither the file nor the derived variables → "not in the
+  open file"; the time-axis column → one line as before. Regression test:
+  `test_load_view_warning_lists_each_skipped_item_once_with_its_reason`
   (`tests/parquet_analyzer/test_load_robustness.py`).
 - **`load_view` also called `load_parquet` (a full re-read from disk) when the open file was
   exactly the source file the view records, just as when nothing was open** (found and fixed
@@ -293,6 +328,8 @@ recording a 1-minute burst at 10 ms intervals every 16 hours, about 13.15 millio
 - For `saveState()`/`restoreState()` to work, the target `QDockWidget`/`QToolBar` must have a
   unique `objectName` (a Qt requirement). It is set explicitly on `MainWindow._variable_dock`
   (`"variable_dock"`) and the main toolbar (`"main_toolbar"`).
+  (2026-10-13) The toolbars are now two, `"file_view_toolbar"` and `"analysis_toolbar"`, and `saveState(1)`/`restoreState(state, 1)` attach a
+  version number. A saved state that contains the old `main_toolbar` is discarded and the default arrangement is used (app foundation 48.3).
 - The variable panel's default position is the **left side** of the window
   (`Qt.DockWidgetArea.LeftDockWidgetArea`).
 - Startup sequence: right after `_build_layout()`/`_build_actions()` build the default layout, the
@@ -452,6 +489,235 @@ never damages the previous file. A failed save never crashes the screen.**
   file name) or an object with a broken `__str__`. The log viewer shows malformed records raw, one
   at a time.
 
+### 49. Overwriting an existing view by choosing it when saving (added 2026-10-13, user request)
+
+Requirement: [5.42](#542-overwriting-an-existing-view-by-choosing-it-when-saving-added-2026-10-13-user-request).
+
+#### 49.1 Entering the name (`MainWindow.save_view_dialog`)
+- Replace `QInputDialog.getText` with `QInputDialog.getItem(self, tr("toolbar.save_view_title"), tr("view.name_label"), items,
+  current, editable=True)`. `items` is `view_io.list_views()` (sorted). If the current view `self._view_name` is in the list, its
+  position becomes `current`; if not (unsaved or deleted), an empty item `""` is added at the top of the list and selected
+  (so that the combo's first display is empty; an empty item is not accepted as a name).
+  - Name entry is collected in a small function `_ask_view_name() -> str | None` (cancel or empty gives `None`; leading and trailing spaces are removed).
+- Overwrite confirmation: if the name is in `list_views()` (even if it is the same as `self._view_name`), show the `messages` confirmation
+  (`view.overwrite_confirm`, "\"{name}\" already exists. Overwrite it?"). If "No", nothing is saved (the name entry is not shown again; start
+  again from "Save...").
+- Name checks, saving, the handling of failures, `log_op("save_view", ...)`, and updating `self._view_name` after saving stay as they are.
+  `overwrite=True/False` is added to the `log_op` record.
+- Dialog title: the current `toolbar.save_view` (it became "Save..." in ch. 48) is not suitable as a title, so the new key
+  `toolbar.save_view_title` ("Save view") is used. Other message titles in `save_view_dialog` use the same key.
+
+#### 49.2 Test plan
+- The list shows the view names; when the current view exists it is selected first, and when it does not, the empty item is selected (check the arguments of `getItem`).
+- New name → saved without confirmation. Another existing name → confirmation appears; "Yes" overwrites, "No" writes nothing (the file's content and
+  modification time do not change). Confirmation also appears for the same name as the current view.
+- Cancel, empty, or whitespace only → nothing happens.
+- Existing tests that replace `QInputDialog.getText` to save views (`test_view_errors.py` and about a dozen other files) are changed to `getItem`
+  (and `side_effects_helper.py`). `getText` used for things other than saving views, such as expression input, is not changed.
+- English and Japanese translations exist.
+
+### 54. Signal aliases (added 2026-10-14, user request)
+
+Requirement: [5.47](#547-signal-aliases-names-that-exist-only-inside-this-app-added-2026-10-14-user-request). Background: idea.md "view", item
+"when a signal is not found, assign a substitute signal" (after the impact was investigated on 2026-10-13, the specification was held, recommending
+option (B), "attach an alias to a file column"). Decision (2026-10-14, user): option (B), one dictionary for the whole app, the list shows only
+aliases, and assignment can be made both from the dedicated editing window and from the view's warning.
+
+**The implementation is split into two stages** (one stage = one branch): **stage 1** = 54.1 to 54.5 and 54.9 (dictionary, resolution, display in the
+list, editing window, marks in the view manager, enable/disable), **stage 2** = 54.6 (assignment from the view's warning).
+
+#### 54.1 Dictionary and storage (`io/signal_aliases.py`, new; pure resolution function in `core/signal_aliases.py`)
+- Storage path: `cfg/parquet_analyzer/signal_aliases.json` (how the path is built is in 54.8; a place that is not mixed into the view list `list_views`).
+  ```json
+  {"version": 1, "aliases": [{"alias": "engine_speed", "sources": ["EngSpd", "NE_rpm"]}]}
+  ```
+  - `alias`: a non-empty string (leading and trailing spaces removed). `sources`: one or more non-empty strings, no duplicates, **the order is the priority**.
+  - Aliases do not duplicate each other (case-sensitive, as column names are).
+  - An alias need not be a valid identifier (treated like a column name). If it is not an identifier, the editing window only warns "cannot be used in expressions"
+    (conversely, giving an identifier alias to a column whose name is not an identifier makes it usable in expressions, which also avoids the limit in 13.4).
+  - An alias does not overlap the names of built-in functions, user functions or maps (`MainWindow.reserved_names()`, since inside an expression they cannot be told apart from functions).
+  - **The reverse is also checked** (2026-10-14, specification review): the name checks when a user function or map is newly created or renamed
+    (`function_manager`, `map_manager`; today they look at `_file_columns`, `_derived` and `reserved_names()`) include **all aliases in the dictionary**
+    (whether or not they are attached in the current file, because the dictionary is one for the whole app and aliases attach when another file is opened).
+  - `sources` is matched only against the file's actual column names. **Aliases do not chain** (even if another alias's name is among the candidates,
+    it is not used when no column of that name exists in the file).
+- Loading: if the file does not exist, the dictionary is empty. If the shape is wrong or the JSON cannot be read, the original file is renamed to
+  `signal_aliases.json.bad-<YYYYmmdd_HHMMSS>` and set aside, as for user functions (26.3); the dictionary starts empty and a warning is shown once.
+  Per-item errors (empty alias, duplicates, etc.) skip only that item and are collected into the warning. Unknown keys are ignored (as in ch. 8).
+- Writing uses a temporary file and replacement (the same method as the settings file). If it fails, the dictionary is left unchanged and an error is shown.
+
+#### 54.2 Resolution (when opening a file, changing the time axis, reading a view)
+- Pure function `resolve_aliases(columns: Sequence[str], aliases) -> dict[str, str]` (alias → original column name):
+  - For each alias, look through `sources` from the top and make the first one that is in `columns` the original column. If none, the alias is not attached.
+  - **If a column with the same name as the alias exists in the file, that alias is not attached** (the file's column wins; the editing window shows "not used in this file
+    (a column with the same name exists)").
+  - One column may have several aliases (they all point to the same column).
+- After `MainWindow` builds the file's columns (`_file_columns`), it adds the aliases as **the same `Column` object** (`_file_columns[alias] = _file_columns[source]`;
+  not copied, so memory, windowed reads and caches are shared with the original column). It also keeps `self._alias_sources: dict[str, str]` (alias → original column name).
+  - As a result, series, expressions (`LazyVariables`, `DerivedColumn`), statistics, XY, histograms and export treat an alias as an ordinary column name
+    (no change is needed on each side).
+  - Time axis: aliases are also shown in the time-axis column selection (combo) (the original name is not shown); choosing an alias makes its original column the time axis.
+    The view's `time_column` (ch. 33) is also resolved through aliases. An alias of the column chosen as the time axis is not shown in the variable list, just like the original column.
+  - **How the time-axis name is held** (2026-10-14, specification review): `_time_column` stays the **original column name** (the data itself; `_time_indexes`,
+    `_build_time_index` and `read_columns` read by the original name). One function that returns the display name (e.g. `_display_name(source)`: the first
+    alias by name order if any is attached, otherwise the original name) is created, and **the combo display, `_sync_time_axis_combo`, the `time_column` saved in views,
+    and the `time_column` in the operation log** use the display name (saving the original name in a view would make the time axis not found in a file with different signal names).
+    `set_time_column(name)` first converts `name` back to the original name, and only then makes the existing comparison (`name == self._time_column`); the combo's
+    `currentTextChanged` passes the display string (that is, the alias).
+  - **Excluding the time axis**: today `_raw_variables` excludes only the time-axis column (`k != name`). After aliases are added, **the original column and all of its aliases**
+    are excluded (so that the time-axis column stays invisible to expressions, XY, histograms and statistics as before). The check in 54.5 uses the same rule.
+- **Put the building of `_raw_variables` in one place** (2026-10-14, specification review): today `{k: v for k, v in self._file_columns.items() if k != time axis}` is
+  written in three places: `load_parquet`, `set_time_column` and `load_view`. Make one function (e.g. `_rebuild_raw_variables()`, which excludes the time-axis original
+  column and its aliases and, for `set_time_column`, re-adds the virtual-variable cache) and call it from the three places.
+- **Names shown in lists** (one place, e.g. `MainWindow.visible_column_names()`): from the file's columns, remove the original columns that have an alias, and add the aliases
+  (the order puts the alias in the position of the original column; if one column has several aliases, by alias name order). Places that use it: the variable list
+  (`variable_panel.set_variables`), the time-axis combo, and the variable choices of XY, histograms and the like (places that build them from the keys of `_raw_variables` or
+  from the variable list today). **The original column names disappear from the lists only; they can still be used in expressions and views as before** (they stay in `_file_columns`).
+  - Places that today use the keys of `_raw_variables` directly as choices (as of 2026-10-14): the variable list of `histogram_window.py` (`_raw_variables.keys()`), the
+    X, Y (and Z) choices of `xy_plot_window.py` (two places), and `variable_panel.set_variables` in `MainWindow` (three places; fixed together with `_rebuild_raw_variables`
+    above). All are replaced by "names shown in lists" (`_raw_variables` also holds the original names, so without this the original names would appear). Places that fetch
+    values (`_raw_variables.get(name)`) stay as they are.
+- Variable list items: the display string is the alias itself (some places use the item string as a variable name, so no decoration is added after it).
+  The tooltip says "original column: EngSpd". Filtering (search) also matches the original name.
+- Virtual variable with the same name as an alias: rejected, as with "a column cannot have the same name as a virtual variable" today (all aliases in the dictionary
+  are checked, 54.8; when loading a view, it is skipped with the current warning).
+- Operation log: the aliases attached are recorded in the post-operation state record (`file_info` of `_state_snapshot`, the `result` of 30.2) as
+  `aliases={"engine_speed": "EngSpd"}` (2026-10-14, specification review. The rule is that `log_op("load_parquet")` is written at the start of the process, and at that point the
+  aliases are not yet decided, so they are not added to the `load_parquet` record).
+
+#### 54.3 Variable list and saving views
+- If an alias is put into a plot, the series name is the alias (the legend, hover, cursor values, images and the headings of exports also show the alias). It is saved
+  in views with the alias (the view format does not change, and `version` is not raised). Expressions written with the original name are saved with the original name.
+- Right-click in the variable list: on a file column (not a virtual variable), "Add alias...". On a column that has an alias, "Edit alias...". Both open the editing window of
+  54.4 with that column already included as a candidate in a new item (or an existing item) selected.
+
+#### 54.4 Editing window (`ui/signal_alias_manager.py`, new)
+- Entry points: next to "User functions, Maps" on the analysis toolbar, "Signal aliases" (shortcut configurable as `signal_aliases`, no default;
+  added to the order of ch. 48), and the right-click of 54.3. Non-modal, one at a time (as with the map manager window).
+- Left: the list of aliases (the alias and, for the current file, the original column; "—" if none is attached; "a column with the same name exists" if
+  there is one). Buttons "Add" and "Delete".
+- Right: editing the selected alias: the name (`QLineEdit`), the list of candidate column names (in priority order; `QListWidget` plus "Up", "Down", "Delete";
+  candidates are added either by choosing from the current file's columns in a combo (original names that have no alias are also shown) or by typing a name).
+- "Save" and "Revert" (as in the editing of map values, 27.8: enabled only while there are unsaved changes; closing or selecting another alias with unsaved changes asks for
+  confirmation). On save, the checks of 54.1 apply (if they fail, the reason is shown and nothing is saved).
+- **Reflecting a save** (when a file is open): resolve 54.2 again with the new dictionary and compare with before.
+  - Newly attached aliases appear in the list at once.
+  - **If an alias in use disappears or starts pointing to a different column**, the save is refused and the places that use it are shown (the same idea as refusing deletion of
+    a map or user function that is in use). "In use" means: a series name shown in a plot, a name referenced by a virtual variable's expression (`referenced_names`), or a name
+    chosen as the time axis.
+  - **When a new alias with the same name as an existing virtual variable is attached**, the save is also refused, with the reason "overlaps with virtual variable <name>"
+    (2026-10-14, specification review; attaching it as is would make `_file_columns` and `_raw_variables` overwrite each other with the same name; the reverse of
+    "a virtual variable cannot be created with the name of an alias" in 54.2).
+  - Analysis windows (XY, histograms and the like) that use an alias that disappears or changes are closed, as when the file is reopened (25.1).
+  - After reflecting, the variable list and time-axis combo are rebuilt (plots stay as they are; no navigator synchronization is needed).
+- Operation log: `signal_alias_save` (the names of aliases added, deleted or changed), `signal_alias_save_refused` (the name in use and where it is used).
+  `log_op` is written at the start of the save.
+- All wording goes through `tr()` (en and ja).
+
+#### 54.5 "Missing" marks in the view manager (20.2)
+- Include aliases in the set of column names used to judge "missing" (the `available` and `all_columns` that `load_view_dialog` passes to `ViewManagerDialog`).
+  These are the keys of `_file_columns`, so passing the set after the aliases are added matches the resolution in `load_view`. The promise of 20.2 (the marks match what
+  `load_view` actually skips) is kept.
+  - `available` currently excludes the time-axis column with `c != self._time_column`. **The aliases of the time-axis column are also excluded** (the same set as the time-axis
+    exclusion of 54.2; if not excluded, the marks and `load_view` would disagree for a view that uses a time-axis alias as a series).
+
+#### 54.6 Stage 2: assigning from the view's warning
+- When the grouped warning of `load_view` (the current `messages.warning`) contains a **signal that is not found**, add a button "Assign a substitute signal..."
+  (add a warning with a button to `ui/messages`, which returns whether it was pressed). "A signal not found" means a variable name of a series that is not in the file, a
+  time-axis column name, or a name referenced by the expression of a skipped virtual variable (`referenced_names`) that is none of a column, virtual variable, function or map.
+- Pressing it opens the assignment window: one row per missing name, with a choice of the names shown in the current file's list (54.2), plus a combo of original column
+  names (default "Do not assign"). On OK, for each assigned name, add to the dictionary: if an alias with the same name exists, append the column to its `sources`;
+  otherwise add `{"alias": missing name, "sources": [chosen column]}`. Then save (54.1) and reload the same view (`load_view`).
+  - The chosen column may already be an original column with an alias (several aliases on one column, 54.2).
+  - If a missing name overlaps a built-in function and so on (cannot be an alias under 54.1), that row cannot be chosen and the reason is shown.
+- Operation log: `signal_alias_assign_from_view` (the view's name, and the set of assignments).
+
+#### 54.7 Test plan
+- Stage 1:
+  - Round trip of reading and writing the dictionary; no file → empty; broken JSON → set aside as `.bad-` and empty, with one warning; per-item errors (empty, duplicates,
+    no candidate, overlapping a function name) skip only that item; unknown keys are ignored. A failed write leaves the dictionary unchanged.
+  - `resolve_aliases`: priority order of candidates; none present; an alias with a same-named column is not attached; several aliases on one column. (It is also acceptable to add a
+    property test with `hypothesis` that "the original column in the result is always in `columns`, and the alias is never in `columns`.")
+  - Opening a file shows aliases in the variable list and the time-axis combo, and the original names disappear. Tooltip and filtering. The alias column and the original column are the
+    same `Column` object (not copied). An alias put into a plot has the same values as the original column. Expressions can use both the alias and the original name.
+    The same holds for large files (windowed reads).
+  - A view saved with aliases, read in a file whose candidate column names differ, is fully restored (no warning). Also for an alias of the time-axis column.
+  - (Added with the 2026-10-14 specification review) Time axis: choosing an alias in the combo makes `_time_column` the original name, the combo display stays the alias, and the
+    view's `time_column` is saved as the alias. Neither the original name nor the alias of the time-axis column appears in the variable list, the XY or histogram choices, or `_raw_variables`.
+    The original name does not appear in XY or histogram choices. A function or map with the same name as an alias cannot be created (including aliases not attached in the current file).
+    Saving an alias that overlaps a current virtual variable is refused. Attached aliases appear in the operation log's state record (`file_info.aliases`).
+    No chaining (if alias A's candidates contain only alias B's name, A is not attached).
+  - The "missing" marks in the view manager match what `load_view` skips (with and without aliases).
+  - Editing window: add, edit, delete, reorder, save, revert, the unsaved-changes confirmation, validation errors. Saving while a file is open refreshes the list. Deleting or
+    reassigning an alias in use is refused and the places using it are shown (series, expressions, time axis). Analysis windows are closed.
+  - The right-click "Add alias..." and "Edit alias..." appear (not on virtual variables). The toolbar entry and the row for the shortcut in the settings.
+  - Operation side effects (app ch. 45): saving aliases does not change unrelated state. English and Japanese translations.
+- Stage 2: the button appears only when a signal is missing. Assigning and reloading restores the view. The chosen column is added to the candidates of an existing alias, or a new
+  alias is created. A name that overlaps a function name cannot be chosen. "Do not assign" alone leaves the dictionary unchanged.
+- Visual check: take images of the variable list and the editing window without a screen, and confirm.
+
+#### 54.8 Decisions made in implementation and review (2026-10-14, stage 1)
+
+- **Storage path**: not a constant in `config.py`; built by `signal_aliases_path()` in `io/signal_aliases.py` from `config.PARQUET_ANALYZER_CFG_DIR` at the time it is called
+  (as with `user_functions_path()`, so that replacing `isolated_config` in tests takes effect).
+- **Unreadable file** (exists, but cannot be read with `OSError`): not set aside as `.bad-`. Aliases start empty, saving is disabled, and an error is shown
+  (as with `UserFunctionsUnreadable` for user functions).
+- **Skipped items** (empty, duplicate, overlapping a function name, etc.) are kept as they are and not removed, and written back unchanged on the next save (as in 26.3).
+  So items overlapping a reserved name do not appear in the editing window, and a warning is shown at each startup (fix it by editing the file by hand or by renaming the
+  function or map). Per-item warnings are translated with `tr()` and shown **together in one notice** with the startup warnings for functions and maps (the later one does not
+  overwrite the earlier one).
+- **State record**: `file_info` in 54.2 is the `file` of `_state_snapshot()`. `file.aliases` is written only when some alias is attached.
+- **How time-axis names are compared**: the display name of the time axis can change when the dictionary changes (for example, an earlier alias by name order is added to the same
+  column). So whether a name is the time axis is judged by **converting it back to the original name** and comparing with `_time_column` (not by comparing display names with
+  each other; a bug was found in review where, in the XY window, after saving the time axis became an "unusable variable").
+- **When the time-axis column has several aliases**: the time-axis combo shows only the display name of that column (the first by name order). (Showing all of them would make
+  choosing another alias revert to the display name, which is confusing.) The other aliases can still be used in expressions, series and the view's `time_column` as before.
+- **Virtual variable names**: a name that equals **any alias in the dictionary** cannot be used (whether or not it is attached in the current file; the same reason as for functions and maps:
+  the dictionary is one for the whole app, and aliases attach when another file is opened). When a view is loaded, a virtual variable with an alias's name is skipped, reported in the
+  grouped warning, and the "missing" mark in the view manager uses the same judgement (20.2).
+- **Narrowing the variable list**: the variable list has no search field, so "filtering also matches the original name" in 54.2 has no target. The search of the Y choice of XY
+  (`name_picker.py`) matches only the display name (the alias).
+- **Editing window**: "Delete" saves **immediately** after confirmation (going through the same refusal checks as a save). "Add" creates a new unsaved row. After saving, when editing starts
+  again, the "Saved" message is cleared.
+- **Conditions for closing analysis windows** (54.4): in addition to aliases that disappear or are reassigned, also when a name that is no longer shown in the list after the change is used
+  (for example, the original name hidden by a new alias) (closing is the safer choice).
+- **Deleting a time-axis alias**: if the time-axis column has aliases a and b and the display is a, deleting a is refused as "in use as the time axis" (b could stand in for it, but
+  by the rule for "aliases in use" in 54.4; to be reconsidered if needed).
+- The message when a time-axis column cannot be created (`time_axis.failed`) uses the display name. The time-axis metadata in the export of histogram bin values stays the original column
+  name (to record which column it was built from).
+
+#### 54.9 Enabling and disabling aliases (added 2026-10-14, user request; included in stage 1)
+
+Background: the user wants to stop an alias temporarily while keeping its definition (today the only option is deleting it). Decision (2026-10-14, user): **a per-alias "enabled" check**
+and **a global switch "Use signal aliases"** are both added.
+
+- **Per alias enabled**: an `"enabled"` key (true or false, default `true`; `true` if the key is missing) is added to the dictionary item. `version` stays 1
+  (older versions ignore this key and treat the alias as enabled, under the rule that unknown keys are ignored). A value that is not true or false is skipped as an invalid item (54.1).
+  When writing, `"enabled": false` is written only for `false` (files of enabled items keep exactly the same shape as before).
+- **Global switch**: a setting (`Settings.signal_aliases_enabled`, default `True`, in `settings.json`). It is not kept in the dictionary file
+  (the dictionary holds definitions; the switch is a usage preference).
+- **Resolution** (54.2): if the global switch is OFF, no alias is attached. If ON, aliases with `enabled` `false` are not attached. An alias that is not attached is treated as today's
+  "no candidate column exists" (the original column name appears in the list, and a view that uses the alias finds its signal missing and shows the warning).
+  `resolve_aliases` receives only the enabled items (the pure function's shape does not change).
+- **Name-overlap checks** (54.1, 54.8) cover **all aliases** even when an alias is disabled or the global switch is OFF (because they attach again when turned back on).
+- **Refusal when in use** (54.4): if disabling an alias or turning the global switch OFF would remove an alias that is in use (a series shown, a virtual variable's expression, or the
+  time axis), it is refused like deletion, and the places using it are shown (the settings and dictionary are not changed). The rule for closing analysis windows is the same as in 54.4.
+- **Editing window** (54.4):
+  - An "Enabled" check box at the top of the right-hand editing area (above the name). It is part of the edit like the other fields, and is reflected on "Save" (the unsaved mark and confirmation work the same way).
+  - Left list: disabled aliases are marked "(disabled)" in a faded colour (the status column says "disabled").
+  - A "**Use signal aliases**" check box at the top of the window (the global switch). This one is **applied immediately when pressed** (save the setting and resolve again; if refused, the check
+    box is set back). While OFF, the status column of the left list reads "not used (global switch is OFF)" for all items, and editing and saving items still work as before.
+- **Entry point**: "Use signal aliases" (a check-box item, `toggle_signal_aliases`) is added to "⚙ ▾" (below "Allow fast display"). It works as the check box in the editing window,
+  with the same behaviour and state (a change made from either place is reflected in both).
+- Operation log: the change of enabled state is included in `signal_alias_save`'s changes (`enabled_changed`). The global switch is `signal_aliases_toggle` (`enabled`), and a refusal
+  has the same form as `signal_alias_save_refused` (`reason="toggle"`). `log_op` is written first.
+- State record: `file.aliases` contains only the attached aliases (as now). The setting `signal_aliases_enabled` appears in the settings record.
+- Tests: round trip of reading and writing `enabled` (missing key → enabled; only `false` is written; non-boolean values are skipped). A disabled alias is not attached and the
+  original column name appears in the list; enabling it again attaches it. With the global switch OFF, all are detached, and ON restores them (saved in settings, and still effective after restart).
+  With disabled or OFF, aliases still remain in the name checks for functions, maps and virtual variables. Disabling an alias in use or turning OFF while in use is refused and nothing
+  changes (the check box goes back). The "⚙ ▾" check box and the editing-window check box show the same state. "(disabled)" display and the unsaved mark in the editing window.
+  Operation log. A view saved with aliases, loaded with the global switch OFF, shows the "not found" warning, and the marks in the view manager match (20.2). English and Japanese translations.
+
 ## Relations to other domains
 
 - **Plots** ([plots.md](./plots.md)): most of a view's content is the plot configuration. When the
@@ -467,3 +733,6 @@ never damages the previous file. A failed save never crashes the screen.**
   changed from the settings dialog.
 - **Expressions** (ch. 26, 27): the view manager's "missing" marks also consider whether functions
   and maps exist and a static check of their arguments.
+- **App foundation** (app ch. 48 and ch. 49 of this document, 2026-10-13): the view save is opened from "View ▾ → Save...". The name is entered with `getItem` (editable), and overwriting an existing view always asks for confirmation. When changing the toolbar wording, do not mix it with the title key of 49.1.
+- **Data, expressions and analysis** (ch. 54, 2026-10-14): signal aliases only add the same `Column` under another name to `_file_columns`, so any code that reads columns by name handles aliases as is. Code that builds variable choices uses "names shown in lists" (54.2) and does not list the keys of `_file_columns` directly (the original names would appear). The name-overlap checks for virtual variables, functions and maps include the aliases.
+- **App foundation** (54.4): the "Signal aliases" toolbar entry, the shortcut `signal_aliases`, and the path `signal_aliases.json` (`config.py`).

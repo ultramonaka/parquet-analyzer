@@ -592,7 +592,7 @@ def test_load_view_with_unusual_plot_shapes(win, qapp, boxes):
 @pytest.mark.parametrize("name", ["x" * 400])
 def test_save_view_dialog_with_too_long_name_warns_instead_of_raising(win, boxes, monkeypatch, name):
     """OSError (File name too long) leaked out of the Qt slot; only ValueError was handled."""
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: (name, True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: (name, True)))
     win.save_view_dialog()
     assert [b[0] for b in boxes] == ["warning"]
     assert view_io.list_views() == []
@@ -601,27 +601,27 @@ def test_save_view_dialog_with_too_long_name_warns_instead_of_raising(win, boxes
 def test_save_view_dialog_with_unwritable_data_dir_warns(win, boxes, monkeypatch):
     config.PARQUET_ANALYZER_DATA_DIR.parent.mkdir(parents=True, exist_ok=True)
     config.PARQUET_ANALYZER_DATA_DIR.write_text("a file, not a folder")
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("v", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("v", True)))
     win.save_view_dialog()
     assert [b[0] for b in boxes] == ["warning"]
 
 
 @pytest.mark.parametrize("name", ["", "   ", "a/b", "a\x00b"])
 def test_save_view_dialog_rejects_or_ignores_bad_names(win, boxes, monkeypatch, name):
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: (name, True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: (name, True)))
     win.save_view_dialog()
     assert view_io.list_views() == []
     assert all(b[0] == "warning" for b in boxes)
 
 
 def test_save_view_dialog_cancelled_writes_nothing(win, boxes, monkeypatch):
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("v", False)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("v", False)))
     win.save_view_dialog()
     assert view_io.list_views() == [] and boxes == []
 
 
 def test_failed_save_of_an_existing_view_keeps_it_loadable(win, qapp, boxes, monkeypatch):
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("v", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("v", True)))
     win._add_variable_to_plot(win.plot_grid.plots[0], "a")
     win.save_view_dialog()
     before = view_io.view_path("v").read_text(encoding="utf-8")
@@ -629,5 +629,5 @@ def test_failed_save_of_an_existing_view_keeps_it_loadable(win, qapp, boxes, mon
     with monkeypatch.context() as m:
         m.setattr(view_io.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "disk full")))
         win.save_view_dialog()
-    assert [b[0] for b in boxes] == ["warning"]
+    assert [b[0] for b in boxes] == ["question", "warning"]  # the overwrite confirm (persistence 49.1), then the failure
     assert view_io.view_path("v").read_text(encoding="utf-8") == before

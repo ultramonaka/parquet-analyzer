@@ -4,6 +4,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from waiting import wait_until
 
 from parquet_analyzer.core.column import LazyColumn, WindowedColumn
 from parquet_analyzer.ui import plot_widget as plot_widget_module
@@ -72,11 +73,8 @@ def test_windowed_series_plots_correct_values(windowed_win, qapp):
     plot.resize(2000, 400)
     windowed_win._on_variable_dropped(plot, "a")
     qapp.processEvents()
-    import time
 
-    for _ in range(50):
-        qapp.processEvents()
-        time.sleep(0.005)
+    wait_until(lambda: not windowed_win._busy_sources and plot.pending_downsample_count() == 0)
 
     real_a = windowed_win.variable_values("a")
     displayed_x, displayed_y = plot._series["a"]["curve"].getData()
@@ -128,11 +126,8 @@ def test_stats_on_windowed_variable_matches_full_column(windowed_win, qapp, monk
 
     monkeypatch.setattr(windowed_win.variable_panel, "selectedItems", lambda: [_Item("a")])
     windowed_win._on_stats_requested()
-    import time
 
-    for _ in range(50):
-        qapp.processEvents()
-        time.sleep(0.005)
+    wait_until(lambda: windowed_win.findChildren(StatsDialog) and not windowed_win._stats_workers)
 
     dialogs = windowed_win.findChildren(StatsDialog)
     assert dialogs
@@ -170,11 +165,8 @@ def test_precision_indicator_shows_when_a_series_falls_back_to_pyramid(windowed_
 
     windowed_win._on_variable_dropped(plot, "a")
     qapp.processEvents()
-    import time
 
-    for _ in range(80):
-        qapp.processEvents()
-        time.sleep(0.005)
+    wait_until(lambda: windowed_win._precision_label.text() != "")
 
     assert windowed_win._precision_label.text() != ""
 
@@ -185,18 +177,13 @@ def test_precision_indicator_clears_once_zoomed_to_a_precise_range(windowed_win,
     plot.resize(1200, 400)
     windowed_win._on_variable_dropped(plot, "a")
     qapp.processEvents()
-    import time
 
-    for _ in range(80):
-        qapp.processEvents()
-        time.sleep(0.005)
+    wait_until(lambda: windowed_win._precision_label.text() != "")
     assert windowed_win._precision_label.text() != ""  # coarse at full zoom-out
 
     x = windowed_win._time_values
     plot.setXRange(x[0], x[0] + (x[-1] - x[0]) * 0.01, padding=0)  # well under the threshold
-    for _ in range(50):
-        qapp.processEvents()
-        time.sleep(0.005)
+    wait_until(lambda: windowed_win._precision_label.text() == "")
 
     assert windowed_win._precision_label.text() == ""
 

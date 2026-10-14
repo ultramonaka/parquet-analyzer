@@ -9,12 +9,11 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QLineEdit, QMessageBox, QSplitter
+from test_functions_maps_ui import CURVE, MAP, _csv, boxes, flags_on, win  # noqa: F401  (fixtures/helpers)
 
 from parquet_analyzer.io import maps as maps_io
 from parquet_analyzer.io.settings import Settings, load_settings, save_settings
 from parquet_analyzer.ui import map_manager
-
-from test_functions_maps_ui import CURVE, MAP, _csv, boxes, flags_on, win  # noqa: F401  (fixtures/helpers)
 
 Yes, No, Cancel = (QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No, QMessageBox.StandardButton.Cancel)
 
@@ -143,7 +142,7 @@ def test_edit_back_to_original_clears_changed_state(win, tmp_path):
     "r, c, text, needle",
     [
         (1, 1, "abc", "row 2, column 2"),
-        (1, 1, "nan", "non-finite"),
+        # "nan" / blank in a value cell is now an empty cell (27.10): see test_maps_empty_cells.py
         (1, 1, "inf", "non-finite"),
         (1, 0, "-5", "row 2, column 1"),  # x of row 2 becomes -5 < 0: descending
         (2, 0, "10", "duplicate"),

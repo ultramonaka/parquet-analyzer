@@ -7,14 +7,14 @@ from datetime import datetime
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QThreadPool, Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import QMenu, QWidget
 
+from .. import features
 from ..core.background_worker import WorkerHub
 from ..core.column import DerivedColumn
 from ..core.downsample import lttb
 from ..core.oplog import log_op
-from .. import features
 from ..io.settings import DEFAULT_SCROLL_BINDINGS, normalize_scroll_bindings
 from .i18n import tr
 
@@ -178,6 +178,7 @@ class TimePlotWidget(pg.PlotWidget):
     seriesVisibilityChanged = Signal(object, str, bool)  # self, name, visible
     seriesLabelClicked = Signal(object, str)  # self, name -- legend name label clicked
     seriesRemoved = Signal(object, str)  # self, name -- left this plot (removed or transferred)
+    seriesChanged = Signal(object, str)  # self, name -- added or replaced (plots 50.2)
     removeSeriesRequested = Signal(object, str)  # context menu "Delete series"
     separateSeriesRequested = Signal(object, str)  # context menu "Separate series into new plot"
     backgroundClicked = Signal(object)  # self -- left click on empty plot area
@@ -222,6 +223,11 @@ class TimePlotWidget(pg.PlotWidget):
         self.scroll_bindings = normalize_scroll_bindings(scroll_bindings)
 
         self._series: dict[str, dict] = {}  # name -> {x, y, curve, color, generation}
+        # One plot-wide source of generation numbers (data 28.4). Each entry keeps the last number
+        # it drew and compares results against it (per series, see _start_series_worker), but the
+        # numbers never repeat across entries, so a held job of a removed/previous-file series
+        # can never match a re-installed series of the same name.
+        self._generation_source = itertools.count(1)
         self._seed_x_range: tuple[float, float] | None = None  # consumed by the next first-series install
         self._coarse_series: set[str] = set()  # names currently shown via a pyramid envelope
         self._color_cycle = itertools.cycle(_COLOR_CYCLE)
@@ -265,6 +271,14 @@ class TimePlotWidget(pg.PlotWidget):
         # drives everything else via wheel zoom / mouse drag pan.
         self.getViewBox().enableAutoRange(x=False, y=False)
         self.getViewBox().sigRangeChanged.connect(self._on_range_changed)
+        # The built-in "A" button would call enableAutoRange() and leave auto range ON; route
+        # it to fit_y() instead (plots 5.40 / 47.1). Hover show/hide stays pyqtgraph's.
+        auto_btn = self.getPlotItem().autoBtn
+        try:
+            auto_btn.clicked.disconnect(self.getPlotItem().autoBtnClicked)
+        except (TypeError, RuntimeError):
+            pass
+        auto_btn.clicked.connect(self.fit_y)
 
     # -- drag & drop (overlay a variable from VariablePanel) --------------------
 
@@ -340,7 +354,7 @@ class TimePlotWidget(pg.PlotWidget):
         visible = bool(data.get("visible", True))
         entry = {
             **{k: v for k, v in data.items() if k != "visible"},
-            "curve": curve, "color": color, "generation": 0, "visible": visible, "selected": False,
+            "curve": curve, "color": color, "generation": next(self._generation_source), "visible": visible, "selected": False,
         }
         self._series[name] = entry
         if not visible:
@@ -371,6 +385,7 @@ class TimePlotWidget(pg.PlotWidget):
         # recompute, so it must happen even when auto_redraw is off.
         self._redraw_series(name)  # no-op for a hidden series (23.1)
         self.refresh_cursor_labels()  # an existing cursor's label should now list this series too
+        self.seriesChanged.emit(self, name)  # (plots 50.2)
 
     def _series_y_bounds(self, entry: dict) -> tuple[float, float]:
         """(lo, hi) for one series' Y — its true extent, or the (inf, -inf)
@@ -445,6 +460,7 @@ class TimePlotWidget(pg.PlotWidget):
         entry["y"] = y
         self._redraw_series(name)
         self.refresh_cursor_labels()
+        self.seriesChanged.emit(self, name)  # (plots 50.2)
 
     def replace_series_source(self, name: str, y_source, y_bounds: tuple[float, float] | None) -> None:
         """Like replace_series_y() but the new data is a windowed source (a DerivedColumn,
@@ -458,8 +474,9 @@ class TimePlotWidget(pg.PlotWidget):
         self._set_series_coarse(name, False)
         self._redraw_series(name)
         self.refresh_cursor_labels()
+        self.seriesChanged.emit(self, name)  # (plots 50.2)
 
-    def transfer_series(self, name: str, target: "TimePlotWidget") -> None:
+    def transfer_series(self, name: str, target: TimePlotWidget) -> None:
         """Move a series to another plot (PlotGridWidget's "separate into a new
         plot"), preserving whether it's windowed or fully resident. series_data()'s
         (x, y, color) can't represent a windowed series (no resident y array to
@@ -689,8 +706,9 @@ class TimePlotWidget(pg.PlotWidget):
         label = pg.TextItem(anchor=(0, 1), color=_CURSOR_COLOR)
         line.setVisible(self._cursor_mode_enabled)
         label.setVisible(self._cursor_mode_enabled)
-        self.addItem(line)
-        self.addItem(label)
+        # Never part of the data bounds (plots 47.2, same as the hover line, 39.1).
+        self.addItem(line, ignoreBounds=True)
+        self.addItem(label, ignoreBounds=True)
         self._cursors[cursor_id] = {"line": line, "label": label}
         line.sigClicked.connect(lambda _line, _ev, cid=cursor_id: self._on_cursor_line_clicked(cid))
         line.sigPositionChanged.connect(lambda _line, cid=cursor_id: self._on_cursor_line_moved(cid))
@@ -1102,6 +1120,33 @@ class TimePlotWidget(pg.PlotWidget):
             y_lo, y_hi = 0.0, 1.0
         self.getViewBox().setRange(xRange=(x_lo, x_hi), yRange=(y_lo, y_hi), padding=0.02)
 
+    def fit_y(self) -> None:
+        """The "A" button: fit Y (only) once to the visible series' drawn curves within the
+        current X range (plots 5.40 / 47.1). Uses the drawn curve data, never the full arrays,
+        so nothing is read on the UI thread; auto range stays off."""
+        log_op("fit_y", plot=self.plot_id)
+        vb = self.getViewBox()
+        x_lo, x_hi = vb.viewRange()[0]
+        if not (np.isfinite(x_lo) and np.isfinite(x_hi)):
+            return
+        y_lo, y_hi = np.inf, -np.inf
+        for entry in self._series.values():
+            if not entry["visible"]:
+                continue
+            xs, ys = entry["curve"].getData()
+            if xs is None or ys is None or len(xs) == 0:
+                continue
+            xs = np.asarray(xs, dtype=float)
+            ys = np.asarray(ys, dtype=float)
+            sel = (xs >= x_lo) & (xs <= x_hi) & np.isfinite(ys)
+            if not sel.any():
+                continue
+            y_lo = min(y_lo, float(ys[sel].min()))
+            y_hi = max(y_hi, float(ys[sel].max()))
+        if not (np.isfinite(y_lo) and np.isfinite(y_hi)):
+            return  # nothing to fit to: leave the range alone (24.8)
+        vb.setRange(yRange=(y_lo, y_hi), padding=0.02)
+
     def redraw(self) -> None:
         """R button/key: force a downsample recompute for the current range."""
         log_op("redraw", plot=self.plot_id)
@@ -1238,7 +1283,7 @@ class TimePlotWidget(pg.PlotWidget):
         X is looked up on the UI thread (a free fancy index, so the job closure holds no array,
         37.3); with a lazy TimeIndex axis the job reads the time values at the same stride grid
         itself (36.8: no per-point reads on the UI thread)."""
-        entry["generation"] += 1
+        entry["generation"] = next(self._generation_source)
         generation = entry["generation"]
         self.downsampleStarted.emit()
         job = y_source.thin_job(lo, hi, n_out)
@@ -1295,13 +1340,14 @@ class TimePlotWidget(pg.PlotWidget):
         entry["curve"].setData(x, y)
 
     def _start_series_worker(self, name: str, entry: dict, job) -> None:
-        # Generation is tracked per series (not per plot): with 2+ overlaid series,
+        # Generation is compared per series (not per plot): with 2+ overlaid series,
         # redrawing all of them in one pass (e.g. from _on_range_changed) used to bump
         # a single plot-wide counter once per series, so every series but the last
         # processed always looked "stale" by the time its own result came back and got
-        # silently discarded. Each series now has its own counter — reused as-is for
-        # the windowed-fetch job below, not just LTTB recompute.
-        entry["generation"] += 1
+        # silently discarded. Each series now keeps its own latest number (drawn from one
+        # plot-wide increasing source, data 28.4) — reused as-is for the windowed-fetch
+        # job below, not just LTTB recompute.
+        entry["generation"] = next(self._generation_source)
         generation = entry["generation"]
         self.downsampleStarted.emit()  # drives the main-window progress indicator
         self._hub.submit(
@@ -1340,7 +1386,7 @@ class TimePlotWidget(pg.PlotWidget):
         still-in-flight real-fetch result from an earlier (more zoomed-in) redraw
         of this same series is correctly discarded as stale if it lands after.
         """
-        entry["generation"] += 1
+        entry["generation"] = next(self._generation_source)
         self._set_series_coarse(name, True)
         x = entry["x"]
         row_starts = pyramid.row_starts

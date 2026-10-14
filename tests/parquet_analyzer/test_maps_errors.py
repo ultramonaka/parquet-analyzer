@@ -143,12 +143,12 @@ def _csv(tmp_path, text, name="t.csv"):
 @pytest.mark.parametrize(
     "text",
     [
-        "0,0\n1,nan\n",
+        "0,nan\n1,nan\n",  # nothing but empty cells (27.10)
         "0,0\n1,inf\n",
         "0,0\n1,-inf\n",
         "0,0\n1,1e999\n",
         "0,0\n1e999,1\n",
-        "0,0\n1,\n",
+        "0,\n1,\n",
         "0,0\n1\n",
         "0,0\n1,2,3\n",
         "0,0\n0,1\n",  # duplicate x
@@ -173,7 +173,7 @@ def test_odd_csv_content_is_map_error(tmp_path, text):
         ",0,1\n0,1,2\n",  # one Y row
         ",0\n0,1\n1,2\n",  # one X value
         ",0,1\n0,1,2\n1,3\n",  # ragged row
-        ",0,1\n0,1,nan\n1,3,4\n",
+        ",0,1\n0,nan,nan\n1,,\n",
         ",0,1\n0,1,2\n0,3,4\n",  # duplicate y
         ",1,0\n0,1,2\n1,3,4\n",  # descending x
         ",0,1\n0,1,2\n1,3,x\n",

@@ -3,7 +3,7 @@
 > 総括仕様: [overview.ja.md](../overview.ja.md)（共通ルール・用語・旧節番号の対応表）。
 > 本書は「要求」→「設計」の順。節番号は旧仕様書の番号をそのまま使っている。
 
-**この分野の範囲**: メイン画面のプロット（マルチプロット・重ね合わせ）、ナビゲータ、ズーム・パン操作、時刻軸の書式、カーソル、プロットの高さ変更・並べ替え・時刻ラベル、系列ごとの選択・削除・表示/非表示、プロットごとのX軸の独立。
+**この分野の範囲**: メイン画面のプロット（マルチプロット・重ね合わせ）、ナビゲータ、ズーム・パン操作、時刻軸の書式、カーソル、プロットの高さ変更・並べ替え・時刻ラベル、系列ごとの選択・削除・表示/非表示、プロットごとのX軸の独立、「A」ボタン（Yを合わせる）。
 
 ## 要求
 
@@ -167,6 +167,27 @@
 - 置いたカーソル（5.13）とは見た目を変え、ラベルが重ならないようにする。画像保存には含めない。
   マウスの移動は操作ログに書かない（ON/OFFだけ記録）。
 - 詳細は[39章](#39-マウスを乗せた位置の値の表示ホバー表示2026-10-03追加ユーザー要望)。
+
+#### 5.40 「A」ボタン（Yを合わせる）（2026-10-08追加、実機での不具合報告から）
+
+- プロットの左下の「A」ボタン（pyqtgraphに付いている自動範囲のボタン。マウスを乗せると出る）を押すと、
+  **そのプロットのYだけ**を、今のXの範囲に見えている系列に**1回だけ**合わせる。Xは変えない（ナビゲータ・
+  連動している他のプロットもそのまま）。押した後も自動範囲は入らず、パン・ズームは今どおり。
+- 不具合（2026-10-08、ユーザー報告）: カーソルを置いた状態で「A」を押すと、Yの範囲が広がり続けて
+  プロットが壊れる。カーソルがなくても、押すとpyqtgraphの自動範囲が入ったままになっていた。
+- 詳細は[47章](#47-aボタンyを合わせる2026-10-08追加実機での不具合報告から)。
+
+#### 5.43 新しいプロットへの間引きの設定・ナビゲータの絵の追従（2026-10-13追加、状態の持ち主の調査から）
+
+- ツールバーの「⚙ ▾」の「簡易表示を許可」（間引き）の今の設定は、**後から作ったプロットにも**効く
+  （「＋ プロット追加」・「新しいプロットへ分ける」・ビューの読み込みで作られるプロット）。
+- ナビゲータの絵（連動している一番上のプロット＝アンカーの、最初の表示中の系列）は、その系列が変わる
+  どの操作の後も今の系列を示す。一番上のプロットの連動を外していても同じ。
+- 不具合（2026-10-13、状態の持ち主の調査で発見・画面なしで再現。idea.md「状態の持ち主の調査の結果」）:
+  (1) 間引きをOFFにしてからプロットを足すと、新しいプロットだけ間引かれる。間引きOFFで保存したビューを
+  読むと、2つ目以降のプロットは間引かれる。(2) 一番上のプロットの連動を外した状態でアンカーへ変数を
+  ドロップしても、ナビゲータの絵が変わらない。
+- 詳細は[50章](#50-新しいプロットへの間引きの設定ナビゲータの絵の追従2026-10-13追加状態の持ち主の調査から)。
 
 ## 設計
 
@@ -684,6 +705,10 @@ x)`として発する。
   - **連動の切替・並べ替え・削除の後も、ナビゲータは連動グループ（アンカー）の現在の範囲を
     表示する**（レビューで判明: 構成が変わるたびに概観波形を作り直す処理が、選択範囲を
     データ全体に戻していた。22章の並べ替えでも起きていた既存の不具合）。
+  - 2026-10-06: 概観の更新の中で範囲を戻す。`_refresh_navigator_overview`が（同期の経路では）
+    毎回、連動グループの範囲へ選択範囲を戻す（派生変数の追加/編集/削除、マップ・関数の変更、
+    先頭プロットへのドロップで、6回目の再発。バックログ14）。ファイルを開く・時間軸の切替は
+    `keep_region=False`で全範囲のまま（ホーム）。
 - 時間軸列の切替（`set_time_axis_data`）は、連動していないプロットも含めて全時間領域
   プロットのX値を差し替えて`go_home`する（従来どおり。連動状態は保つ）。
 - `go_home()`は全プロットの`go_home()`を呼ぶ（従来どおり）。連動していないプロットも
@@ -791,6 +816,99 @@ x)`として発する。
 連動、カーソル、時間軸の切り替え、実際のクリック・ホイール）。不具合の修正には、修正前に失敗する
 回帰テストを付ける。
 
+#### 24.9 ナビゲータの同期を1か所にまとめる（`NavigatorSync`）（2026-10-08追加、バックログ20）
+
+目的: 「ナビゲータの選択範囲が全範囲に飛び、プロットは拡大したまま」の不具合（24.1、6回再発。
+LEARNINGS 2026-10-02・2026-10-06）を、呼び出し側の注意ではなく**構造**で防ぐ。`main_window.py`
+（2155行）の分割の最初の1つ。画面の見た目・操作は変えない（リファクタリング＋下の潜在的な不具合の修正）。
+
+原因の型: `NavigatorWidget.set_overview_data`が毎回選択範囲を全範囲に戻し、`main_window.py`の中で
+概観を描く経路（同期3種類＋非同期2種類、`set_overview_data`の呼び出しは9か所）がそれぞれ範囲を戻す
+必要があった。戻しているのは`_refresh_navigator_overview`の後と`_on_navigator_overview_ready`の中の2か所で、
+新しい経路を足すたびに戻し忘れが起きうる。
+
+**(1) `NavigatorWidget`（`ui/navigator.py`）**
+
+- `set_overview_data(x, y, *, keep_region: bool = True)`: 概観の曲線と範囲の上下限（bounds）を更新する。
+  - `keep_region=True`（既定）: 選択範囲は**今の範囲のまま**（新しい上下限の外にはみ出す分は上下限に収める）。
+    前の概観が無かった（初回）・今の範囲が新しい上下限と全く重ならないときは全範囲にする。
+  - `keep_region=False`: 全範囲にする（ホーム）。
+  - 有限なXが無いときは今までどおり曲線を空にし、範囲には触らない（29.4）。
+- **上下限・範囲の変更で`rangeSelected`を出さない**: pyqtgraphの`LinearRegionItem.setBounds`は、今の範囲が
+  新しい上下限からはみ出すと線を動かし`sigRegionChanged`を出す。今のコードは`setBounds`をシグナルを止めずに
+  呼んでいるため、この経路でプロットの範囲が動きうる（潜在的な不具合）。`setBounds`と範囲の設定は
+  シグナルを止めて行う（`set_selected_range`と同じ扱い）。
+- `rangeSelected`を出すのは利用者のドラッグ/クリックだけ、という規則をdocstringに書く。
+
+**(2) `NavigatorSync`（`ui/navigator_sync.py`、新規）**
+
+`MainWindow`の次のメソッドと状態を移す（中身はほぼそのまま）:
+`_refresh_navigator_overview`・`_refresh_navigator_overview_impl`・`_first_plottable_column`・
+`_set_derived_navigator_overview`・`_on_derived_pyramid_for_navigator`・`_detach_nav_pyramid_listener`・
+`_on_derived_overview_built`・`_on_derived_overview_failed`・`_set_windowed_navigator_overview`・
+`_on_navigator_overview_ready`・`_on_navigator_overview_failed`・`_windowed_navigator_overview`、
+状態`_navigator_overview_gen`・`_nav_pyramid_column`・`_navigator_hub`（`WorkerHub`）。
+
+- 作り方: `NavigatorSync(navigator, hub, *, time_values, raw_variables, data_source, anchor_plot, group_range,
+  set_busy, time_finite_bounds)`——いずれも呼ぶたびに今の値を返す関数（`MainWindow`を丸ごと渡さない。依存を
+  引数で見えるようにする）。`group_range`は`MainWindow._group_x_range`（24.2の「1か所」はそのまま`MainWindow`
+  に置く。統計・ビュー保存・画像保存の記載も使うため）。
+- 公開API:
+  - `refresh(home: bool = False)`: 概観を作り直す（今の`_refresh_navigator_overview(keep_region=not home)`）。
+    ハブ（`WorkerHub`）は今どおり`MainWindow`が作って渡す。
+- **範囲の戻しは1か所**: 概観を`navigator`に渡すのは`NavigatorSync._apply(x, y)`だけにする（同期・非同期の
+  全経路。`set_overview_data`を直接呼ぶ所を他に残さない）。`_apply`は
+  1. `navigator.set_overview_data(x, y, keep_region=not self._home)`、
+  2. ホーム中（`_home`が真）でなく、連動グループの範囲（`group_range()`）があり有限なら、選択範囲をそれに
+     合わせる（シグナルなし）。
+  `_home`は`refresh(home=True)`の同期の部分を描く間だけ真（`try/finally`で戻す）。その後に届く非同期の結果は
+  手順2で連動グループの範囲に合わせる（ファイルを開いた直後はプロットが空で`group_range()`が`None`なので
+  全範囲のまま、時間軸の切替の後はプロットが`go_home`済みで連動グループの範囲＝全範囲）。
+  - （レビューで変更、2026-10-08）最初の版はホーム中も手順2を行っていた。時間軸の切替は`refresh(home=True)`を
+    `set_time_axis_data`（プロットの`go_home`）より**前に**呼ぶため、その時点の連動グループの範囲は古い時間軸の
+    値で、新しい上下限に収めると幅0の範囲になった（後の`go_home`の`rangeChanged`で偶然直るだけで、別の
+    シグナルの順序に頼る隠れた依存）。ホームは定義上全範囲なので、ホーム中は手順2を行わない。
+- 世代番号・`WorkerHub`のジョブ・`_set_busy("navigator", …)`・派生変数のピラミッド待ち（一度きりの
+  リスナー）の規則は今どおり（data 36.6 C・37・40章）。古い世代の結果は捨てる。成功・失敗は1回ずつ報告。
+- `MainWindow`側:
+  - `_refresh_navigator_overview(keep_region=True)`は残さず、呼び出し（ファイルを開く・時間軸の切替・
+    派生変数の追加/編集/削除・関数/マップの変更・`_on_grid_layout_changed`）を`self._nav_sync.refresh(...)`に
+    置き換える。ホームはファイルを開く・時間軸の切替の2か所だけ（`home=True`）。
+  - `navigator.rangeSelected`→`plot_grid.set_x_range`、`plot_grid.rangeChanged`→`navigator.set_selected_range`の
+    接続は`MainWindow`に残す（どちらも1行。表示中の範囲の連携は`MainWindow`の責務のまま）。
+  - 操作ログの状態（`state_snapshot`の`navigator`）は今どおり`navigator.selected_range()`を読む。
+- モジュール構成図（overview 5.1のPlantUML）とディレクトリ一覧に`navigator_sync`を足す（同じコミットで）。
+
+**(3) 移動とコミット**
+
+- CLAUDE.mdの規則7: 「移動だけ」のコミット（メソッドを`NavigatorSync`へ移し、`MainWindow`から委譲するだけ。
+  動作は変えない。テストも全て通る）と、「中身の変更」のコミット（`keep_region`の既定化・`_apply`への集約・
+  `setBounds`のシグナル止め・委譲の撤去）を分ける。
+
+**テスト計画**（`tests/parquet_analyzer/test_navigator_sync.py`、新規。既存の`test_navigator_resync.py`も通ること）
+
+1. `NavigatorWidget`単体: 範囲を一部に設定 → `set_overview_data`（既定）で範囲が変わらない。
+   `keep_region=False`で全範囲。新しい上下限が今の範囲より狭い → 範囲が上下限に収まり、**`rangeSelected`が
+   1度も出ない**（直す前に失敗すること）。初回・重ならないときは全範囲。有限なXが無い → 範囲そのまま。
+2. 同期の全経路（ファイルを開く・時間軸の切替・系列の追加/削除/並べ替え・連動の切替・派生変数の追加/編集/
+   削除・マップの変更）の後、プロットを拡大していればナビゲータの範囲＝連動グループの範囲。ファイルを開く・
+   時間軸の切替の後は全範囲。
+3. **非同期の経路**（バックログ20で足すと決めたもの）: 窓読み込みの列（`WindowedColumn`、行グループが少ない
+   ファイル）で`_on_navigator_overview_ready`の精細化が届いたとき、プロットを拡大していれば範囲が連動グループの
+   範囲のまま。派生変数のピラミッドが届いたときも同じ。結果が届く前に別の概観を要求したら古い結果は捨てられる
+   （世代番号）。失敗したときは粗い概観のまま・`busy`が下りる。テストはワーカーの結果を実時間で待つ
+   （CLAUDE.md: 固定回数のループにしない）。
+4. 構造の確認: `main_window.py`に`navigator.set_overview_data`の呼び出しが無い（ソースを読む簡単なテスト）。
+   `navigator_sync.py`の中でも`set_overview_data`を呼ぶのは`_apply`だけ。
+5. 実際の操作: 拡大したまま上の各経路を通し、そのあとナビゲータの範囲をドラッグ（実際のマウスイベント）して
+   プロットが全範囲に飛ばない。
+
+規模: 大（Sonnet＋reviewer）。WorkerHub・ナビゲータの不変条件に触れる。
+
+- 2026-10-08追加: 概形を決め直すとき（`_refresh_impl`の最初）は、どの経路でも`_gen`を上げて
+  `navigator`の「描画中」の印を消す。メモリに載る列の経路で上がらず、前のファイルの間引きの読み込みが
+  印を残したままになっていた（A2で判明、[data 28.4](./data.ja.md)）。
+
 ### 39. マウスを乗せた位置の値の表示（ホバー表示）（2026-10-03追加、ユーザー要望）
 
 要件: 5.32。`idea.md`の検討で、決めたいこと5つはすべておすすめの案に決定（2026-10-03）。
@@ -835,6 +953,146 @@ x)`として発する。
 - 非表示の系列が出ない。FFTプロットは連動しない。トグルOFFで出ない。設定の保存と読み込み。
 - 時間軸がNaNを含む・昇順でない列でも例外にならない。画像保存に含まれない。
 - 画面なしでMainWindowを動かし、ホバー中の画面を画像にして見た目を確かめる。
+
+### 47. 「A」ボタン（Yを合わせる）（2026-10-08追加、実機での不具合報告から）
+
+要求は[5.40](#540-aボタンyを合わせる2026-10-08追加実機での不具合報告から)。
+
+#### 47.0 不具合の原因
+
+- `TimePlotWidget`はpyqtgraphの自動範囲を切っている（4/5章: 曲線は表示範囲だけを切り出して描くので、
+  自動範囲に任せると切り出した曲線に合わせて縮み続ける）。しかし`PlotItem`の「A」ボタン
+  （`autoBtn`、`PlotItem.autoBtnClicked`）は残っていて、押すと`enableAutoRange()`で**自動範囲が入ったまま**
+  になる。
+- カーソルの線と値のラベル（16章、`add_cursor`の`pg.InfiniteLine`＋`pg.TextItem`）が`ignoreBounds`なしで
+  追加されているので、自動範囲の計算に入る。ラベルは表示範囲の上端に置かれるため、範囲が広がる → ラベルが
+  上へ動く → さらに広がる、を繰り返す（画面なしで再現: Yが±1.04 → 2秒後に−20万〜500万）。
+
+#### 47.1 動作
+
+- `autoBtn`のクリックを`PlotItem.autoBtnClicked`から外し、`TimePlotWidget.fit_y()`につなぐ。
+  ボタンの出方（マウスを乗せると出る）はpyqtgraphのまま。
+- `fit_y()`: `log_op("fit_y", plot=...)`を最初に書く。**描いてある曲線**（`curve.getData()`）のうち、
+  今のXの範囲`[x_min, x_max]`に入る点だけから、表示中（`visible`）の系列のYの有限な最小・最大を取り、
+  `setRange(yRange=..., padding=0.02)`でYだけを変える（`go_home`と同じ余白）。
+  - 描いた曲線を使う理由: 画面のスレッドで配列を読まない（窓読み込みの系列・`TimeIndex`の時間軸でも同じ、
+    データ36.8・overview §2）。描いた点に合わせるので、見えている線が切れることはない。間引き（LTTB）で
+    落ちた細かい山は見えていないので合わせない。押したときに再描画の途中なら、その時点の曲線に合わせる。
+  - 描いた曲線は前後に1点ずつはみ出しているので、X範囲の外の点は使わない。
+  - 合わせる点が1つもない（系列なし・全部非表示・範囲内が全部NaN）ときは何もしない（例外にしない、
+    非有限の範囲を渡さない、24.8）。
+  - 最小＝最大（一定の値）のときはpyqtgraphの幅0の扱いに任せる（24.8と同じ）。
+- 押した後`getViewBox().state["autoRange"]`は`[False, False]`のまま。
+- Xは変えないので、ナビゲータの再同期（24.9）は要らない。連動している他のプロットのYも変えない。
+- FFTプロット（`fft`はOFF）は今のまま。
+
+#### 47.2 カーソルを範囲の計算から外す
+
+- `add_cursor`の線とラベルを`addItem(..., ignoreBounds=True)`で追加する（ホバーの線と同じ、39.1）。
+  47.1で自動範囲は入らなくなるが、データの範囲を使う他の経路（`ViewBox.childrenBounds`等）にもカーソルを
+  入れないため。
+
+#### 47.3 テスト計画（`test_plot_widget.py`／`test_plots_errors.py`）
+
+回帰テストは修正前に失敗することを確かめる。ボタンは実際の経路で押す（`autoBtn`はマウスを乗せないと
+出ないので、乗せてから、または見える状態にしてから、ビューポート上のボタンの位置を`QTest.mouseClick`）。
+
+- **カーソルあり**: `sine`を描いてカーソルを1本置き、「A」→ Yがデータの範囲（±1付近）になり、
+  イベントループを回した後も変わらない。自動範囲はOFFのまま（修正前は広がり続ける）。
+- **拡大中**: Xを一部（`sine`が0〜0.5くらいの所）に絞ってYを大きく外してから「A」→ Yがその範囲の値に
+  合う。Xとナビゲータの枠は変わらない。
+- 非表示の系列は合わせる対象に入らない。全部非表示・系列なしでは何も変わらない。
+- 範囲内が全部NaNの系列だけ → 何も変わらない、例外なし。
+- 窓読み込みの系列（`add_windowed_series`）でも描いた曲線に合わせ、画面のスレッドで`window()`を呼ばない。
+- 連動している2つのプロットで、押した方のYだけが変わる。
+- カーソルの線・ラベルが`ignoreBounds`（`vb.addedItems`の範囲計算・`childrenBounds`にカーソルの位置が
+  入らない）。
+- 操作ログに`fit_y`が残る。
+- 画面なしで`MainWindow`を動かし、カーソルあり・拡大中に「A」を押した画面を画像にして確かめる。
+
+### 50. 新しいプロットへの間引きの設定・ナビゲータの絵の追従（2026-10-13追加、状態の持ち主の調査から）
+
+要求は[5.43](#543-新しいプロットへの間引きの設定ナビゲータの絵の追従2026-10-13追加状態の持ち主の調査から)。
+方針: 「同じ状態を複数の経路が書き、経路ごとに手で同期する」所を、**持ち主1か所**に寄せて直す
+（idea.md「状態の持ち主の調査の結果」の(1)(2)）。一気の作り直しはしない。
+
+#### 50.0 不具合の原因
+
+1. `PlotGridWidget`は新しいプロットへ`auto_redraw`・`downsample_pixel_ratio`・`scroll_bindings`・ホバー・
+   カーソルモードを`add_plot`で写すが、間引きのON/OFFだけは持っておらず写さない。`TimePlotWidget`は常に
+   `_downsample_enabled = True`で始まる。`MainWindow._apply_downsample_enabled`は**その時点の**プロットにしか
+   配らない。`load_view`は間引きの設定を当てて（`main_window.py`の`_apply_downsample_enabled(view.downsample_enabled, …)`）
+   からプロットを作るので、ビューの2つ目以降のプロットは間引かれる。
+2. 系列の追加は`layoutChanged`を出さないので、`MainWindow`の呼ぶ側が手で`_nav_sync.refresh()`を呼んでいる。
+   その判定が経路ごとにばらばらで、`_on_variable_dropped`は`plot is plots[0]`（アンカーではない）を見ている。
+   派生変数の編集・関数/マップの変更・派生変数の削除は`anchor_affected`を各自で計算している（3か所）。
+
+#### 50.1 間引きの設定は`PlotGridWidget`が持つ
+
+- `PlotGridWidget`に`_downsample_enabled: bool = True`を持たせ、`set_downsample_enabled(enabled)`は
+  これを書き換えてから今のプロットへ配る（今どおり）。`add_plot`は新しいプロットへ
+  `plot.set_downsample_enabled(self._downsample_enabled)`を写す（ホバー・カーソルモードと同じ所で）。
+  読む用に`downsample_enabled()`を足す。
+- FFTプロット（`x_axis_datetime=False`）にも同じく写す（今の`set_downsample_enabled`も全プロットに配っている）。
+- `MainWindow._downsample_enabled`は残す（ツールバーの項目・ビューの保存・操作ログが読む）。値は常に
+  `plot_grid`と同じ（`_apply_downsample_enabled`が両方を書く唯一の所）。
+- 新しいプロットを作る全経路（「＋ プロット追加」・「新しいプロットへ分ける」・「系列を新しいプロットへ分ける」・
+  `load_view`・FFT）が`add_plot`を通るので、これで全部に効く。`load_view`の順番は変えなくてよい。
+
+#### 50.2 アンカーの「絵の元」が変わったらグリッドが`layoutChanged`を出す
+
+- `TimePlotWidget`に`seriesChanged = Signal(object, str)`（self, name）を足し、系列を**足した・置き換えた**
+  ときに出す: `_install_series`の最後（`add_series`・`add_windowed_series`の両方が通る。同じ名前の
+  置き換えも含む）、`replace_series_y`・`replace_series_source`の最後。削除・移動・表示の切替は今どおり
+  `seriesRemoved`・`seriesVisibilityChanged`（グリッドはこれで既に`layoutChanged`を出している）。
+- `PlotGridWidget.add_plot`で`plot.seriesChanged`を`_on_series_changed(plot, name)`につなぐ。
+  `_on_series_changed`は、`plot is self.anchor_plot()`かつ`name`が`plot.visible_series_names()`の先頭のときだけ
+  `layoutChanged`を出す。
+  - 理由: ナビゲータの絵はアンカーの最初の表示中の系列だけで決まる（24.9の`_refresh_impl`）。それ以外の系列の
+    追加・置き換えで作り直すと、ビューの読み込み（アンカーに何本も足す）で画面のスレッドの概観の計算が
+    本数分走る。判定はこの1か所だけに置く。
+- `MainWindow`から手での`_nav_sync.refresh()`を外す:
+  - `_on_variable_dropped`の`plot is self.plot_grid.plots[0]`の判定と`refresh`。
+  - `edit_derived_variable`・`update_registry`（関数/マップの変更）・`delete_derived_variable`の
+    `anchor_affected`の計算と`refresh`。
+  - 削除は`PlotGridWidget.remove_series_everywhere(name)`（新規）に任せる: 時間領域の全プロットから
+    `name`を外し、1つでも外したら`layoutChanged`を1回出す。（実装で変更、2026-10-13）最初の版は
+    「`remove_series`→`seriesRemoved`で既に`layoutChanged`が出る」としていたが、グリッドの`_on_series_removed`は
+    選択を外すだけで出していなかった（出しているのは凡例・右クリックからの削除の経路だけ）。
+    `MainWindow`がグリッドのシグナルを直接出すのは持ち主の考え方に反するので、グリッドのメソッドにした。
+    `delete_derived_variable`はこれを**最後に**呼ぶ（`_raw_variables`から消した後。ナビゲータが列の代わりに
+    消した変数を選ばないため）。
+  - 残るのは、ファイルを開く・時間軸の切替の`refresh(home=True)`と`_on_grid_layout_changed`の3か所だけ。
+- `load_view`の最後の`_on_grid_layout_changed()`（`finally`）は残す（途中で失敗したときも1度は合わせる）。
+- 操作ログ・`state_snapshot`の内容は変えない。
+
+#### 50.3 テスト計画（`tests/parquet_analyzer/test_plot_state_sync.py`、新規。既存の`test_navigator_sync.py`・`test_navigator_resync.py`も通ること）
+
+回帰テストは修正前に失敗することを確かめる（50.0の再現: 画面なしで`[False, True]`、ナビゲータの絵が古いまま）。
+
+間引き:
+1. ツールバーの「簡易表示を許可」を実際に`trigger()`でOFF → 「＋ プロット追加」（ツールバーの項目）→
+   全プロットの`_downsample_enabled`が偽（直す前は新しいプロットだけ真）。
+2. OFFのまま「新しいプロットへ分ける」・「系列を新しいプロットへ分ける」→ 新しいプロットも偽。
+3. 間引きOFF・プロット3つでビューを保存 → ファイルを開き直す（間引きは真に戻る）→ ビューを読み込む →
+   3つとも偽。ONで保存したビューならすべて真。
+4. ファイルを開くと全プロットが真に戻る（今どおり）。
+
+ナビゲータ（絵は`navigator`の曲線のYの最大などで見分けられる列を使う。例: `a`は±1、`b`は大きい値）:
+5. プロット2つ、一番上の連動を外す（アンカー＝2つ目）→ アンカーへ`b`をドロップ（`_on_variable_dropped`。
+   できればプロットへの実際のドロップの経路）→ 手で`refresh`しなくてもナビゲータの絵が`b`（直す前は古いまま）。
+6. アンカーに`a`がある所へ2本目の`b`を足す → `layoutChanged`が出ない（概観を作り直さない。`NavigatorSync`の
+   世代番号が上がらない）。最初の系列を非表示にしてから足した系列が先頭の表示中の系列になるなら出る。
+7. アンカーの最初の系列が派生変数のとき、式を編集 → ナビゲータの絵が新しい値。アンカー以外のプロットにだけ
+   ある派生変数の編集・関数の変更では作り直さない。派生変数の削除で絵が次の系列（またはファイルの列）になる。
+8. 構造の確認（ソースを読む簡単なテスト）: `main_window.py`に`anchor_affected`が無い、`plots[0]`を見て
+   `refresh`する所が無い、`_nav_sync.refresh(`の呼び出しは3か所（ファイルを開く・時間軸の切替・
+   `_on_grid_layout_changed`）。
+9. ビューの読み込み（プロット2つ・各3系列）の後、ナビゲータの絵＝アンカーの最初の系列、範囲＝連動グループの範囲（24.9の
+   テストと同じ確かめ方）。
+
+規模: 中（Sonnet、`implementer`）。ナビゲータの不変条件（24.9）に触れるので、`main`への統合の前に本セッションで
+画面なしの実行と全件テストで確かめる。
 
 ## 他の分野との関係
 

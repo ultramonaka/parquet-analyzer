@@ -8,7 +8,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from parquet_analyzer.core.expression import ExpressionError, UnknownFunctionError, evaluate_expression
+from parquet_analyzer.core.expression import (
+    ExpressionError,
+    UnknownFunctionError,
+    evaluate_expression,
+)
 from parquet_analyzer.core.functions import FunctionRegistry, UserFunction, validate_user_function
 from parquet_analyzer.core.maps import LookupTable
 from parquet_analyzer.io import user_functions as uf_io
