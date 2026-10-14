@@ -432,7 +432,7 @@ def test_save_view_preserves_the_current_zoom_range(qapp, isolated_config, monke
 
 
 def test_load_view_warning_lists_each_skipped_item_once_with_its_reason(qapp, isolated_config, tmp_path, monkeypatch):
-    """Backlog 33 (found by the A4 old-view test): a derived variable that couldn't be restored
+    """Dev notes 33 (found by the A4 old-view test): a derived variable that couldn't be restored
     was listed twice in the consolidated warning (once as the variable, once as the series
     plotting it), and the heading blamed "the currently open file" even when the cause was a
     missing function. Each item is now listed once; a plain column missing from the file says so."""

@@ -1,4 +1,4 @@
-"""The navigator region must follow the plots after every series change (plots 24.1; backlog 14).
+"""The navigator region must follow the plots after every series change (plots 24.1; dev notes 14).
 
 set_overview_data() used to reset the region to the full extent; before the fix several callers
 (map/function changes via update_registry, derived add/edit/delete, a drop onto the first plot)

@@ -1,4 +1,4 @@
-"""detailed_specification.md 37.3 / backlog 13.6: a finished background job (its task, its
+"""detailed_specification.md 37.3 / dev notes 13.6: a finished background job (its task, its
 function/closure and the arrays it captured) must actually be freed, each result is delivered
 exactly once, and cyclic GC runs on the UI thread only.
 

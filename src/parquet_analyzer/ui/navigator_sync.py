@@ -53,7 +53,7 @@ class NavigatorSync:
         """Rebuild the navigator overview. The selection window stays on the linked group's
         current range (24.1 re-sync rule) -- every overview, synchronous or asynchronous,
         reaches the navigator only through _apply(), so no path can forget the restore (the
-        24.1 bug recurred 6 times; LEARNINGS 2026-10-06). home=True ("go home": file load,
+        24.1 bug recurred 6 times; dev notes 2026-10-06). home=True ("go home": file load,
         time-axis change) gives the full extent instead -- for the synchronous part of this
         call only; refinements that land later keep the region (24.9)."""
         self._home = home

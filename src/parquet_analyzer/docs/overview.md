@@ -22,8 +22,8 @@ docs/
     persistence.md
     export.md
     app.md
-  backlog.md              task list (where work is tracked), open issues and remaining tasks
-  history.md              record of resolved investigations and decisions (e.g. the old 13.5.1
+  dev notes              task list (where work is tracked), open issues and remaining tasks
+  dev notes              record of resolved investigations and decisions (e.g. the old 13.5.1
                           large-file memory work)
 ```
 
@@ -43,7 +43,7 @@ docs/
   design chapter has a "Test plan" subsection. A change spanning domains is written in the main
   domain, and references are added to the "Relations to other domains" and the relevant places of
   the other domains.
-- Issues that become resolved are moved from `backlog` to `history` (not deleted).
+- Issues that become resolved are moved from `dev notes` to `history` (not deleted).
 - Only stable content goes in this document. Domain-specific decisions are not written here (it
   would cause drift).
 - **Diagrams**: the domain relations (1.1) and the module structure (5.1) are written directly in
@@ -196,7 +196,7 @@ document first.
 | Pyramid | A coarse min/max envelope of a big column (`core/pyramid.py`) |
 | View | A saved screen configuration (`data/parquet_analyzer/*.json`) |
 | Feature flag | A switch that shows or hides the UI entry points of an unfinished feature (`features.py`) |
-| External review 1 / External review 2 | Code reviews by ChatGPT. In the spec, "external review #N" and "external review 1 #N" are item numbers of review 1 (2026-10-02, static review; original text in commit `2e794ca`'s `idea.md`, items later organized from `idea.md`); "external review 2 #N" are item numbers of review 2 (2026-10-04, public release 0.3.0; `idea.md`) |
+| External review 1 / External review 2 | External code reviews. In the spec, "external review #N" and "external review 1 #N" are item numbers of review 1 (2026-10-02, static review); "external review 2 #N" are item numbers of review 2 (2026-10-04, of public release 0.3.0) |
 
 ## 4. Overall requirements (purpose, environment, non-functional requirements, out of scope)
 
@@ -508,7 +508,7 @@ Sections of the old `specification.ja.md` (requirements):
 | 3 | Directory layout | [domains/app.md](./domains/app.md) |
 | 3.1 | Sharing paths with other projects | [domains/app.md](./domains/app.md) |
 | 4 | How to start | [domains/app.md](./domains/app.md) |
-| 5 | Screen layout and main features | history.md |
+| 5 | Screen layout and main features | dev notes |
 | 5.1 | Main window | [domains/plots.md](./domains/plots.md) |
 | 5.2 | Navigator | [domains/plots.md](./domains/plots.md) |
 | 5.3 | Interaction (v2, settled after real-use feedback) | [domains/plots.md](./domains/plots.md) |
@@ -535,14 +535,14 @@ Sections of the old `specification.ja.md` (requirements):
 | 8 | Logs (log/parquet_analyzer) | [domains/app.md](./domains/app.md) |
 | 9 | Non-functional requirements | [overview.md](./overview.md) |
 | 10 | Out of scope | [overview.md](./overview.md) |
-| 11 | Open questions | history.md |
-| 11.1 | Interpreting "Pygraph" (resolved) | history.md |
-| 11.2 | How to share paths with other projects (resolved) | history.md |
-| 11.3 | Axis assignment of zoom operations (resolved, v2) | history.md |
-| 11.4 | Expression input UI (resolved) | history.md |
-| 11.5 | exe format (resolved) | history.md |
-| 11.6 | Parquet reading library (resolved) | history.md |
-| 11.7 | Multi-plot / overlay UI interaction (resolved) | history.md |
+| 11 | Open questions | dev notes |
+| 11.1 | Interpreting "Pygraph" (resolved) | dev notes |
+| 11.2 | How to share paths with other projects (resolved) | dev notes |
+| 11.3 | Axis assignment of zoom operations (resolved, v2) | dev notes |
+| 11.4 | Expression input UI (resolved) | dev notes |
+| 11.5 | exe format (resolved) | dev notes |
+| 11.6 | Parquet reading library (resolved) | dev notes |
+| 11.7 | Multi-plot / overlay UI interaction (resolved) | dev notes |
 
 Chapters of the old `detailed_specification.ja.md` (detailed design) (per chapter; subsections are
 in the same file as their parent chapter unless listed after the table):
@@ -561,12 +561,12 @@ in the same file as their parent chapter unless listed after the table):
 | 10 | Asynchronous downsampling recompute (settled) | [domains/data.md](./domains/data.md) |
 | 11 | Logging | [domains/app.md](./domains/app.md) |
 | 12 | Error-handling policy | [domains/app.md](./domains/app.md) |
-| 13 | Open questions and remaining tasks at this point | backlog.md |
-| 13.1 | Bugs under investigation | backlog.md |
-| 13.2 | Efficiency (not addressed) | history.md |
-| 13.3 | Unused / unwired code (decide: put it to use or delete it) | backlog.md |
-| 13.4 | Known limitations of expressions | backlog.md |
-| 13.5 | Other | backlog.md |
+| 13 | Open questions and remaining tasks at this point | dev notes |
+| 13.1 | Bugs under investigation | dev notes |
+| 13.2 | Efficiency (not addressed) | dev notes |
+| 13.3 | Unused / unwired code (decide: put it to use or delete it) | dev notes |
+| 13.4 | Known limitations of expressions | dev notes |
+| 13.5 | Other | dev notes |
 | 14 | Statistics display | [domains/analysis.md](./domains/analysis.md) |
 | 15 | MDF/MATLAB → Parquet conversion tool | [domains/data.md](./domains/data.md) |
 | 16 | Cursors | [domains/plots.md](./domains/plots.md) |
@@ -588,5 +588,5 @@ Subsections in a different file from their parent chapter:
 |---|---|---|
 | 4.2 | Choosing the column used as the time (X) axis | [domains/data.md](./domains/data.md) |
 | 9.2 | Drawing indicator | [domains/data.md](./domains/data.md) |
-| 13.2 | Efficiency (all addressed) | history.md |
-| 13.5.1 | Memory blow-up with large files (~4 GB) (full record of the investigation and staged fixes) | history.md |
+| 13.2 | Efficiency (all addressed) | dev notes |
+| 13.5.1 | Memory blow-up with large files (~4 GB) (full record of the investigation and staged fixes) | dev notes |

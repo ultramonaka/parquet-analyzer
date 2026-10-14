@@ -18,7 +18,7 @@ Stats of a windowed column are aggregated per window in the worker (data 53; ope
 no row outside the visible range is read, and with small chunks no single read covers more than
 half of the rows.
 
-Not watched (they read everything today; reducing that is backlog 29 stage 2): expressions that do
+Not watched (they read everything today; reducing that is dev notes 29 stage 2): expressions that do
 not become a `DerivedColumn` (unknown margin, some user functions), histogram / XY / FFT, image /
 data export. The sanity test at the bottom proves the counter does count a deliberate full read
 (`WindowedColumn.values()`).

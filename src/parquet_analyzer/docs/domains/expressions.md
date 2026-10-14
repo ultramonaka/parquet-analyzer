@@ -124,14 +124,14 @@
 - Development feature flag `maps` ([overview 9](../overview.md)).
 - Details in [detailed_specification ch. 27](#27-maps-tables-added-2026-10-02-user-request).
 
-#### 5.24 Missing values in the moving average (added 2026-10-02, from fact-checking an external review)
+#### 5.24 Missing values in the moving average (added 2026-10-02)
 - `rolling_mean` gives a missing result if even one value in the window is missing (NaN) (missing
   values propagate). State this in the spec. Statistics (5.12) are computed excluding missing
   values, so make the difference clear to the user (in the expression descriptions and tooltips).
 - For averaging while ignoring missing values, add **`rolling_nanmean(a, window)`** (averages only
   the non-missing values in the window; if the window is all missing, that point is missing).
-- Details in [ch. 31](#31-missing-values-in-the-moving-average-added-2026-10-02-from-fact-checking-an-external-review).
-- (Added 2026-10-04, from external review 2, #7) **The window is centered**: `rolling_mean`/`rolling_nanmean` average over a
+- Details in [ch. 31](#31-missing-values-in-the-moving-average-added-2026-10-02).
+- (Added 2026-10-04) **The window is centered**: `rolling_mean`/`rolling_nanmean` average over a
   window that straddles the point (a centered moving average), not only past values. The function description, tooltip,
   function list and README state this explicitly. A trailing-only window (a `mode` argument) is not added for now. Details in 31.1.
 - (Added 2026-10-08, user decision) **Trailing moving averages `trailing_mean(a, window)` and `trailing_nanmean(a, window)`**:
@@ -163,7 +163,7 @@
 - The result of a comparison or condition that involves a missing value is missing (NaN). This keeps "unknown" from turning into
   0 or 1. To replace missing values with another value, write `where(isnan(a), 0, a)`.
 - Everything is computed element by element (per time step). Multi-line user functions (writing named intermediate values)
-  are not included in this version (`idea.md`).
+  are not included in this version (dev notes).
 - Details in [ch. 43](#43-conditionals-added-2026-10-06-user-request).
 
 ## Design
@@ -533,7 +533,7 @@ ch. 27 (maps) the foundation for "adding functions usable in expressions from ou
   consolidated warning" path via the `ExpressionError` at evaluation (ch. 8). Dependent derived
   variables and series are skipped likewise. The warning makes clear that "a function is missing"
   (the `error.unknown_function` text).
-- The view manager's (ch. 20) missing marks must follow the same rules as `load_view` (see CLAUDE.md):
+- The view manager's (ch. 20) missing marks must follow the same rules as `load_view` (see dev rules):
   if any function used by a derived variable's expression (`referenced_functions`) isn't in the
   registry, that derived variable is treated as missing, spreading transitively to its dependents.
   Shown as "function <name> not found". `ViewManagerDialog` is given the set of available function
@@ -766,9 +766,9 @@ so that it can be used in expressions. Decision (2026-10-06, user): the handling
   point become missing, and the others keep their previous values); rejection of `spline`; empty a cell in the table, save, CSV has an empty cell,
   reload gives the same; the preview draws without exception; the values of an existing map without empty cells do not change (regression).
 
-#### 27.11 Freezing the table's axes; clicking a graph moves to the table cell (added 2026-10-14, user request, backlog item 42)
+#### 27.11 Freezing the table's axes; clicking a graph moves to the table cell (added 2026-10-14, user request, dev notes item 42)
 
-Requirement: the last item of 5.21. Background (idea.md "additional features", from the user): when a large map's table is scrolled,
+Requirement: the last item of 5.21. Background (dev notes "additional features", from the user): when a large map's table is scrolled,
 it is no longer clear which value corresponds to which axis value. When a point of interest is found in the graph, finding the same cell in
 the table is tedious. Decision (2026-10-14, user): the **first row and first column are frozen** (the option of putting values in the headers
 is not adopted). Only **one direction, from the 2D graph to the table**, is supported (3D is out of scope; no markers from table to graph).
@@ -831,7 +831,7 @@ is not adopted). Only **one direction, from the 2D graph to the table**, is supp
   `map_preview_cell_jump` record in the operation log.
 - Visual: take an image of a larger map scrolled to the bottom right, and confirm the frozen row and column are visible.
 
-#### 27.12 Clicking a 3D surface moves to the table cell (added 2026-10-14, user request, backlog item 44)
+#### 27.12 Clicking a 3D surface moves to the table cell (added 2026-10-14, user request, dev notes item 44)
 
 Background: after the user checked 27.11 on a real machine, the request came: "can this also work in 3D?" (2026-10-14). 27.11 excluded 3D point
 selection as difficult, but the 3D component (`Xyz3DView`, analysis 25.3) already picks the grid point nearest to the mouse position to show its
@@ -894,7 +894,7 @@ extend 27.11 (2) to 3D.
   an image.
 - Flag: with `maps` disabled it isn't on the toolbar (loading and evaluation stay active).
 
-### 31. Missing values in the moving average (added 2026-10-02, from fact-checking an external review)
+### 31. Missing values in the moving average (added 2026-10-02)
 
 Requirement: 5.24. Background: `rolling_mean` in `core/analysis.py` is computed with `np.convolve`, so a
 missing value in the window makes the result missing. Statistics (`basic_stats`) exclude missing values,
@@ -913,7 +913,7 @@ so the behaviors differ, but which behavior applied wasn't written in the spec (
   start and at the end; a window that is all missing; window width 1; a window longer than the data;
   integer arrays.
 
-#### 31.1 Stating the window position (center) (added 2026-10-04, from external review 2, #7)
+#### 31.1 Stating the window position (center) (added 2026-10-04)
 
 Background: the implementation is a **centered** moving average using `np.convolve(mode="same")`, but the function description, tooltip and README
 only say "moving average", so it could be misread as a moving average of past values only (for public-version users).
@@ -926,7 +926,7 @@ only say "moving average", so it could be misread as a moving average of past va
 - The calculation does not change. A `mode` argument (a trailing-only window) is not added for now (to be specified separately if needed).
 - Tests: for odd and even windows, with an input that is 1 at a single point, the output position matches the range above (a regression test that fixes the window position).
 
-#### 31.2 Trailing-only moving averages `trailing_mean`/`trailing_nanmean` (added 2026-10-08, backlog item 28)
+#### 31.2 Trailing-only moving averages `trailing_mean`/`trailing_nanmean` (added 2026-10-08, dev notes item 28)
 
 Requirement: addendum to 5.24. Background: the centered moving average (31.1) uses future values too, so it cannot be used for "the average of values known
 up to that time" (reproducing control or real-time processing). A `mode` argument to switch to a trailing window was considered, but it is a **separate function
@@ -954,7 +954,7 @@ item in the function list).
 - Descriptions (English and Japanese): the expression function descriptions and the function list in `ui/i18n.py` (`fnref.desc.*` and examples `fnref.example.*`
   etc., the same set of keys as the existing `rolling_*`), category "Analysis", and the function descriptions in the README (English and Japanese). Add one line
   to the description of `rolling_*` as well: "for a trailing-only window, use `trailing_mean`".
-- Item 13.4 (backlog), "`rolling_mean` cannot specify a time-based window", is out of scope for this change (the window remains in sample counts).
+- Item 13.4 (dev notes), "`rolling_mean` cannot specify a time-based window", is out of scope for this change (the window remains in sample counts).
 
 **Test plan**:
 - Agreement with the naive implementation (lengths 0 to several hundred, window widths 1 to length + 5, NaN and ±Inf mixed in, integer arrays). Add property tests

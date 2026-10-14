@@ -94,7 +94,7 @@ class _Task:
 
 class WorkerHub:
     """Runs jobs off the UI thread and hands each result (or failure) back to the UI thread
-    (detailed_specification.md 37.1; 10章/28.1; backlog 13.6). Replaces `BackgroundWorker`.
+    (detailed_specification.md 37.1; 10章/28.1; dev notes 13.6). Replaces `BackgroundWorker`.
 
     A plain Python object owned by its owner (plot, main window); not a QObject and not a
     signal sender (the module's `_Relay` is). `pending` maps token -> (on_finished, on_failed):

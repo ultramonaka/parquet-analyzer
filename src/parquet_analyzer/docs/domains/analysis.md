@@ -69,12 +69,12 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   image export) is reused by the postponed histogram feature.
 - Details in [detailed_specification ch. 25](#25-xy--xyz-plots-added-2026-10-02-user-request).
 
-#### 5.25 Checking the sample spacing before FFT (added 2026-10-02, from fact-checking an external review)
+#### 5.25 Checking the sample spacing before FFT (added 2026-10-02)
 - FFT assumes evenly spaced samples, but the spacing of the target range isn't checked. **Before
   turning FFT back on with its feature flag**, check the sample spacing of the target range before
   computing, and if it varies a lot, say "FFT needs evenly spaced samples" and don't compute (ask
   the user to narrow the range).
-- Details in [ch. 32](#32-checking-the-sample-spacing-before-fft-added-2026-10-02-from-fact-checking-an-external-review).
+- Details in [ch. 32](#32-checking-the-sample-spacing-before-fft-added-2026-10-02).
 
 #### 5.33 Histogram (added 2026-10-04, user request)
 - A separate window (analysis window, 25.1) opened from "Histogram" in the "Graphs ▾" menu (25.5). The target is the
@@ -110,7 +110,7 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   settings.
 - Development feature flag `histogram` (ON by default since 2026-10-06). Candidates for later versions (distribution by time
   of day, load duration curve, narrowing by time of day, 2-variable 2D/3D, comparison of periods, CSV of the bin table, etc.)
-  are in `idea.md`. The two-stage aggregation and the export of values per group are in 5.37.
+  are in dev notes. The two-stage aggregation and the export of values per group are in 5.37.
 - Details in [ch. 42](#42-histogram-added-2026-10-04-user-request).
 
 #### 5.37 Two-stage aggregation of the histogram and export of values per group (added 2026-10-06, user request)
@@ -124,7 +124,7 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   another application. (2026-10-06, user's decision: net is not made in this app; consumption and regeneration are each
   output separately as derived variables with conditional branches: `where(P > 0, P, 0)` and `where(P < 0, -P, 0)`.)
 - A chart of the values per group over time (a bar chart with dates on the horizontal axis) is not included this time
-  (`idea.md`).
+  (dev notes).
 - Details in [42.8](#428-two-stage-aggregation-and-export-of-values-per-group-added-2026-10-06-user-request).
 
 #### 5.35 Making a map from measurements (map display and export in XY) (added 2026-10-06, user request, high priority)
@@ -147,7 +147,7 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   other maps (e.g. two maps that were made, or the original design map against the measurements).
 - Even for large files, computed without holding all data in memory (split and added up while reading, as with the XY density).
 - Development feature flag `map_from_xy`. Candidates for later versions (saving the XY window settings into a view, etc.) are
-  in `idea.md`.
+  in dev notes.
 - Details in [ch. 44](#44-making-a-map-from-measurements-map-display-and-export-in-xy-added-2026-10-06-user-request).
 
 #### 5.39 Excluding outlying points of a map by clicking them, and leaving missing cells empty (added 2026-10-08, user request)
@@ -161,13 +161,13 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   window discards it).
 - In addition, a choice is added to leave cells with fewer than the minimum point count N (44.2) **empty**, instead of filling
   them with the fill method.
-- Details in [44.13](#4413-excluding-outlying-points-and-leaving-missing-cells-empty-added-2026-10-08-backlog-item-22).
+- Details in [44.13](#4413-excluding-outlying-points-and-leaving-missing-cells-empty-added-2026-10-08-dev-notes-item-22).
 - 2026-10-13: because the operation was hard to understand, the UI entry is hidden behind the feature flag
   `map_exclude_points` (default OFF) (44.13 (8), user's decision).
-- The decisions above are from 2026-10-07 (agreed by the user; decisions recorded under "map" in `idea.md`).
+- The decisions above are from 2026-10-07 (agreed by the user; decisions recorded under "map" in dev notes).
 
 #### 5.48 Display kinds of the histogram (duration curve, trend, by time of day), narrowing by time window, and two-variable frequency (added 2026-10-14, user request)
-- The purpose is the analysis of electric power usage (same as 5.33). From the "next version" items of `idea.md`
+- The purpose is the analysis of electric power usage (same as 5.33). From the "next version" items of dev notes
   "Histogram (candidates for later versions)", the user chose five (2026-10-14): distribution by time of day, load duration
   curve, narrowing by time of day, trend of values per group, and frequency of a two-variable combination.
 - **Narrowing by time of day**: in the histogram window, the target can be narrowed to a **range of times of day** (e.g.
@@ -190,7 +190,7 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   and can be saved as CSV or registered as a map.
 - Implemented in three stages (stage 1 = narrowing by time window, duration curve, trend; stage 2 = by time of day; stage 3 =
   two-variable frequency). Comparison across periods, two-variable frequency after aggregation per group, and narrowing of the
-  XY by time window are not included this time (`idea.md`).
+  XY by time window are not included this time (dev notes).
 - Details in [42.10–42.13](#4210-narrowing-by-time-window-added-2026-10-14-stage-1) and
   [44.14](#4414-frequency-of-two-variables-time-as-a-map-aggregate-added-2026-10-14-stage-3).
 
@@ -500,7 +500,7 @@ entry points into **a menu of graph kinds**.
   is likely unavailable headless, so the display itself needs checking on a real machine (state in
   the report if it couldn't be checked).
 
-### 32. Checking the sample spacing before FFT (added 2026-10-02, from fact-checking an external review)
+### 32. Checking the sample spacing before FFT (added 2026-10-02)
 
 Requirement: 5.25. Background: `analysis.fft` only decides the sampling interval with
 `dt = median(diff(x))` and doesn't look at the variation (external review 1 #4). FFT is
@@ -534,7 +534,7 @@ framework, the failure paths of statistics, FFT, XY and 3D).
 
 ### 42. Histogram (added 2026-10-04, user request)
 
-Requirement: 5.33. For the use cases (e.g. distribution of electric power usage), see `idea.md`. Uses the analysis window
+Requirement: 5.33. For the use cases (e.g. distribution of electric power usage), see dev notes. Uses the analysis window
 framework (25.1), the "Graphs ▾" menu (25.5) and `WorkerHub` (data ch. 37) as they are.
 
 #### 42.1 Structure
@@ -614,7 +614,7 @@ No grouping:
   exact). When collecting the values of the fine bin that contains the median, if that bin's min and max are equal, that value is the median
   (nothing is collected). If the number collected would exceed `HIST_MEDIAN_COLLECT_MAX` (1,000,000), a further pass rebuilds a fine histogram
   within that bin's range to narrow it down (because for a column such as electric power that is almost always 0, one bin can hold almost
-  the whole column and be loaded into memory; found in review. The same problem in `chunked_stats` is in the backlog).
+  the whole column and be loaded into memory; found in review. The same problem in `chunked_stats` is in the dev notes).
   With frequency = time, the mean is the **time-weighted mean**, and the median is an approximation from the fine histogram weighted by time
   (marked "≈" in the legend).
 
@@ -1163,7 +1163,7 @@ entry points of the "map" display mode, the export and the overlay.
   machine); hatching for filled cells; that the range is not changed automatically once touched, and "Auto" restores it; name validation in the export dialog and the overwrite
   confirmation for the same name (dialogs monkeypatched); register only / CSV only / both; overwrite recomputes virtual variables and restores on failure; the JSON `origin`
   and `filled`; filled cells can be told apart in the map manager.
-- **44.5**: clicking a legend item hides a series, it stays hidden after recompute, and it is absent from image export (using real Qt clicks, as CLAUDE.md's testing rules require).
+- **44.5**: clicking a legend item hides a series, it stays hidden after recompute, and it is absent from image export (using real Qt clicks, as dev rules's testing rules require).
   Search and multiple selection in the Y list. Clicking the name text. A hidden Y is drawn in density display and stays hidden when back in scatter.
 - **Additions from the review (2026-10-07)**: grid errors appear in English and Japanese (`tr`); export is disabled when the grid is invalid; no floating-point residue remains in
   grid points (`-1` to `1` with interval 0.1 gives `-0.4`); the CSV headers (`<Y>\<X>`, `<X>,<Y>` for a curve, names containing commas, and omitted for numeric names) read back
@@ -1266,7 +1266,7 @@ Found in the review after merging (2026-10-07).
   (3) `[1e15, 1e15+1]` with 400 points → `MapGridError("too_fine")`, an error appears in the settings panel and export is disabled; (4) "leave empty" with empty cells → the note and proportion appear, and do not appear without empty cells;
   (5) the point count on a curve with two Y series equals the row count; (6) curve overlay → 3D → 2D restores the overlay. (1)–(3), (5) and (6) must fail before the fix.
 
-#### 44.11 Remainder of 44.10 (added 2026-10-08, the rest of backlog item 19)
+#### 44.11 Remainder of 44.10 (added 2026-10-08, the rest of dev notes item 19)
 
 Two items remained after the merge of the fixes of 44.10.
 
@@ -1280,7 +1280,7 @@ Two items remained after the merge of the fixes of 44.10.
   is not left behind, and a warning appears; (4) "Save as CSV only" with `os.replace` failing → the warning as before, and no temporary file. (1) and (3) must fail before the fix.
 - Size: small to medium (Sonnet; the main session checks the review).
 
-#### 44.12 Tidying `xy_plot_window.py` (added 2026-10-08, backlog item 21)
+#### 44.12 Tidying `xy_plot_window.py` (added 2026-10-08, dev notes item 21)
 
 Purpose: split `ui/xy_plot_window.py` (1,771 lines) into pieces that are easier to change for the later versions of 44 (such as 22, "exclude outlying points by clicking"). **The screen appearance, operations, operation log and image export results do not change** (refactoring only). As a guide, make `xy_plot_window.py` about 1,000 lines or fewer.
 
@@ -1306,7 +1306,7 @@ Current structure (lines as of `main` on 2026-10-08): calculation of scatter and
 - The class docstring of the mixin lists the attributes and methods of `XYPlotWindow` that the mixin uses (so that the dependencies are visible).
 - The pure calculation and range functions (`xy_map.py`) stay as they are.
 
-**(4) How to split the commits** (CLAUDE.md rule 7)
+**(4) How to split the commits** (dev rules rule 7)
 
 1. The rename (1) only.
 2. The move to the mixin (3) only. No changes to content.
@@ -1330,7 +1330,7 @@ Size: medium (Sonnet and reviewer). Start after 20 is merged (it does not touch 
 - For `OverlayHost`, the window gained read-only properties `result`, `plot`, `legend`, `view3d`, `closed` and `status_core`, plus `x_name()`, `registry_tables()`, `add_legend_entry()`, `redraw_scene_3d()`, `map_bounds_3d()` and `dialog_parent()`. The controller is created before the window's `super().__init__` (because the "Overlay ▾" button is created inside the settings panel).
 - "Does not depend on Qt" means "can be unit-tested without creating widgets" (`xy_overlay.py` itself imports pyqtgraph and `tr()`).
 
-#### 44.13 Excluding outlying points and leaving missing cells empty (added 2026-10-08, backlog item 22)
+#### 44.13 Excluding outlying points and leaving missing cells empty (added 2026-10-08, dev notes item 22)
 
 Requirement: 5.39. Mainly touches `ui/xy_map_view.py` (`XYMapViewMixin`, 44.12), `ui/xy_map.py` (`compute_xy_map`) and `core/map_grid.py`. The overlay display (`XYOverlayController`), scatter and density displays are not changed.
 

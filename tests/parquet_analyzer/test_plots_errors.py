@@ -3,7 +3,7 @@
 Plots, plot grid, navigator, variable panel and expression bar are driven with degenerate
 data (all-NaN, one sample, constant, Inf, huge/tiny magnitudes), nonsensical ranges
 (zero-width, reversed, far outside the data, NaN/Inf), stale ids and repeated or out-of-order
-operations. Invariants checked (CLAUDE.md): no exception escapes a Qt slot, pyqtgraph is never
+operations. Invariants checked (dev rules): no exception escapes a Qt slot, pyqtgraph is never
 handed a non-finite X coordinate/range/bound, the navigator follows layout changes, and the
 "at least one linked time plot first" structure survives.
 """

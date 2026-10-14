@@ -1,4 +1,4 @@
-"""Real-time waiting for background work (CLAUDE.md: tests that wait for a worker thread must
+"""Real-time waiting for background work (dev rules: tests that wait for a worker thread must
 sleep in real time until the condition they assert, never run a fixed number of event-loop
 rounds -- a slow 2-core CI machine needs far longer than a dev Mac)."""
 from __future__ import annotations

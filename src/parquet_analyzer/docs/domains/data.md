@@ -44,7 +44,7 @@ the MDF/MATLAB→Parquet conversion tool.
 - Parquet is read with `polars` (lazy evaluation with `scan_parquet`) (see 11.6).
 - For large files, lazy reads and reading only the needed range are considered wherever possible.
 
-#### 5.22 Reporting background-job failures, checking the time-axis order (added 2026-10-02, from fact-checking an external review)
+#### 5.22 Reporting background-job failures, checking the time-axis order (added 2026-10-02)
 - **Even if an exception occurs in work running in the background (downsampling, building the envelope
   for the coarse display, statistics, FFT, future analysis windows), the "drawing" indicator must not stay
   on forever, and that column's processing must not stay stuck afterwards.** The user is told about the
@@ -58,10 +58,10 @@ the MDF/MATLAB→Parquet conversion tool.
   in this version (to be considered in the future large-data design). (Added 2026-10-03, found on the real
   machine) However, **using a non-ascending or missing-value column as the time axis must never freeze or
   crash the app** (after the warning, display continues as far as it can).
-- Details in [ch. 28](#28-reporting-background-job-failures-added-2026-10-02-from-fact-checking-an-external-review)
-  and [ch. 29](#29-checking-the-time-axis-order-added-2026-10-02-from-fact-checking-an-external-review).
+- Details in [ch. 28](#28-reporting-background-job-failures-added-2026-10-02)
+  and [ch. 29](#29-checking-the-time-axis-order-added-2026-10-02).
 
-#### 5.29 The next stage of large-data support (added 2026-10-02, from fact-checking an external review)
+#### 5.29 The next stage of large-data support (added 2026-10-02)
 - Handle only the visible range of the time-axis column and of derived variables' results too, keeping
   memory use down even for files of around 100 million rows. In addition, manage the windowed-read cache
   by memory size, and make background work that is no longer needed stoppable midway.
@@ -69,7 +69,7 @@ the MDF/MATLAB→Parquet conversion tool.
   were adopted and implemented (cache memory management and cancellation were not adopted). The design is
   in [36.8](#368-the-adopted-design-2026-10-04-from-the-367-decision-and-the-reviewers-review).
 
-#### 5.46 Aggregating statistics over a whole column window by window (added 2026-10-13, stage 1 of backlog item 29; external review 2, candidate C)
+#### 5.46 Aggregating statistics over a whole column window by window (added 2026-10-13, stage 1 of dev notes item 29)
 - When "Statistics" is pressed on a large file (a windowed column), the rows of the displayed range are not read all
   at once; they are read in chunks and aggregated as they go. The 4–6 GB needed for statistics over the whole of a
   100-million-row column (36.7) is brought down to about the amount resident after drawing.
@@ -78,7 +78,7 @@ the MDF/MATLAB→Parquet conversion tool.
 - The results (count, missing, min, max, mean, standard deviation, median) are the same as now (the median stays exact).
 - Separating `values()` (the read-everything API) and making it explicit by name is specified later as stage 2
   (user's decision, 2026-10-13).
-- Details in [ch. 53](#53-aggregating-statistics-over-a-whole-column-window-by-window-added-2026-10-13-stage-1-of-backlog-item-29).
+- Details in [ch. 53](#53-aggregating-statistics-over-a-whole-column-window-by-window-added-2026-10-13-stage-1-of-dev-notes-item-29).
 
 #### 5.30 Reliably releasing background-job parts and protecting UI objects (added 2026-10-03, from the 13.6 investigation)
 - When background work (downsampling, envelopes, statistics, FFT, analysis windows) finishes, the parts
@@ -276,7 +276,7 @@ etc.), and the CLI exits with code 1. **The input file and an existing output fi
   - A MAT v7.3 group (struct) gets the warning text "not numeric" (not "zero length").
   - The extension `.dat` is treated as MDF (as now).
 
-### 28. Reporting background-job failures (added 2026-10-02, from fact-checking an external review)
+### 28. Reporting background-job failures (added 2026-10-02)
 
 Requirement: 5.22. Background: `BackgroundWorker.run()` in `core/background_worker.py` was only
 `signals.finished.emit(self._func())`, so if `func` raised, `finished` was never emitted. The caller kept its
@@ -344,7 +344,7 @@ strong reference to the worker, the drawing indicator (the count of `downsampleS
 - FFT: failure → a warning (checked with a monkeypatch), `_busy_sources` back to empty.
 - Confirm each test fails if 28.1's exception handling is removed (the drawing indicator remains, etc.).
 
-#### 28.4 Discarding old results of the previous file (added 2026-10-08, from the A2 results; backlog item 30)
+#### 28.4 Discarding old results of the previous file (added 2026-10-08, from the A2 results; dev notes item 30)
 
 In A2 ([app 46.5](./app.md)), two paths were found through which results of jobs of the previous file got through when
 a file was reopened. Both are marked `xfail(strict=True)` in `test_worker_paths.py`; remove the marks once fixed.
@@ -390,13 +390,13 @@ a file was reopened. Both are marked `xfail(strict=True)` in `test_worker_paths.
   time axis, in each case; the `navigator` mark clears (`_busy_sources` goes back to empty).
 - All other combinations in `test_worker_paths.py` (D, N, P) pass. Each test is confirmed to fail when the fix is removed.
 
-### 29. Checking the time-axis order (added 2026-10-02, from fact-checking an external review)
+### 29. Checking the time-axis order (added 2026-10-02)
 
 Requirement: 5.22. Background: `MainWindow._visible_row_range`, `TimePlotWidget._redraw_series` and the
 cursors' nearest-sample lookup use `np.searchsorted`, assuming an ascending time axis. Any column can be
 chosen as the time axis, yet that assumption was checked nowhere. `ParquetDataSource.is_monotonic()` was
 implemented but unused, and it looks only at row-group statistics, so it can't see disorder within a row
-group (external review #1 in `idea.md`, fact-checked).
+group (external review #1 in dev notes, fact-checked).
 
 #### 29.1 The check (add `check_time_order(values) -> TimeOrderReport` to `core/numeric.py`)
 
@@ -457,7 +457,7 @@ group (external review #1 in `idea.md`, fact-checked).
   within a few seconds. Since the bug is a freeze, the test runs in a separate process with a time limit,
   and it is confirmed to fail by timeout on the implementation before the fix.
 
-#### 29.3 Test plan (including the error-case tests of external review #12)
+#### 29.3 Test plan (including error-case tests)
 
 - `check_time_order`: strictly increasing, with duplicates (ok), going back midway, decreasing throughout,
   containing NaN (at the start, middle, end), containing Inf, empty, one value, all NaN.
@@ -493,7 +493,7 @@ Test plan: `test_data_errors.py` (reading, statistics, the type table, NaT), `te
 (envelopes, thinning, LTTB edge cases), `test_open_errors_ui.py` (`load_parquet`, switching the time axis,
 drops, views through the actual path). A bug fix comes with a regression test that fails before the fix.
 
-### 36. The next stage of large-data support (added 2026-10-02, from fact-checking an external review)
+### 36. The next stage of large-data support (added 2026-10-02)
 
 Requirement: 5.29 (external review #3, #6, #7, #11). 36.1–36.7 are the record of the study and
 measurements. **The adopted design is 36.8** (decided 2026-10-04: A, C and D adopted, B not pursued, E not
@@ -809,7 +809,7 @@ because the review found violations):
   navigator waiting for it** redraw (no matter who started building it). If it can't be built, `renderFailed`
   reports it; it never stays blank silently.
 - When the navigator's overview changes later (on the pyramid's completion), the selection is put back on the
-  linked group's visible range (via `_on_grid_layout_changed`; the sixth path of LEARNINGS 2026-10-02).
+  linked group's visible range (via `_on_grid_layout_changed`; the sixth path of dev notes 2026-10-02).
 - Background computation of derived variables uses a snapshot (never modified) of the functions and maps taken
   when the column was built. Function and map changes replace it with a new snapshot through the current
   recompute path (expressions ch. 18/26's "all or nothing" doesn't change).
@@ -833,7 +833,7 @@ rows (with `eager_load_limit_mb=0` to exercise D too) and a non-ascending time a
 
 ### 37. Releasing background-job parts and garbage collection (added 2026-10-03, from the 13.6 investigation)
 
-Requirement: 5.30. Background (the investigation in `history.md` 13.6):
+Requirement: 5.30. Background (the investigation in dev notes 13.6):
 - `BackgroundWorker` (`setAutoDelete(False)` + a strong reference held by the caller) was **never released**
   for two reasons: (1) the lambdas receiving results captured the worker (PySide keeps lambdas on the C++ side,
   where Python's GC can't follow them), and (2) `QThreadPool` keeps Python references to work it doesn't
@@ -898,7 +898,7 @@ Requirement: 5.30. Background (the investigation in `history.md` 13.6):
   (counted with weak references, not `gc.get_referrers`).
 - GC timer: run the event loop for about 1.2 s with the default thresholds, and collection runs from the timer.
 
-### 40. Navigator overview of windowed columns (added 2026-10-03, from `backlog.md` 13.7)
+### 40. Navigator overview of windowed columns (added 2026-10-03, from dev notes 13.7)
 
 Background: with `eager_load_limit_mb=0`, plotting a column of a file with a single row group
 (`feature_test.parquet`) made `MainWindow._windowed_navigator_overview` build the overview from row-group
@@ -916,7 +916,7 @@ statistics (each row group's min and max), giving two points and a zero-width na
   overview has well over 2 points, and the selection is the minimum and maximum of the time axis's finite values.
   Confirm it fails before the fix.
 
-### 41. Measuring at the scale of 100 million rows (recording a baseline) (added 2026-10-03, the remainder of external review #12)
+### 41. Measuring at the scale of 100 million rows (recording a baseline) (added 2026-10-03)
 
 Purpose: before designing ch. 36 (the next stage of large-data support), measure the time and memory of the
 current implementation on files of about 100 million rows and record them as a baseline. **This chapter doesn't
@@ -939,9 +939,9 @@ improve the implementation** (it only measures).
   36.1 as "36.4 Measurements (baseline)". For stages that are clearly problematic (tens of seconds or more, several
   GB of memory or more), add an assessment of the cause (fixing it is ch. 36's job).
 
-### 53. Aggregating statistics over a whole column window by window (added 2026-10-13, stage 1 of backlog item 29)
+### 53. Aggregating statistics over a whole column window by window (added 2026-10-13, stage 1 of dev notes item 29)
 
-Requirement: 5.46. Sources: idea.md "External review 2" #4, candidate C, and "Remainder of large-data support" (2).
+Requirement: 5.46. Sources: dev notes "External review 2" #4, candidate C, and "Remainder of large-data support" (2).
 
 #### 53.1 The current design (fact-checked, `main` as of 2026-10-13)
 
@@ -981,7 +981,7 @@ Requirement: 5.46. Sources: idea.md "External review 2" #4, candidate C, and "Re
    background work keeps reading the old `ParquetDataSource`, so reading a closed file must not crash (same as the current
    `DerivedColumn` path: a read that raises is reported as a failure and dropped by the generation check).
 5. Not changed in stage 1: the name and API of `values()` (stage 2), the inside of `chunked_stats` (the "median bin becomes large
-   for a column where one value dominates" item of idea.md "Remainder of large-data support" (4); the ±1e308 overflow in backlog is a
+   for a column where one value dominates" item of dev notes "Remainder of large-data support" (4); the ±1e308 overflow in dev notes is a
    separate issue and stays as is), and how histogram, XY and FFT read data.
 
 #### 53.3 Test plan
@@ -1060,7 +1060,7 @@ that stage). The RSS at the start of the stage was about 1,350 MB (the resident 
   materializing only the columns the expression refers to.
 - **Persistence** ([persistence.md](./persistence.md)): settings such as `eager_load_limit_mb`, recently used
   folders.
-- **History** (history.md): the details of the design and measurements of lazy/windowed reads and
+- **History** (dev notes): the details of the design and measurements of lazy/windowed reads and
   the pyramid are in old 13.5.1 (the large-file memory problem). Always consult it when changing this domain's
   design.
 - **All domains (background work)** (2026-10-03): background work follows ch. 28 (failure reporting) and ch. 37

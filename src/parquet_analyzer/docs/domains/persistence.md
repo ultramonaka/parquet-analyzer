@@ -66,26 +66,26 @@ settings file and settings menu, persisting the window layout.
   Schema details in
   [detailed_specification ch. 9](#9-settings-file-cfgparquet_analyzersettingsjson).
 
-#### 5.26 Saving the time-axis column in a view (added 2026-10-02, from fact-checking an external review)
+#### 5.26 Saving the time-axis column in a view (added 2026-10-02)
 - Views currently don't save which column was used as the time axis. Opening a view saved with
   another column as the time axis puts the time axis back on the file's first column — "saved,
   but different". **Save the time-axis column in the view, and use that column as the time axis
   when opening it** (if the file doesn't have that column, keep the current time axis and add a
   line to the consolidated warning).
-- Details in [ch. 33](#33-saving-the-time-axis-column-in-a-view-added-2026-10-02-from-fact-checking-an-external-review).
+- Details in [ch. 33](#33-saving-the-time-axis-column-in-a-view-added-2026-10-02).
 
-#### 5.27 Saving the view's file location as a relative path too (added 2026-10-02, from fact-checking an external review)
+#### 5.27 Saving the view's file location as a relative path too (added 2026-10-02)
 - Views currently save the source Parquet file as an absolute path, so moving the folder elsewhere
   or to another PC makes them unopenable. **Save a path relative to the view file in addition to
   the absolute path**, and when opening, try the absolute path → the relative path (this resolves
   the `path_type="relative"` item in remaining task 13.3).
-- Details in [ch. 34](#34-saving-the-views-file-location-as-a-relative-path-too-added-2026-10-02-from-fact-checking-an-external-review).
+- Details in [ch. 34](#34-saving-the-views-file-location-as-a-relative-path-too-added-2026-10-02).
 
-#### 5.28 Validating the shape of view files (added 2026-10-02, from fact-checking an external review)
+#### 5.28 Validating the shape of view files (added 2026-10-02)
 - For a hand-edited view file whose items have the wrong type (e.g. `"plots": "hello"`), show an
   error message that says "where it is wrong" (it doesn't crash today, but the message is the raw
   exception text and hard to understand). Low priority.
-- Details in [ch. 35](#35-validating-the-shape-of-view-files-added-2026-10-02-from-fact-checking-an-external-review).
+- Details in [ch. 35](#35-validating-the-shape-of-view-files-added-2026-10-02).
 
 #### 5.42 Overwriting an existing view by choosing it when saving (added 2026-10-13, user request)
 - Today, "View ▾ → Save..." requires typing the name every time, and overwriting the same view means typing the same name again.
@@ -211,7 +211,7 @@ recording a 1-minute burst at 10 ms intervals every 16 hours, about 13.15 millio
   `test_load_view_applies_matching_variables_even_when_others_are_missing`,
   `test_load_view_recomputes_derived_variables_from_the_newly_opened_file`
   (`tests/parquet_analyzer/test_load_robustness.py`).
-- **Wording of the grouped warning** (2026-10-09, backlog item 33; found by the tests of old views in A4): previously, a derived variable that
+- **Wording of the grouped warning** (2026-10-09, dev notes item 33; found by the tests of old views in A4): previously, a derived variable that
   could not be restored appeared **twice**, once as "derived variable" and once as "the series that drew it", and the heading did not fit when
   the cause was a missing function or map. The fixed form: the heading is "View "…": the following items could not be restored (the rest has been
   restored)". Each item appears once (a derived variable that was skipped does not also list its series). Items whose reason is known get it in
@@ -415,7 +415,7 @@ contained before loading it.
   annotation doesn't show a view name that no longer exists; 19.3). `log_op("delete_view", name=...)`.
 - i18n: all of the strings above go through `tr()` (en + ja).
 
-### 33. Saving the time-axis column in a view (added 2026-10-02, from fact-checking an external review)
+### 33. Saving the time-axis column in a view (added 2026-10-02)
 
 Requirement: 5.26 (external review #9).
 - `View.time_column: str | None` (JSON `time_column`, default `None`). `save_view_dialog` stores
@@ -433,7 +433,7 @@ Requirement: 5.26 (external review #9).
   column; a file without the column warns and keeps the current time axis; an older view; the view
   manager's display and marks.
 
-### 34. Saving the view's file location as a relative path too (added 2026-10-02, from fact-checking an external review)
+### 34. Saving the view's file location as a relative path too (added 2026-10-02)
 
 Requirement: 5.27 (external review #10, remaining task 13.3).
 - Add `relative_path: str | None` to `SourceDef` (relative to the view JSON's location,
@@ -444,12 +444,12 @@ Requirement: 5.27 (external review #10, remaining task 13.3).
   error as before. Which one was used is logged (in the operation log's `details`).
 - The existing `path_type="relative"` branch (where `parquet_path` itself is relative) stays.
 - The remaining-task 13.3 item "the `relative` branch of `path_type` is never reached" is resolved
-  by this chapter and moved to `history.md`.
+  by this chapter and moved to dev notes.
 - Tests: opens from the same place; opens after moving the folder (the `data/` with data and
   views) elsewhere; the absolute path wins; the error when neither exists; when the relative path
   can't be made (`relative_path=None`).
 
-### 35. Validating the shape of view files (added 2026-10-02, from fact-checking an external review)
+### 35. Validating the shape of view files (added 2026-10-02)
 
 Requirement: 5.28 (external review #8). Priority: low.
 - `load_view` in `io/view.py` checks the types of the top level, `source`, `plots[]`, `series[]`
@@ -518,7 +518,7 @@ Requirement: [5.42](#542-overwriting-an-existing-view-by-choosing-it-when-saving
 
 ### 54. Signal aliases (added 2026-10-14, user request)
 
-Requirement: [5.47](#547-signal-aliases-names-that-exist-only-inside-this-app-added-2026-10-14-user-request). Background: idea.md "view", item
+Requirement: [5.47](#547-signal-aliases-names-that-exist-only-inside-this-app-added-2026-10-14-user-request). Background: dev notes "view", item
 "when a signal is not found, assign a substitute signal" (after the impact was investigated on 2026-10-13, the specification was held, recommending
 option (B), "attach an alias to a file column"). Decision (2026-10-14, user): option (B), one dictionary for the whole app, the list shows only
 aliases, and assignment can be made both from the dedicated editing window and from the view's warning.

@@ -115,7 +115,7 @@ def test_unknown_keys_are_ignored_at_every_level(isolated_config):
 @pytest.mark.parametrize("rng", [[NAN, 1], [1, NAN], [-INF, INF], [NAN, NAN], [0, INF]])
 def test_non_finite_x_axis_range_is_dropped(isolated_config, rng):
     """pyqtgraph raises on a NaN/inf range, which aborted the rest of the view load
-    (CLAUDE.md: never hand pyqtgraph a non-finite range)."""
+    (dev rules: never hand pyqtgraph a non-finite range)."""
     _put("t", _good(x_axis_range=rng))
     assert view_io.load_view("t").x_axis_range is None
 

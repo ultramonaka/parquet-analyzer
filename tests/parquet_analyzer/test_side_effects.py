@@ -343,7 +343,7 @@ CASES = {
 }
 
 # Rows whose real behaviour differs from the table (45.2: judged by the main session); a bug
-# found this way is marked xfail(strict=True) with its backlog task. Never loosen the allowed set instead.
+# found this way is marked xfail(strict=True) with its dev notes task. Never loosen the allowed set instead.
 XFAIL: dict[str, str] = {}
 
 

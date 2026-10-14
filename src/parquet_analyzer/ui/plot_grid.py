@@ -856,7 +856,7 @@ class PlotGridWidget(QWidget):
         if source not in self._plots:
             # A plot just removed from the grid is still X-linked until it is deleted, and its
             # pane is re-laid-out outside the splitter (its range jumps): that must not drive
-            # the navigator away from the real group's range (24.1, LEARNINGS 2026-10-02).
+            # the navigator away from the real group's range (24.1, dev notes 2026-10-02).
             return
         self.rangeChanged.emit(x_range)
 
