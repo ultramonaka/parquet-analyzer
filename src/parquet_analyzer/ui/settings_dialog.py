@@ -98,6 +98,8 @@ class SettingsDialog(QDialog):
                 continue  # developer feature flag, detailed_specification.md 21
             if key in ("user_functions", "maps", "xy_plot", "histogram") and not features.is_enabled(key):
                 continue
+            if key == "export_parquet" and not features.is_enabled("parquet_export"):
+                continue
             edit = QKeySequenceEdit()
             seq = settings.shortcuts.get(key, "")
             if seq:

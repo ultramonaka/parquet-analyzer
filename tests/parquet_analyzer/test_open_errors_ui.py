@@ -153,7 +153,8 @@ def test_bad_time_axes_open_warn_and_plot_without_hanging(qapp, win, tmp_path, t
     _settle(qapp, win)
     assert win.plot_grid.plots[0].series_names() == ["v"]
     assert win._time_order_report.ok is ok
-    assert win._time_order_label.isVisibleTo(win) is (not ok)
+    # a constant axis is ok but has duplicates (56.2): its label is a note, still shown
+    assert win._time_order_label.isVisibleTo(win) is (not ok or win._time_order_report.duplicate_count > 0)
     row_start, row_end = win._visible_row_range()  # must not raise on any of them
     assert 0 <= row_start <= row_end <= N
 
@@ -256,7 +257,8 @@ def test_switching_the_time_axis_to_a_degenerate_numeric_column_warns_and_surviv
     _settle(qapp, win)
     assert win._time_column == "x"
     assert np.isfinite(win._time_values).sum() == finite
-    assert win._time_order_label.isVisibleTo(win) == (finite == 0)
+    # all-True 'bool' axis: finite and ascending but every value repeats (56.2 note)
+    assert win._time_order_label.isVisibleTo(win) == (finite == 0 or win._time_order_report.duplicate_count > 0)
     win.set_time_column("t")
     _settle(qapp, win)
     assert win._time_column == "t" and win._time_order_report.ok

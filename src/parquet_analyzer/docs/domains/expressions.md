@@ -163,8 +163,20 @@
 - The result of a comparison or condition that involves a missing value is missing (NaN). This keeps "unknown" from turning into
   0 or 1. To replace missing values with another value, write `where(isnan(a), 0, a)`.
 - Everything is computed element by element (per time step). Multi-line user functions (writing named intermediate values)
-  are not included in this version (dev notes).
+  are not included in this version.
 - Details in [ch. 43](#43-conditionals-added-2026-10-06-user-request).
+
+#### 5.49 Compute derived variables in the background, only as needed, when loading a view, and show progress (added 2026-10-15, user request;)
+- When a view is opened, derived variables are not computed **all of them, all rows, on the screen's thread**. On opening, only the expression check and a trial
+  computation on the first few rows are done, and **only the derived variables shown in a plot (and the derived variables they use)** are computed in background work.
+  Derived variables not shown in a plot are computed when first used (adding to a plot, statistics, XY, histogram, export, etc.).
+- The screen does not freeze while computing. At the right end of the status bar (the same place as the current "drawing" indicator), show a progress bar, "n / total",
+  the **estimated remaining time** and a cancel button.
+- On cancel, the view is shown with only what has been computed so far; series that could not be shown appear as "cancelled" in the current consolidated warning of
+  "items that could not be restored". The definitions of the derived variables are kept (they are computed when used later).
+- Where computation is expected to get faster, run it across multiple cores (derived variables that do not depend on each other are computed at the same time).
+- The results (load time, time the screen freezes) are measured and reported to the user (user decision, 2026-10-15).
+- Details in [ch. 55](#55-compute-derived-variables-in-the-background-only-as-needed-when-loading-a-view-added-2026-10-15).
 
 ## Design
 
@@ -533,7 +545,7 @@ ch. 27 (maps) the foundation for "adding functions usable in expressions from ou
   consolidated warning" path via the `ExpressionError` at evaluation (ch. 8). Dependent derived
   variables and series are skipped likewise. The warning makes clear that "a function is missing"
   (the `error.unknown_function` text).
-- The view manager's (ch. 20) missing marks must follow the same rules as `load_view` (see dev rules):
+- The view manager's (ch. 20) missing marks must follow the same rules as `load_view`:
   if any function used by a derived variable's expression (`referenced_functions`) isn't in the
   registry, that derived variable is treated as missing, spreading transitively to its dependents.
   Shown as "function <name> not found". `ViewManagerDialog` is given the set of available function
@@ -766,9 +778,9 @@ so that it can be used in expressions. Decision (2026-10-06, user): the handling
   point become missing, and the others keep their previous values); rejection of `spline`; empty a cell in the table, save, CSV has an empty cell,
   reload gives the same; the preview draws without exception; the values of an existing map without empty cells do not change (regression).
 
-#### 27.11 Freezing the table's axes; clicking a graph moves to the table cell (added 2026-10-14, user request, dev notes item 42)
+#### 27.11 Freezing the table's axes; clicking a graph moves to the table cell
 
-Requirement: the last item of 5.21. Background (dev notes "additional features", from the user): when a large map's table is scrolled,
+Requirement: the last item of 5.21. Background: when a large map's table is scrolled,
 it is no longer clear which value corresponds to which axis value. When a point of interest is found in the graph, finding the same cell in
 the table is tedious. Decision (2026-10-14, user): the **first row and first column are frozen** (the option of putting values in the headers
 is not adopted). Only **one direction, from the 2D graph to the table**, is supported (3D is out of scope; no markers from table to graph).
@@ -831,7 +843,7 @@ is not adopted). Only **one direction, from the 2D graph to the table**, is supp
   `map_preview_cell_jump` record in the operation log.
 - Visual: take an image of a larger map scrolled to the bottom right, and confirm the frozen row and column are visible.
 
-#### 27.12 Clicking a 3D surface moves to the table cell (added 2026-10-14, user request, dev notes item 44)
+#### 27.12 Clicking a 3D surface moves to the table cell
 
 Background: after the user checked 27.11 on a real machine, the request came: "can this also work in 3D?" (2026-10-14). 27.11 excluded 3D point
 selection as difficult, but the 3D component (`Xyz3DView`, analysis 25.3) already picks the grid point nearest to the mouse position to show its
@@ -926,7 +938,7 @@ only say "moving average", so it could be misread as a moving average of past va
 - The calculation does not change. A `mode` argument (a trailing-only window) is not added for now (to be specified separately if needed).
 - Tests: for odd and even windows, with an input that is 1 at a single point, the output position matches the range above (a regression test that fixes the window position).
 
-#### 31.2 Trailing-only moving averages `trailing_mean`/`trailing_nanmean` (added 2026-10-08, dev notes item 28)
+#### 31.2 Trailing-only moving averages `trailing_mean`/`trailing_nanmean`
 
 Requirement: addendum to 5.24. Background: the centered moving average (31.1) uses future values too, so it cannot be used for "the average of values known
 up to that time" (reproducing control or real-time processing). A `mode` argument to switch to a trailing window was considered, but it is a **separate function
@@ -954,7 +966,7 @@ item in the function list).
 - Descriptions (English and Japanese): the expression function descriptions and the function list in `ui/i18n.py` (`fnref.desc.*` and examples `fnref.example.*`
   etc., the same set of keys as the existing `rolling_*`), category "Analysis", and the function descriptions in the README (English and Japanese). Add one line
   to the description of `rolling_*` as well: "for a trailing-only window, use `trailing_mean`".
-- Item 13.4 (dev notes), "`rolling_mean` cannot specify a time-based window", is out of scope for this change (the window remains in sample counts).
+- Item 13.4, "`rolling_mean` cannot specify a time-based window", is out of scope for this change (the window remains in sample counts).
 
 **Test plan**:
 - Agreement with the naive implementation (lengths 0 to several hundred, window widths 1 to length + 5, NaN and ±Inf mixed in, integer arrays). Add property tests
@@ -1088,6 +1100,178 @@ Found in the review after merging (2026-10-07).
   variable in `x < (1 < y)` does not contain "comparison:"; (4) entering `1 < foo(x)` in the expression input shows the translated "unknown function" message.
   (1), (2) and (3) must fail before the fix.
 
+### 55. Compute derived variables in the background, only as needed, when loading a view (added 2026-10-15)
+
+Requirement: 5.49.
+
+#### 55.1 Current structure (fact check, `main` as of 2026-10-15)
+
+- `MainWindow.load_view` creates the view's derived variables one at a time in dependency order with `_on_add_derived_variable`. That goes through
+  `_build_derived_column`, and every expression except those with windowed-read inputs (those that become a `DerivedColumn`) is computed with
+  `evaluate_expression(...)` for **all rows on the screen's thread** and turned into a `MaterializedColumn`. Derived variables not shown in a plot are treated the same.
+- It is heavy for files too small for windowed reading (below the default 512 MB). Measurements (20 functions, 40 derived variables): with 2 million rows the screen freezes for 3.5 s and
+  drawing takes 8.7 s to finish. With 20 million rows, 23 s and 30 s. Per expression (2 million rows): `a+b` 0.4 ms, `if`/`where` about 4 ms, curve map 48–73 ms,
+  2D map 89–112 ms.
+- Series are added synchronously inside `load_view` by `_add_variable_to_plot` (assuming the values already exist).
+
+#### 55.2 The deferred column `DeferredColumn` (`core/column.py`)
+
+- It holds the expression, the input columns (`Mapping[str, Column]`, only the names the expression references out of the `_raw_variables` at build time), the row count, and a copy of the
+  functions and maps (`_registry_snapshot()`, never modified). When `values()` is first called it computes all rows and keeps the result. `window(a, b)` is
+  `values()[a:b]` (same as `LazyColumn`). `is_ready` (whether computed) and `compute()` (the same as `values()`; the name called from background work).
+- **Threads**: `values()` is called from a background thread (55.3), so computing and holding are guarded by a `threading.Lock` (it never computes twice at the same time.
+  The screen's thread may wait, but there is no double computation or double memory use). The input `LazyColumn.values()` has a lock for the same reason (it was assumed
+  to be called only from the screen's thread). Reading in `ParquetDataSource` is already used from background threads (windowed reading).
+- **Check at build time** (the point of "all or nothing" does not move): check the expression's grammar, that all referenced names exist, and that the functions and maps exist, then
+  do a trial computation on **only the first `probe_rows` (1000) rows** (the same idea as `make_derived_column`). Reading the first rows must not
+  materialize the whole column (add to `LazyColumn` a `peek(a, b)` that reads only a range without caching. If an input of a `DeferredColumn` is itself a `DeferredColumn`,
+  its `peek` is the trial-computed value of its own head). The check of the result's shape (1-D, same as the row count; scalars are broadcast) is also done in the trial computation.
+- **An expression with a not-yet-computed `DeferredColumn` among its inputs is not a target of `make_derived_column`** (it returns `None`, and that expression also becomes a `DeferredColumn`.
+  Found in review: on a windowed-read file, the trial computation of a `DerivedColumn` triggered the all-row computation of its inputs on the screen's thread).
+- Where it is used: only when `_build_derived_column(..., deferred=True)`. Only `load_view` calls it with `deferred=True`. Adding or editing from the expression input is as before (computed for all rows on the spot so that mistakes
+  show up immediately). Expressions that become a `DerivedColumn` (windowed reading, data 36.8 C) stay `DerivedColumn` as before (they are lazy to begin with, so they do not become a `DeferredColumn`).
+- **Recomputation on function/map changes (`update_registry`) and derived-variable edits**: a not-yet-computed `DeferredColumn` is only rebuilt as a `DeferredColumn` with the new snapshot and is
+  not computed (the recomputation path must not call `values()` and compute everything). Already computed ones are recomputed as before. All-or-nothing (expressions ch. 18/26)
+  is unchanged (the check on rebuilding is done by the trial computation).
+
+#### 55.3 Split `load_view` into three stages (`ui/main_window.py`)
+
+1. **Definition (synchronous, finishes quickly)**: in the same order as now, apply the file (or the current file), time axis and thinning settings, and register the derived variables in dependency order with
+   `deferred=True` (a failure skips only that item and goes into `skipped`, as now).
+2. **Computation (background work)**: collect the derived variables that appear in the view's series and the `DeferredColumn`s they use (transitively), and `compute()` them in the background in dependency order.
+   - One variable = one job (via `WorkerHub`; always reports success or failure exactly once, ch. 37). Variables are submitted as soon as their dependencies are ready, and the **limit on how many are submitted at once** is
+     `_VIEW_COMPUTE_PARALLEL` (default: `max(1, min(os.cpu_count() - 1, 4))`, but no more than the pool's thread count. The limit of 4 was decided from the measurements in 55.6:
+     running more in parallel hardly shortens the time and only increases memory). Most of numpy's computation releases the
+     GIL, so variables that do not depend on each other run in parallel on multiple cores (how much it helps is measured in 55.6. If it does not help, set it to 1).
+   - A variable that fails (an exception during computation) is skipped along with the variables that depend on it, and goes into `skipped` with a reason.
+   - It has a generation number (`_view_compute_generation`), raised when another view or file is opened, the file is closed, or on cancel. Results of an old generation are
+     discarded (the computed values themselves may stay in the `DeferredColumn`; that does no harm).
+   - If there is nothing to compute (everything is a `DerivedColumn` or a raw column), skip 2 and go straight to 3.
+3. **Placement (synchronous)**: do the second half of the current `load_view` as is (creating plots, adding series, heights, linking the X axes, ranges, the consolidated warning, `_on_grid_layout_changed`). The values are
+   already computed, so no heavy computation occurs. Series that could not be computed (cancelled or failed) are skipped and appear in the consolidated warning.
+   A plot that becomes empty is removed by the same rule as now.
+
+- **Entry points disabled during computation (found in review, 2026-10-15)**: the function manager, map manager, signal aliases, alias ON/OFF, "+ add plot", saving the view, and
+  the time-axis selection (combo) (`_VIEW_COMPUTE_LOCKED_ACTIONS` and `time_axis_combo` are set with `setEnabled(False)`). Reason: if `update_registry` replaces a column that is being computed,
+  placement judges it "not computed" and drops the series; saving would store an empty half-finished layout; extra plots would be added.
+  They are restored however the computation ends (completion, cancel, failure, abort). Even if `update_registry`, `set_time_column` or `save_view_dialog` is called from a management screen left open,
+  nothing is changed during computation and only a notice is shown (`view_compute.busy`; `update_registry` returns the list of failures).
+- Before starting the computation, fit the empty grid to the whole time axis and sync the navigator (`_on_grid_layout_changed`. Found in review: the grid was 0–1 while the
+  navigator showed the whole range, which disagreed).
+- **Opening a view or file discards the current computation only after loading the new view / resolving its location has succeeded** (same as `load_parquet`. Found in review:
+  specifying a broken or missing view discarded the view in progress and left an empty grid and a stale `_view_name`). Aborting (`_abort_view_compute`) ends by
+  returning to a consistent state with `_on_grid_layout_changed()` (except in `closeEvent`).
+- During computation (during 2), the plot area, the variable panel and the expression input are disabled (`setEnabled(False)`, so that dropping a series or adding an expression does not
+  mix with the placement in 3). Opening or closing a file or view first cancels the current computation and then proceeds.
+- During 2, `_set_busy("view_compute", True)` (the recording of the operation log result waits for the computation to end; `_is_settling`).
+- Operation log: the start of `load_view` (as now) and `view_compute_cancel` (the cancel operation). Background jobs are recorded automatically as `job`.
+  The number of variables computed, the time taken and the parallelism are included in the `load_view` result (outside `state_snapshot`; an extra `log_op` record is fine).
+
+#### 55.4 Progress display (right end of the status bar)
+
+- On the right side of the status bar (in the `addPermanentWidget` row, next to the current "drawing" bar), show the following only while computing:
+  a progress bar (0 to the total count, determinate), the text "Opening view n / total · about M s remaining", and a cancel button.
+- Remaining estimate = (elapsed time / number finished) x (number remaining). While none has finished, "estimating remaining time". Because computation runs in parallel,
+  elapsed time is the real time since computation began (not the sum of per-variable times).
+- If 2 finishes within 300 ms, nothing is shown (to prevent flicker; shown by a timer).
+- All text goes through `tr()` (en and ja). The cancel button gets an `objectName` (so tests can press it).
+
+#### 55.5 Cancel
+
+- Pressing the button does `log_op("view_compute_cancel")`, raises the generation, and goes on to 3 without waiting for the jobs in progress (placing only what has been computed).
+  The numpy computation in progress cannot be stopped midway, so it keeps running in the background until it ends and its result is discarded (it stays in the `DeferredColumn`).
+- **A plot none of whose series could be shown because of cancel is kept as an empty pane** (user decision, 2026-10-15, so that the view's layout is not lost on a later save,
+  and variables can be added afterwards). Plots that became empty for other reasons (missing column, failed computation of a derived variable) are removed as before. A plot where some
+  series were cancelled and some dropped for other reasons is also kept. Height and X-axis linking follow `PlotDef`, the same as the other kept plots.
+- **Abandoned computation (after cancel or abort)**: the background jobs keep running in the shared analysis pool until they end, hold the old file's arrays in the meantime, and
+  `QThreadPool` waits for them at exit, so exit may be delayed (found in review; the code is not changed. The numpy computation cannot be stopped midway).
+- Series that could not be shown appear in the consolidated warning as "<name> (cancelled)". The derived variable definitions remain (they stay in the variable panel. If added to a
+  plot later, it is computed then = on the screen's thread, as now).
+
+#### 55.6 Measurement (before merge; for the report to the user)
+
+- The measurement script `tests/parquet_analyzer/bench_view_load.py` (not a pytest test; `uv run python …`): creates a file of the same shape as the investigation for 46, 20 functions, 40 derived variables and
+  a view (only some derived variables plotted), and measures `load_view` in a separate headless `MainWindow` process.
+  Values measured: the longest time the screen's thread stayed stopped (a 10 ms timer is put in the event loop and the maximum delay is taken), the time until drawing finishes, and the
+  peak resident memory. 2 million and 20 million rows, `main` (before the change) and after the change, `_VIEW_COMPUTE_PARALLEL` = 1 and the default.
+- The results are recorded in a table below this section and reported to the user. If parallelism has no effect, the default is set to 1.
+
+**Measurement results (2026-10-15, after the stage 1 implementation)**
+
+Environment: Apple M4 Pro (12 cores), 24 GB memory, macOS (Darwin 25.6), Python 3.12, headless (offscreen). The file has a time column plus 8 float64 columns,
+20 user functions (including calls to `where`, `rolling_mean`, `sqrt` and a curve map `cv`), 2 maps (1 curve, 1 2D), 40 derived variables
+(with chains), of which 8 are shown in 2 plots. `eager` is the behavior before the change (reproduced by making `deferred` in `_on_add_derived_variable` always False).
+"Longest stall" is the longest time the event loop stayed stopped (maximum delay of a 10 ms timer), "until drawn" is from the `load_view` call until
+all plots have finished drawing, and memory is the peak RSS of the child process. Each setting was measured twice (results fluctuate with other load on the machine; the second figure is to the right of `/`).
+
+| Rows | Method | Parallel | Longest stall (ms) | `load_view` call (s) | Until drawn (s) | Peak RSS (MB) |
+|---|---|---|---|---|---|---|
+| 2M | before | - | 1928 / 2547 | 1.9 / 2.5 | 2.4 / 3.4 | 1142 / 1146 |
+| 2M | deferred | 1 | 625 / 915 | 0.03 / 0.07 | 1.9 / 2.9 | 723 / 730 |
+| 2M | deferred | 2 | 604 / 1274 | 0.03 / 0.05 | 1.7 / 3.3 | 833 / 825 |
+| 2M | deferred | 4 | 611 / 1103 | 0.03 / 0.04 | 1.6 / 3.2 | 886 / 939 |
+| 2M | deferred | 11 | 602 / 1040 | 0.03 / 0.06 | 1.6 / 3.7 | 1100 / 1123 |
+| 20M | before | - | 14168 / 16196 | 14.2 / 16.2 | 15.0 / 17.1 | 9204 / 7136 |
+| 20M | deferred | 1 | 1160 / 1064 | 0.03 / 0.04 | 7.3 / 7.0 | 5001 / 4990 |
+| 20M | deferred | 2 | 1344 / 1075 | 0.11 / 0.03 | 5.5 / 4.8 | 6126 / 5950 |
+| 20M | deferred | 4 | 1396 / 984 | 0.16 / 0.03 | 5.6 / 3.9 | 7053 / 6786 |
+| 20M | deferred | 11 | 1552 / 939 | 0.10 / 0.03 | 7.8 / 4.3 | 5643 / 7546 |
+
+Reading:
+- The time the screen is stopped goes from about 2–2.5 s to about 0.6–1 s with 2 million rows, and from about 14–16 s to about 1–1.5 s with 20 million rows. The `load_view` call itself returns almost immediately
+  (0.03–0.16 s). The remaining 0.6–1.5 s is in placement (stage 3), where 8 series are added for all rows (confirmed by `layout_s` in `bench_view_load.py`), and
+  the same work was included before the change. It is outside the scope of this chapter.
+- Until drawn: with 20 million rows, 15–17 s becomes about 7 s with deferred and parallel 1 (the 32 unused variables are not computed), and a further 4–5.5 s with parallel 2–4.
+  With 2 million rows the effect of parallelism is within measurement noise.
+- Memory: deferred with parallel 1 uses less than before. The more parallelism, the higher the peak from per-variable temporary arrays of the running variables (with 20 million rows, parallel 1: about 5 GB, 4: about 6.8–7 GB,
+  11: about 5.6–7.5 GB).
+- Conclusion: the effect of parallelism shows only with large row counts (about 1.4–1.8x), so the default is kept, and the limit is set to 4 to hold down memory growth.
+
+#### 55.7 Test plan
+
+- `DeferredColumn`: merely building it does not materialize the input columns (`LazyColumn`'s `values` is not called) / the trial computation makes expression mistakes, unknown names,
+  unknown functions and shape mismatches raise at build time / the value of `values()` equals the full-row result of `evaluate_expression` / calling
+  `values()` from two threads at once computes only once / a chain where an input is a `DeferredColumn`.
+- `LazyColumn.peek` does not read the whole column (does not call `read_columns`).
+- `load_view` (with a real file): derived variables not shown in a plot are not computed / only the derived variables shown and their dependencies are computed /
+  the screen's thread does not stop during computation (with a monkeypatch that slows the jobs, confirm that events are processed during computation) / the placement afterwards
+  (series, colors, order, heights, ranges, linking) is the same as now (the existing view tests pass unchanged) / an exception during computation skips only that variable and its dependents and appears in the consolidated
+  warning / opening another view or closing the file during computation discards the old results.
+- Progress: the bar, text and button appear when it takes 300 ms or more / disappear when done / the estimate calculation (0 finished, midway).
+- Cancel: pressing it places only what has been computed, and the rest appears in the warning as "cancelled" / the derived variables remain in the variable panel and can be added to a plot later /
+  results arriving afterwards change nothing.
+- Function/map changes (`update_registry`) do not compute a not-yet-computed `DeferredColumn` (it is only rebuilt).
+- Parallel computation: dependency order is respected (a dependent is not submitted before its dependency finishes). No more than the parallelism limit are submitted.
+- During computation, it is included in the "drawing/computing" `_busy_sources`, and the recording of the operation log result waits for the end.
+- Add `view_compute_cancel` to the list of the side-effect tests (app ch. 45).
+
+#### 55.7.1 What was decided in implementation and differences from the spec (2026-10-15, implementer)
+
+- **Upper limit of 4 on the default parallelism** (55.3). The reason is the measurements in 55.6 (memory grows without getting faster).
+- **A derived variable whose computation fails is removed together with its definition, like one that could not be registered** (removed from `_derived` and the variable panel. Dependents are removed too,
+  and the warning shows "<name> (<reason>)"). Reason: if kept, adding it to a plot later would hit the same failure on the screen's thread, and an exception other than `ExpressionError` could
+  crash the operation (aligned with the result of today's "all or nothing"). Variables that were cancelled are not removed (as in 55.5).
+- **A series is judged by "has it been computed"** (stage 3). On cancel, a variable that happened to finish computing in the background has its series placed (not dropped).
+- **Operation log**: `log_op` calls in stage 3 (`add_plot` etc.) became child operations of `load_view` even after the event loop has run, by adding `compound_op(owner)`.
+  The `view_compute` busy mark is kept during stage 3 as well (so the `load_view` result is not written in an intermediate state). The extra record of the `load_view` result is
+  the `job` `view_compute` (`finish` / `cancel`, `target` is "computed count of total, parallel N", `ms`).
+- **`LazyColumn.peek`** is used only for the trial computation. `DeferredColumn.peek` returns a real slice if computed, and the trial result of the first rows (an approximation for validation) if not.
+- **Progress text** is "Opening view n / total · about M s remaining" (for a minute or more, "M min S s").
+- **Existing tests**: `wait_view_loaded(win)` from `tests/parquet_analyzer/view_load_helper.py` was added to 7 tests that inspect the layout right after `load_view`
+  (when there are derived variables shown in a plot, placement comes after the background computation).
+- **Table in app ch. 45**: a `view_compute_cancel` row was added. Because the watcher's `settle` cannot wait during computation, the row's action includes "`load_view` → wait for progress to appear →
+  press cancel", and the items allowed to change are `*` (everything). Reload, rebuilding the data source, unexpected dialogs (warnings are expected) and exception records are
+  detected by the watcher.
+
+- Tests for the fixes found in review (2026-10-15): disabling the entry points during computation and rejecting `update_registry` / `set_time_column`, restoring on completion, cancel, failure and abort /
+  a broken view leaves a computation in progress / an expression whose input is a `DeferredColumn` becomes a `DeferredColumn` and is not computed on the screen's thread / the grid range during computation matches the
+  navigator / handling of plots emptied by cancel (keep, other reasons removed, mixed kept, height and linking). The test for when progress does not appear lengthens the time before showing so that it is stable on slow CI.
+
+#### 55.8 Stage 2: speed up map computation (not started; details decided after the stage 1 measurements)
+
+- The map items under "performance and structure improvements from review": read the columns once instead of twice, and for regular grids compute the cell directly (expected 5–10x).
+  Start if the derived variables that use maps are still slow in the 55.6 measurements.
+
 ## Relations to other domains
 
 - **Data** ([data.md](./data.md)): expression evaluation reads only the needed columns via
@@ -1111,3 +1295,5 @@ Found in the review after merging (2026-10-07).
   to computing in full). Background computation uses a snapshot of the functions and maps taken when the
   column was built.
 - **Data** (43.2, 2026-10-06): conditional grammar, `where` and `isnan` are also element-wise, so `_margin` treats them as margin 0 and they are eligible for `DerivedColumn`.
+- **Data and App foundation** (ch. 55, 2026-10-15): when loading a view, derived variables are registered as `DeferredColumn`s, and only the ones shown in a plot are computed in the background (`WorkerHub`, in parallel). `LazyColumn` gains `peek` and a lock. Progress and cancel are at the right end of the status bar.
+- **Persistence** (ch. 55): the second half of `load_view` (placement) is done after the computation ends. The rules for skipping and for "missing items" are unchanged (cancel just adds one more reason for skipping).

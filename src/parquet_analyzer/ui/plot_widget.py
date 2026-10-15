@@ -236,6 +236,8 @@ class TimePlotWidget(pg.PlotWidget):
         self.scene().sigMouseClicked.connect(self._on_scene_mouse_clicked)
         # Hover value readout (detailed_specification.md 39): items are created lazily.
         self._hover_enabled = False
+        self._time_unreliable = False  # 56.1: cached flag set by the grid; never recomputed per move
+        self._time_unreliable_tip = ""
         self._hover_x: float | None = None
         self._hover_line: pg.InfiniteLine | None = None
         self._hover_label: pg.TextItem | None = None
@@ -787,12 +789,28 @@ class TimePlotWidget(pg.PlotWidget):
             return float(values[0]) if len(values) else None
         return float(entry["y"][row])
 
+    def set_time_unreliable(self, flag: bool, tip: str = "") -> None:
+        """56.1: the time axis is not ascending, so range-based values may be wrong. Cursor and hover
+        readouts get a warning mark before the values (the values are still shown). `flag` is a value
+        cached by MainWindow when the time axis was chosen -- hover only reads it."""
+        flag = bool(flag)
+        if flag == self._time_unreliable and tip == self._time_unreliable_tip:
+            return
+        self._time_unreliable = flag
+        self._time_unreliable_tip = tip if flag else ""
+        self.refresh_cursor_labels()
+        if self._hover_label is not None:
+            self._hover_label.setToolTip(self._time_unreliable_tip)
+            if self._hover_x is not None:
+                self._render_hover(settled=True)
+
     def _update_cursor_label(self, cursor_id: str) -> None:
         entry = self._cursors.get(cursor_id)
         if entry is None:
             return
         x = entry["line"].value()
-        lines = [self.format_x(x)]
+        lines = [("\u26a0 " if self._time_unreliable else "") + self.format_x(x)]
+        entry["label"].setToolTip(self._time_unreliable_tip)
         for name, series_entry in self._series.items():
             if not series_entry["visible"]:
                 continue  # hidden series get no value line (23.1)
@@ -870,6 +888,7 @@ class TimePlotWidget(pg.PlotWidget):
         label.setParentItem(self.getViewBox())
         label.setZValue(60)
         label.setVisible(False)
+        label.setToolTip(self._time_unreliable_tip)
         self._hover_line, self._hover_label = line, label
         self.getViewBox().sigResized.connect(self._position_hover_label)
 
@@ -950,7 +969,7 @@ class TimePlotWidget(pg.PlotWidget):
 
     def _render_hover(self, settled: bool) -> None:
         x = self._hover_x
-        header = self.format_x(x) + ("" if self.x_axis_datetime else " Hz")
+        header = ("\u26a0 " if self._time_unreliable else "") + self.format_x(x) + ("" if self.x_axis_datetime else " Hz")
         rows = [f'<span style="color:#000">{html.escape(header)}</span>']
         for name, entry in self._series.items():
             if not entry["visible"]:

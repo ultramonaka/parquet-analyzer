@@ -7,6 +7,7 @@ import pytest
 from PySide6.QtCore import QMimeData, QPointF, Qt
 from PySide6.QtGui import QDropEvent
 from PySide6.QtWidgets import QDialog, QMessageBox
+from view_load_helper import wait_view_loaded
 
 from parquet_analyzer import features
 from parquet_analyzer.core.functions import UserFunction
@@ -14,6 +15,7 @@ from parquet_analyzer.io import maps as maps_io
 from parquet_analyzer.io import user_functions as uf_io
 from parquet_analyzer.io import view as view_io
 from parquet_analyzer.io.view import DerivedVariableDef, PlotDef, SeriesDef, SourceDef, View
+from parquet_analyzer.ui import messages
 from parquet_analyzer.ui.function_manager import (
     DropLineEdit,
     FunctionManagerWindow,
@@ -551,6 +553,8 @@ def _marked_names(dialog):
 def test_view_with_missing_function_skips_chain_and_manager_marks_match(win, monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text, *a, **k: seen.append(text))
+    # "ghost" is a missing signal: the warning carries the assign button (persistence 54.6), same text
+    monkeypatch.setattr(messages, "warning_with_button", lambda _p, _t, text, _b: seen.append(text) or False)
     maps_io.import_map(_csv(tmp_path, "cv.csv", CURVE), "cv")
     win.function_registry.maps["cv"] = maps_io.load_map("cv")
     _save_view(
@@ -570,6 +574,7 @@ def test_view_with_missing_function_skips_chain_and_manager_marks_match(win, mon
     dialog = ViewManagerDialog(available, available_functions=win.function_registry.all_names())
     marked = _marked_names(dialog)
     win.load_view("v")
+    wait_view_loaded(win)
     loaded = set(win.plot_grid.plots[0].series_names()) | set(win._derived)
     view = view_io.load_view("v")
     names = {s.variable for p in view.plots for s in p.series} | {d.name for d in view.derived_variables}
@@ -586,6 +591,7 @@ def test_load_view_warning_names_missing_function(win, monkeypatch):
     monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text, *a, **k: seen.append(text))
     _save_view("v", [PlotDef("p1", [SeriesDef("a", "#ff0000")])], [DerivedVariableDef("d1", "Gone_fn(a)")])
     win.load_view("v")
+    wait_view_loaded(win)
     assert len(seen) == 1 and "Gone_fn" in seen[0] and "d1" in seen[0]
 
 
@@ -608,6 +614,7 @@ def test_view_manager_marker_text_names_function(win):
 def test_view_with_present_function_loads_fully(win):
     _save_view("v", [PlotDef("p1", [SeriesDef("d1", "#ff0000")])], [DerivedVariableDef("d1", "Power_fn(a, b)")])
     win.load_view("v")
+    wait_view_loaded(win)
     assert "d1" in win._derived and win.plot_grid.plots[0].series_names() == ["d1"]
 
 
@@ -804,6 +811,7 @@ def test_view_manager_marks_signature_mismatch_like_load_view(win, monkeypatch):
                                registry=win.function_registry)
     marked = _marked_names(dialog)
     win.load_view("v")
+    wait_view_loaded(win)
     loaded = set(win.plot_grid.plots[0].series_names()) | set(win._derived)
     for n in ("d1", "d2", "d3", "d4", "ok"):
         assert (n in marked) == (n not in loaded), n

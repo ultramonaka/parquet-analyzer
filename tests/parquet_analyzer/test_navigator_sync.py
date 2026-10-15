@@ -1,4 +1,4 @@
-"""NavigatorSync / NavigatorWidget keep_region (plots 24.9; dev notes task 20).
+"""NavigatorSync / NavigatorWidget keep_region.
 
 1. NavigatorWidget alone: set_overview_data keeps/clamps/resets the region and never emits
    rangeSelected.

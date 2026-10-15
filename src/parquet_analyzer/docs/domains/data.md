@@ -69,7 +69,7 @@ the MDF/MATLAB→Parquet conversion tool.
   were adopted and implemented (cache memory management and cancellation were not adopted). The design is
   in [36.8](#368-the-adopted-design-2026-10-04-from-the-367-decision-and-the-reviewers-review).
 
-#### 5.46 Aggregating statistics over a whole column window by window (added 2026-10-13, stage 1 of dev notes item 29)
+#### 5.46 Aggregating statistics over a whole column window by window
 - When "Statistics" is pressed on a large file (a windowed column), the rows of the displayed range are not read all
   at once; they are read in chunks and aggregated as they go. The 4–6 GB needed for statistics over the whole of a
   100-million-row column (36.7) is brought down to about the amount resident after drawing.
@@ -78,7 +78,7 @@ the MDF/MATLAB→Parquet conversion tool.
 - The results (count, missing, min, max, mean, standard deviation, median) are the same as now (the median stays exact).
 - Separating `values()` (the read-everything API) and making it explicit by name is specified later as stage 2
   (user's decision, 2026-10-13).
-- Details in [ch. 53](#53-aggregating-statistics-over-a-whole-column-window-by-window-added-2026-10-13-stage-1-of-dev-notes-item-29).
+- Details in [ch. 53].
 
 #### 5.30 Reliably releasing background-job parts and protecting UI objects (added 2026-10-03, from the 13.6 investigation)
 - When background work (downsampling, envelopes, statistics, FFT, analysis windows) finishes, the parts
@@ -87,6 +87,40 @@ the MDF/MATLAB→Parquet conversion tool.
 - Python's cleanup of data no longer used (garbage collection) runs only on the UI thread, preventing
   crashes from UI objects being destroyed on a background thread.
 - Details in [ch. 37](#37-releasing-background-job-parts-and-garbage-collection-added-2026-10-03-from-the-136-investigation).
+
+#### 5.50 Time-axis order, continued: statistics warnings, duplicate times, sorted display, time zones (added 2026-10-15, user request)
+- The status-bar warning (5.22) stays as it is (user's decision).
+- When the time axis is not ascending, **screens that show range-based values also show a warning**: the statistics result, analysis
+  windows that use a range (XY, histogram, FFT), cursor readouts and the hover display. The values are still shown as before.
+- **Duplicate times** (places where the same time repeats) are counted and the count is shown in the status-bar warning (calculations are
+  still correct, so this is shown as a "notice", separate from not-ascending / missing).
+- A feature to **display sorted by the time axis** is added. It can be switched on and off (default off). Even after sorting, the
+  correspondence with the **original row number** is kept, and the original row number can be seen in the cursor, the hover and
+  exported files.
+- A time axis of **time-zone-aware times** is displayed in **UTC**.
+- Tests are added for time axes with duplicate times, NaN, infinity and time-zone-aware times.
+- Details in [ch. 56](#56-time-axis-order-continued-added-2026-10-15).
+
+#### 5.52 Withstanding data of 500 million rows x 50 columns (added 2026-10-15, user request; stage 1 is measurement)
+- Parquet files of about 500 million rows and 50 columns are used for analysis (none on hand yet). Reduced from the original 1 billion rows x
+  100 columns (2026-10-15, user's decision; stage 1 measurements were already done at 1 billion rows, so they serve as the upper-bound result).
+  Processing that uses all rows (views, export, histograms, etc.) is heavy.
+- Target: the main operations (open, open a view, whole-column statistics, histogram) **within 20 seconds**. The memory limit can be changed
+  per environment in the settings (e.g. up to 95% of physical memory). Calculations that use all rows **prioritize accuracy** (no
+  approximation).
+- Places expected to get faster (virtual-variable computation, statistics, etc.) are run in parallel on **multiple cores**.
+- Whether to design the time axis so that it is not held entirely in memory either will be decided as work proceeds.
+- Stage 1 is **measurement only**: write a script that creates test files (about 20 columns), generate files, and measure where it gets stuck.
+  The policy for stage 2 is decided from the results (user's decision, 2026-10-15).
+- Details in [ch. 58](#58-withstanding-data-of-500-million-rows-x-50-columns-added-2026-10-15).
+
+#### 5.53 Correctness and boundary conditions on large data (added 2026-10-15, from external review 3)
+- At the scale of 500 million rows, confirm by measurement that results (statistics, histograms, virtual variables, displayed range,
+  pyramid, export) are correct. The current measurements look only at time and memory.
+- Premises that rely on pyarrow's current behavior, such as the pyramid bucket positions, are guaranteed by our own code and fixed by tests.
+- Verify with random data the cases where NaN, Inf, duplicate times or float32 lie at bucket, anchor and row-group boundaries.
+- Background work that never stops, memory limits and fallback to full computation are handled in stage 2 of ch. 58 (not in ch. 59).
+- Details in [ch. 59](#59-correctness-and-boundary-conditions-on-large-data-added-2026-10-15).
 
 ## Design
 
@@ -344,7 +378,7 @@ strong reference to the worker, the drawing indicator (the count of `downsampleS
 - FFT: failure → a warning (checked with a monkeypatch), `_busy_sources` back to empty.
 - Confirm each test fails if 28.1's exception handling is removed (the drawing indicator remains, etc.).
 
-#### 28.4 Discarding old results of the previous file (added 2026-10-08, from the A2 results; dev notes item 30)
+#### 28.4 Discarding old results of the previous file
 
 In A2 ([app 46.5](./app.md)), two paths were found through which results of jobs of the previous file got through when
 a file was reopened. Both are marked `xfail(strict=True)` in `test_worker_paths.py`; remove the marks once fixed.
@@ -396,7 +430,7 @@ Requirement: 5.22. Background: `MainWindow._visible_row_range`, `TimePlotWidget.
 cursors' nearest-sample lookup use `np.searchsorted`, assuming an ascending time axis. Any column can be
 chosen as the time axis, yet that assumption was checked nowhere. `ParquetDataSource.is_monotonic()` was
 implemented but unused, and it looks only at row-group statistics, so it can't see disorder within a row
-group (external review #1 in dev notes, fact-checked).
+group.
 
 #### 29.1 The check (add `check_time_order(values) -> TimeOrderReport` to `core/numeric.py`)
 
@@ -809,7 +843,7 @@ because the review found violations):
   navigator waiting for it** redraw (no matter who started building it). If it can't be built, `renderFailed`
   reports it; it never stays blank silently.
 - When the navigator's overview changes later (on the pyramid's completion), the selection is put back on the
-  linked group's visible range (via `_on_grid_layout_changed`; the sixth path of dev notes 2026-10-02).
+  linked group's visible range.
 - Background computation of derived variables uses a snapshot (never modified) of the functions and maps taken
   when the column was built. Function and map changes replace it with a new snapshot through the current
   recompute path (expressions ch. 18/26's "all or nothing" doesn't change).
@@ -833,7 +867,7 @@ rows (with `eager_load_limit_mb=0` to exercise D too) and a non-ascending time a
 
 ### 37. Releasing background-job parts and garbage collection (added 2026-10-03, from the 13.6 investigation)
 
-Requirement: 5.30. Background (the investigation in dev notes 13.6):
+Requirement: 5.30.
 - `BackgroundWorker` (`setAutoDelete(False)` + a strong reference held by the caller) was **never released**
   for two reasons: (1) the lambdas receiving results captured the worker (PySide keeps lambdas on the C++ side,
   where Python's GC can't follow them), and (2) `QThreadPool` keeps Python references to work it doesn't
@@ -869,6 +903,11 @@ Requirement: 5.30. Background (the investigation in dev notes 13.6):
   number) are made here.
 - `_deliver` (UI thread): takes the entry out of `pending` first, then calls exactly one of `on_finished` or
   `on_failed` once. If it can't be taken out (already cancelled, etc.), nothing happens.
+- **Progress path (2026-10-15, addition from export 57.3)**: the relay gained another signal, `progress(hub_ref, key, done, total)`.
+  `hub.progress_sink(callback) -> (key, emit)` registers `callback(done, total)` and returns an `emit(done, total)` that can be called from a pool
+  thread. `emit` fires the relay's `progress`, and `callback` is called on the UI thread (the worker never touches UI parts). Progress that
+  arrives after `hub.drop_progress(key)` is discarded. Progress arrives before the same thread's `done` (in emission order). The meaning of
+  `total < 0` belongs to the caller (for export: "computing all rows").
 - Existing rules stay: dropping stale results by generation number, balancing `downsampleStarted`/`Finished`,
   not `deleteLater`-ing a plot with jobs in flight (counted with `len(pending)`), ch. 28's failure reporting, and
   25.1's cancellation of analysis windows (results of cancelled work are ignored by the receiver).
@@ -898,7 +937,7 @@ Requirement: 5.30. Background (the investigation in dev notes 13.6):
   (counted with weak references, not `gc.get_referrers`).
 - GC timer: run the event loop for about 1.2 s with the default thresholds, and collection runs from the timer.
 
-### 40. Navigator overview of windowed columns (added 2026-10-03, from dev notes 13.7)
+### 40. Navigator overview of windowed columns
 
 Background: with `eager_load_limit_mb=0`, plotting a column of a file with a single row group
 (`feature_test.parquet`) made `MainWindow._windowed_navigator_overview` build the overview from row-group
@@ -939,9 +978,9 @@ improve the implementation** (it only measures).
   36.1 as "36.4 Measurements (baseline)". For stages that are clearly problematic (tens of seconds or more, several
   GB of memory or more), add an assessment of the cause (fixing it is ch. 36's job).
 
-### 53. Aggregating statistics over a whole column window by window (added 2026-10-13, stage 1 of dev notes item 29)
+### 53. Aggregating statistics over a whole column window by window
 
-Requirement: 5.46. Sources: dev notes "External review 2" #4, candidate C, and "Remainder of large-data support" (2).
+Requirement: 5.46.
 
 #### 53.1 The current design (fact-checked, `main` as of 2026-10-13)
 
@@ -980,9 +1019,7 @@ Requirement: 5.46. Sources: dev notes "External review 2" #4, candidate C, and "
 4. **Switching files.** Discarding results when another file is opened during a computation (app 46.5 S-5) stays as it is. The
    background work keeps reading the old `ParquetDataSource`, so reading a closed file must not crash (same as the current
    `DerivedColumn` path: a read that raises is reported as a failure and dropped by the generation check).
-5. Not changed in stage 1: the name and API of `values()` (stage 2), the inside of `chunked_stats` (the "median bin becomes large
-   for a column where one value dominates" item of dev notes "Remainder of large-data support" (4); the ±1e308 overflow in dev notes is a
-   separate issue and stays as is), and how histogram, XY and FFT read data.
+5. Not changed in stage 1: the name and API of `values()` (stage 2), the inside of `chunked_stats`, and how histogram, XY and FFT read data.
 
 #### 53.3 Test plan
 
@@ -1048,6 +1085,454 @@ that stage). The RSS at the start of the stage was about 1,350 MB (the resident 
   excluded operations in 46.6.
 - **36.8 in this document**: the windowed-column read paths gain `read_uncached` (the only way through the cache stays `window`).
 
+### 56. Time-axis order, continued (added 2026-10-15)
+
+Requirement: 5.50. A continuation of ch. 29. Split
+into two stages: stage 1 = 56.1-56.3 and 56.6 (warnings, duplicate times and tests), stage 2 = 56.4 and 56.5 (sorted display and UTC; split
+because the impact is wide).
+
+#### 56.1 Warnings on screens that use a range (stage 1)
+
+- `MainWindow` gets one place that answers "might range calculations be wrong with the current time axis?"
+  (`time_order_unreliable() -> bool`: `True` when `_time_order_report` exists and `decreasing_count > 0`. Missing values alone give `False`,
+  because missing values do not break range calculations. `False` while displayed sorted (56.4)), and each screen looks only at this.
+- Where and how it is shown (values are still shown as before; not modal):
+  - Statistics result (statistics dialog): one warning-colored line above the table, "⚠ The time axis is not ascending, so statistics for
+    the range may be incorrect".
+  - Analysis windows that use a range (XY, histogram, FFT): one line with the same meaning next to the range display (a short wording is fine).
+  - Cursor readout and hover display: a "⚠" before the value, and the reason in the tooltip (if any). Keep per-mouse-move work light
+    (overview §2): do not compute `time_order_unreliable()` each time (just read the value held when the time axis was decided).
+- Re-apply when the time axis is switched or the file is reopened (open analysis windows and statistics dialogs are re-applied at their next
+  recalculation).
+- Implementation (stage 1): for the cursor and hover, `MainWindow._apply_time_order_to_readouts` passes `PlotGrid.set_time_unreliable(flag, tip)`
+  to each `TimePlotWidget` every time the time axis is decided (also inherited by plots added later; FFT plots are excluded). The statistics
+  dialog has a warning label via `StatsDialog(time_unreliable=)`. XY and histogram add a short wording (`time_order.range_warning_short`) at the
+  start of the status display.
+- Deviation (FFT): FFT is disabled by a feature flag, and its result is added to a plot rather than to a window with a "range display". When
+  the range is not ascending, the existing `fft.time_not_ascending` refuses the run itself (ch. 32), so no warning line was added to FFT.
+- How duplicates are counted (56.2): like `decreasing_count`, non-finite values are skipped, and a value equal to the previous **finite value**
+  is a duplicate (`2, NaN, 2` is one). +-Inf is not finite and is not counted as a duplicate. `TimeIndex.build` also keeps the scan result
+  as-is in `report` (to show the duplicate count).
+- Impact on existing tests: a time axis with all rows equal (`constant`/`bool`) or `_times()` with consecutive duplicates is `ok` but has many
+  duplicates, so the label now appears (the tests' expectations were corrected to match 56.2).
+
+#### 56.2 Duplicate times (stage 1)
+
+- `TimeOrderReport` gains `duplicate_count` (the number of places where, with only finite values lined up, the value equals the previous one)
+  and `first_duplicate_index` (the original row number, `None` if none). Keep the chunked scan design (29.1), giving the same result
+  across chunk boundaries as in one pass. The meaning of `ok` is unchanged (duplicates do not break range calculations; the condition for
+  using `TimeIndex` is also unchanged).
+- The status-bar warning label (29.2) is shown when it is not `ok` **or** `duplicate_count > 0`. The duplicate wording is
+  `time_order.has_duplicates` ("⚠ The time axis has N identical times"). The tooltip shows the row number of the first duplicate (1-based).
+- `duplicate_count` is added to the operation log's `time_order_warning` and to `state_snapshot`.
+
+#### 56.3 Confirming the current handling of time-zone-aware times (stage 1)
+
+- Stage 1 does not change the display (switching to UTC is 56.5 in stage 2). The current behavior (epoch seconds and whether a warning
+  appears when a time-zone-aware column is the time axis) is fixed by tests so that it is clear what stage 2 changes.
+
+#### 56.4 Display sorted by the time axis (stage 2)
+
+- Switch: "Display sorted by time axis" in a "View"-type menu (or the toolbar), a checkable action, default off, shortcut configurable. Enabled
+  only when the time axis is not ascending (cannot be pressed if ascending; the tooltip gives the reason). The state is saved in the view
+  (`time_sorted: bool`; adding a key, so `schema_version` is not raised. Old views are off).
+- Mechanism: build once a stable sort order from the time-axis values (`order = np.argsort(time, kind="stable")`, non-finite values at the end),
+  wrap **all columns so they are seen in this order** (`SortedColumn(base, order)`: `values()` is `base.values()[order]`, `window(a, b)` is
+  `base.values()[order[a:b]]`), and replace `_raw_variables`. The time-axis values are also the sorted ones (ch. 29's check becomes ok plus
+  missing only on the sorted values). Virtual variables are recomputed from the sorted inputs (`delta` and moving averages are computed in time
+  order; this is the purpose).
+- **Original row number**: `order[i]` is the original row number of displayed row `i`. The cursor readout and the exact hover value (after
+  stopping) show "original row N" (1-based). Parquet export (ch. 57) adds a column `source_row` (the original row number, **1-based**,
+  `int64`) while displayed sorted.
+- Restriction (stage 2): not usable on files that have windowed columns (over `eager_load_limit_mb`) (cannot be pressed; the tooltip gives the
+  reason), because sorting turns reads into random reads and breaks the premise of windowed reads. How to handle large files is decided in
+  stage 2 of ch. 58.
+- Memory: the order array (8 bytes x rows) and sorted copies of the columns used. At switch time an estimate of the required amount is given,
+  and once the memory-limit setting of ch. 58 exists, it refuses based on that.
+- Turning it off returns to the original columns and recomputes virtual variables. Plots and ranges return to the whole view (because the
+  row correspondence changes).
+
+#### 56.5 Display time-zone-aware times in UTC (stage 2)
+
+- Currently all time displays use `datetime.fromtimestamp` (the PC's local time), in about 10 places: axis, cursor, hover, view manager,
+  histogram, image annotation, operation log, etc. Only when the time-axis column is time-zone-aware, these are displayed in **UTC** (times
+  without a time zone and numeric time axes stay local as before).
+- Mechanism: gather the display time conversion into one place in `core/` (e.g. `to_display_datetime(x, utc: bool)` in `core/timefmt.py`, plus a
+  small setting that holds UTC or local), and have each place call it. Whether the current time axis is shown in UTC is decided by
+  `MainWindow` when it decides the time axis. When UTC, "UTC" is shown in the axis label and annotation.
+- When starting stage 2, add the list of places (`grep fromtimestamp`) to the spec before proceeding.
+
+#### 56.6 Test plan
+
+- `check_time_order`: duplicate count and first row number (no duplicates, consecutive duplicates, separated duplicates, duplicates across
+  chunk boundaries, equal values separated by NaN, +-Inf duplicates). The chunked result equals the one-pass result (with `hypothesis`,
+  written like the property tests of app ch. 46).
+- Warning label: shown for duplicates only while staying `ok` (the `TimeIndex` condition also unchanged). Wording for not ascending +
+  duplicates + missing.
+- Range warnings: with a non-ascending time axis, a warning appears in the statistics dialog, XY, histogram, cursor readout and hover. Not for
+  missing-only, duplicates-only or normal. Disappears when the time axis is switched to a normal column. The check is not redone on every
+  hover movement.
+- Abnormal time axes (open real files with `load_parquet`): duplicate times, NaN (start, middle, end), +-Inf, time-zone-aware times (UTC and
+  `Asia/Tokyo`), a time-zone-aware column containing NaT. Opening, plotting, whole view, statistics and cursor raise no exception and do not
+  hang (written as in 29.4).
+- Stage 2: sort toggle (values, original row number, virtual-variable `delta` in time order, restored when turned off, saving and loading in a
+  view, cannot be pressed for windowed files). UTC display (09:00 in `Asia/Tokyo` is 00:00 UTC on the axis, cursor and hover; a column without
+  a time zone stays local as before).
+
+### 58. Withstanding data of 500 million rows x 50 columns (added 2026-10-15)
+
+Requirement: 5.52. A continuation of ch. 36, 41 and 53.
+
+#### 58.1 Premises and targets
+
+- Scale: 500 million rows x 50 columns (reduced from the original 1 billion rows x 100 columns, 2026-10-15, user's decision). With float64, one column
+  is 4 GB and the whole is about 200 GB (does not fit in physical memory). The time axis alone is 4 GB.
+- Current baseline (36.4, 36.7): resident memory of about 4-5 GB at 100 million rows. Many places currently hold the whole time axis
+  (`_time_values`) (36.8 D's `TimeIndex` is only for ascending axes).
+- Target: open, open a view, whole-column statistics and histogram within 20 seconds (how far each operation reaches is estimated from the stage 1
+  measurements). Accuracy first (no thinning or sampling in calculations over all rows). The memory limit is a setting (what % of physical
+  memory).
+- Multi-core: places where it should help, such as virtual-variable computation and statistics. The process-based and thread-based approaches
+  are chosen after measuring.
+- Development machine (used for measurements): 12 cores, 24 GB memory, about 178 GB free disk (2026-10-15). 1 billion rows x 20 columns in
+  float64 would be about 168 GB (uncompressed), which does not fit in the free space, so test files **default to float32** and use values that
+  shrink under compression (zstd).
+
+#### 58.2 Stage 1-1: script that creates test files
+
+- `tests/parquet_analyzer/generate_wide_parquet.py` (run with `uv run python ...`; not a pytest test).
+- Arguments: `--output`, `--rows` (e.g. `1e9` is also accepted), `--columns` (default 20, excluding the time axis), `--dtype` (`float32`
+  default / `float64`), `--row-group-rows` (default 1 million), `--compression` (`zstd` default / `snappy` / `none`), `--interval-ms`
+  (default 1), `--gaps` (number of time jumps to insert, default 2), `--seed`, `--force`.
+- Columns: `time` (`datetime[ns]`, no time zone, evenly spaced plus jumps), and signals that repeat several kinds in turn (sine, slow slope,
+  noise, steps, integer counter). Known relations are built in (e.g. `sig_00**2 + sig_01**2 = 1`, `sig_02 - sig_00 = 10`), so that they can be
+  checked by eye as with `feature_test.parquet`. The docstring lists the columns and relations.
+- **Memory is constant regardless of the row count**: build one row group at a time and write with `pyarrow.parquet.ParquetWriter`. Shows
+  progress (rows, %, elapsed, estimated remaining).
+- **Disk check**: estimate the total from the size of the first row group written, and stop if the free space is less than "estimate + 10 GB"
+  (`--force` to continue).
+- Generated files go under `data/raw/` (not in the repository). Sizes to create: 100 million, 300 million and 1 billion rows (all 20
+  columns, float32). For comparison, also create 100 million rows in float64 (if disk allows).
+
+#### 58.3 Stage 1-2: measurement
+
+- Use `tests/parquet_analyzer/bench_large_file.py` (ch. 41). Stages to add: open a view (10 virtual variables, 3 of which are plotted; compare
+  before and after ch. 55), whole-column histogram, whole-column statistics (the ch. 53 path), computing a virtual variable over all rows
+  (about `a*b+c`), Parquet export (if ch. 57 is in). For each stage, record elapsed time and peak resident memory plus **CPU usage** (the
+  process's CPU time / elapsed time = a rough number of cores used), to see the room for multi-core. If the time limit is exceeded, record
+  "timeout" and move on (same as ch. 41).
+- Measure in the order 100 million -> 300 million -> 1 billion rows, and tabulate how each stage's time and memory grow with the row count. If
+  even opening fails at 1 billion rows (out of memory / timeout), record the cause at that point (which array, how many GB) and stop.
+- The results are recorded as a table under "58.4 Measurement results" in this chapter and reported to the user.
+
+#### 58.4 Measurement results (2026-10-15, stage 1)
+
+Machine: Apple M4 Pro (12 cores), 24 GB memory, macOS 26.6, Python 3.12. Settings are defaults (default `eager_load_limit_mb`, feature flags
+default). The files are the defaults of `generate_wide_parquet.py` (20 float32 columns, zstd, 1 million rows per row group, 1 ms interval, 2
+time jumps). The measuring command is `bench_large_file.py` (ch. 41). Each file was measured once (no repetition).
+
+**File generation** (written with constant memory, one row group at a time):
+
+| Rows | Size | Generation time | Speed |
+|---:|---:|---:|---:|
+| 100M | 1.29 GB | 22 s | 4.5M rows/s |
+| 300M | 3.88 GB | 70 s | 4.3M rows/s |
+| 1B | 12.95 GB | 255 s | 3.9M rows/s |
+
+About 13 bytes per row (for 21 columns). Values are rounded to power-of-two steps, so they shrink well with dictionary encoding + zstd (raw
+data for 20 float32 columns is about 84 bytes/row). **Real data of 500 million rows x 50 columns (about 200 GB in float64) is much larger (and harder
+to compress), and disk reads become the bottleneck**. Treat this result as the "lower bound when the amount read is small". Also, the 13 GB file
+fits in 24 GB of physical memory, so after the first stage the measurements are with the file in the OS page cache.
+
+**Time per stage (seconds) and peak resident memory (MB, the process maximum up to that stage)**. `hist_full`, `derived_full`, `view_load`,
+`plot3`, `derived2_plot`, `open_to_first_draw` and `burst20` were measured in dedicated child processes (RSS is not affected by other stages).
+The others are consecutive stages in the same child process (resident memory remains after `time_switch`, so do not read the absolute RSS of
+later stages).
+
+| Stage | 100M: s / MB | 300M: s / MB | 1B: s / MB | 1B CPU (cores) |
+|---|---:|---:|---:|---:|
+| load (open) | 0.84 / 300 | 1.97 / 358 | 6.44 / 364 | 1.4 |
+| plot (first draw of 1 column) | 0.90 / 459 | 2.40 / 650 | 7.68 / 1213 | 2.4 |
+| zoom1000 (zoom to 1/1000) | 0.18 / 467 | 0.19 / 660 | 0.21 / 1228 | 0.5 |
+| pan1000 | 0.53 / 471 | 0.58 / 667 | 0.57 / 1245 | 0.4 |
+| stats_full (whole-column statistics, one raw column) | 0.98 / 704 | 2.83 / 880 | 9.80 / 1488 | 1.2 |
+| derived_plot (show `a+b`) | 1.46 / 704 | 4.35 / 880 | 15.4 / 1488 | 1.7 |
+| time_switch (another column as time axis) | 0.82 / 3025 | 3.25 / 5803 | 19.9 / 9611 | 1.0 |
+| hist_full (whole-column histogram, 1 column) | 1.68 / 572 | 5.08 / 686 | 18.6 / 1282 | 1.5 |
+| derived_full (`a*b+c` over all rows) | 3.51 / 571 | 10.7 / 580 | 40.1 / 689 | 1.6 |
+| plot3 (show 3 columns) | 1.31 / 753 | 3.64 / 1037 | 12.3 / 2641 | 6.1 |
+| derived2_plot (show 2 virtual variables) | 2.12 / 635 | 6.50 / 630 | 26.8 / 649 | 2.1 |
+| open_to_first_draw (open -> first draw) | 1.47 / 479 | 4.16 / 655 | 19.7 / 822 | 2.0 |
+| view_load (open a view with 10 virtual variables, 3 shown) | 3.94 / 724 | 12.1 / 738 | 44.2 / 3263 | 2.5 |
+| burst20 (20 quick zooms/pans) | 0.45 / 490 | 0.44 / 635 | 0.50 / 910 | 1.0 |
+
+`parquet_export` is recorded as "skipped" because `MainWindow` does not yet have an export entry point (ch. 57 is not implemented) (add a call
+to that stage of `bench_large_file.py` once the entry point exists). No stage timed out or ran out of memory, even at 1 billion rows (opening and
+all stages ran to the end).
+
+**What can be read from this**:
+
+- **Time grows almost in proportion to the row count** (about 8-11x from 100M to 1B). Stages that scan all rows exceed the 20-second target
+  (58.1): `view_load` 44 s, `derived_full` 40 s, `derived2_plot` 27 s, `derived_plot` 15 s (within 20 s but with no margin), `hist_full` 19 s,
+  `open_to_first_draw` 20 s is exactly on the border. `stats_full` (9.8 s) is within the target. Zoom, pan and whole view are constant
+  regardless of the row count and comfortable even at 1 billion rows (0.2-0.6 s).
+- **CPU is barely used**: of 12 cores, the stages that scan all rows (`stats_full`, `hist_full`, `derived_full`, `view_load`) use only 1.2-2.5
+  cores (only `plot3` uses 6 cores, because it runs a separate background job per column). Processing in parallel chunks (per row group)
+  could shorten times by a factor close to the number of cores.
+- **Two memory peaks**. (1) `time_switch`: making a column that is neither ascending nor a time (`sig_01`) the time axis loads all rows as
+  float64, **about 9.3 GB** at 1 billion rows (about 9.6 bytes per row). It passes on 24 GB, but breaks at scales beyond physical memory or with
+  repeated switches. The default time axis (an ascending time) `load` stays at 364 MB, thanks to `TimeIndex` (36.8 D). (2) The part
+  proportional to the number of displayed columns: about 0.9-1.2 bytes/row per column (the increment of `plot`, about 0.9 GB at 1 billion rows).
+  `plot3` rises to 2.6 GB and `view_load` to 3.3 GB (because 3 virtual variables are first drawn at the same time). Showing many of the 50
+  columns at 500 million rows x 50 columns reaches over ten GB.
+- The first draw of virtual variables (`derived_plot`, `derived2_plot`, `view_load`) is, after all, the same work as computing that variable once
+  over all rows (about the same seconds per variable as `derived_full`).
+
+**Implications for stage 2 (58.5)**:
+
+1. Split the processing that scans all rows (statistics, histogram, virtual-variable computation, thinning for the first draw) across multiple
+   threads/processes per row group. First `derived_full`, `hist_full` and `view_load` (if close to 10 cores can be used, around 10 seconds
+   even at 1 billion rows).
+2. Switching the time axis (a non-ascending / non-time column) should not load all rows as float64 (extend `TimeIndex`, or windowed reads).
+   The memory-limit setting (58.5) refuses this kind of operation before it starts.
+3. When opening a view, either parallelize the computation for the first draw of plotted virtual variables, or defer it with ch. 55's laziness
+   and open the screen first.
+4. Next measurement: real 50 columns, float64, hard-to-compress values, and a size that does not fit in the page cache (a file over 24 GB).
+   This result is the lower bound when the amount read is small.
+
+#### 58.5 Stage 2 policy (2026-10-15, user's decision)
+
+The target scale is 500 million rows x 50 columns (5.52). Estimates from halving stage 1's values by row count: open a view about 22 s, virtual
+variable over all rows about 20 s (on the border of the 20 s target), histogram about 9 s, first draw about 10 s, statistics about 5 s (within
+target). However, the stage 1 files compress well and were in the page cache, so values with real data, where disk reads are the bottleneck,
+are unknown. So proceed in this order.
+
+1. **Stage 2-0: re-measure with files close to real data** (58.5.1). Confirm here how effective the parallel approach is (whether CPU or reads are
+   the bottleneck).
+2. **Stage 2-1: run calculations over all rows in parallel chunks**. The approach **starts with threads** (per row group; numpy and polars release
+   the GIL during computation; built on `WorkerHub`). If that does not work, consider processes. Targets: whole-column statistics, histogram,
+   virtual-variable computation over all rows, export (stage 2 of 57.4). Making the map faster in stage 2 of ch. 46 (expressions 55.8) is
+   decided together here.
+3. **Stage 2-2: when opening a view, compute and draw only the displayed range first, and continue the all-rows computation in the
+   background** (implication 3 of 58.4). Make the time from opening a view to a picture appearing independent of the row count. Operations
+   that need all rows (statistics, etc.) wait for the all-rows computation to finish, or compute in chunks.
+4. **Stage 2-3: memory-limit setting** (`Settings.memory_limit_percent`, e.g. 95), and a mechanism that estimates and refuses, before starting,
+   operations likely to exceed the limit (switching the time axis to a non-ascending column, showing many columns, etc.).
+- The details (design and test plan) of 2-1 to 2-3 will be written after seeing the results of 2-0. Candidates not yet decided: not holding the
+  whole time axis in memory (extend `TimeIndex` to non-ascending / non-finite cases, or make the time axis windowed too), and how to handle 56.4's
+  sorted display on large files.
+
+#### 58.5.1 Stage 2-0: measurement with files close to real data
+
+- File: **500 million rows x 35 columns x float32, hard-to-compress values** (`--dtype float32 --values full`. About 74 bytes/row for a trial of
+  2 million rows x 25 columns -> about 51 GB for 35 columns. 2026-10-15, user's decision: real data is float32 and about 50 GB. Changed from the
+  initial plan of 25 columns float64, about 100 GB, and the next plan of 12 columns float64, about 47 GB). Parquet reads only the columns used,
+  so the read and compute time per column is determined by row count and type and hardly depends on the number of columns (the number of
+  columns matters for memory when showing many columns, which is extrapolated from the per-column value to 50 columns). The app turns every
+  column read into float64 (`to_numeric`), so float32 columns double in memory. The time and memory of this conversion are included in the
+  measurement.
+- **Actual usage** (user, 2026-10-15): use **about 10** original columns and make **about 20** virtual variables from them by calculation. Make the
+  measurement's `view_load` stage match this: a view that makes 20 virtual variables (including chains) from 10 original columns (make
+  `VIEW_DERIVED` etc. in `bench_large_file.py` configurable, keeping the default stage 1 shape). **Memory estimate**: a virtual variable of 500
+  million rows holds 4 GB (float64) if it keeps all rows, 80 GB for 20, far above the 24 GB of physical memory. Confirm with this stage's memory
+  where expressions that do not become windowed virtual variables (36.8 C, `DerivedColumn`), and all-rows computations (ch. 55's
+  `DeferredColumn` keeps all computed rows), occur. This is expected to be the main issue in the design of stage 2 (2-1 to 2-3).
+- **Page cache**: a measurement stage reads the time axis and the first 4 columns (`cols[:4]` in `bench_large_file.py`), about 19 GB in
+  total. Regardless of the whole file size this can fit in 24 GB of physical memory, so enlarging the file does not make a disk-read
+  measurement. So take both **measurements with the page cache emptied before each stage** (`sudo purge` on macOS; the user runs it, or the
+  measuring script calls it before a stage with an option) and measurements without emptying.
+- Add `--values {quantised,full}` (default `quantised` = as before) to `generate_wide_parquet.py`. `full` does not round each signal's values,
+  and adds small noise (standard deviation about 1e-6; the random seed is `(seed, start)` as now) to all signals so that mantissas vary and
+  zstd barely compresses them. Known relations are kept with a widened tolerance (written in the docstring). The disk check (58.2) is used as is.
+- Measure with `bench_large_file.py` in the same stages and form as stage 1 (the table in 58.4), on a 500 million row x 35 column float32 file.
+  For comparison, also measure a compressible 500 million row x 20 column float32 file (`--values quantised`) (to see the difference from the
+  page-cache-resident case). Stop other heavy processing (such as a full test run) before measuring.
+- Record: the same table as 58.4 (seconds, MB, number of CPU cores) plus a guide to disk read speed (bytes read in that stage / time. If
+  `io_counters` of `psutil` cannot be obtained on macOS, estimate from the sizes of the columns read). The results are recorded as a table
+  below this section and reported to the user.
+- Tests: a small run of `--values full` (10,000 rows x 5 columns): type, row count, known relations (widened tolerance), same content for the
+  same seed, and a larger file than `quantised`.
+- Decided during implementation (2026-10-15, preparation for stage 2-0):
+  - The noise of `--values full` is taken from a stream (`(seed, start, 1)`) separate from the existing random stream (`(seed, start)`). The
+    `quantised` output is byte-for-byte the same as before (default value). The tolerance is `FULL_TOLERANCE` (1e-4).
+  - Read speed is taken from `io_counters` of `psutil` (difference in bytes read per stage). macOS has no `io_counters`, so the read column is
+    left blank ("-") there and no estimate is built into the script. On the measuring machine (Mac), estimate at report time as (size of the
+    columns each stage read (Parquet metadata)) / time (supplemented at merge-time check). On Linux the `io_counters` value is shown (bytes
+    read from the page cache are not counted).
+  - Trial measurement (2 million rows x 25 columns float64): `full` is about 185 bytes/row (compression about 10%), `quantised` about 15
+    bytes/row. Extrapolated to 500 million rows, `full` is about 93 GB and generation about 5 minutes (assuming generation speed is
+    proportional to the row count).
+- **Make the shape of `view_load` configurable** (2026-10-15, continuation of stage 2-0. `feat/58-bench-view-shape`. Medium -> `implementer`):
+  - Add to `bench_large_file.py` `--view-raw N` (number of original columns the view uses, default 4), `--view-derived M` (number of virtual
+    variables, default 10) and `--view-plotted K` (how many of those are plotted, default 3). With the defaults, the view (list of formulas,
+    names and colors) is **the same** as now (to compare with the stage 1 results). For measuring actual usage, use `--view-raw 10
+    --view-derived 20 --view-plotted 5`.
+  - Original columns: the first N numeric columns of the file (excluding the time axis; widens the current selection in `bench_columns`).
+    Stop before starting if there are not enough. If N exceeds 4 for the `BENCH_COLUMNS` file (`generate_test_parquet.py`, 4 columns), stop.
+  - Formulas (built in a fixed order, no randomness): for the part beyond the default shape, (1) the first half are element-wise formulas of
+    original columns (cycled so that every original column is used at least once), (2) the second half are **chains** that use earlier virtual
+    variables (e.g. `d03 + d07`, `d10 * c4`). Include one each of `rolling_mean(<original column>, 100)`, `delta(<virtual variable>)` and
+    `where(<original column> > 0, <virtual variable>, <original column>)` (to also measure formulas with a windowed-read margin and
+    conditional formulas). All are formulas with a known margin (forms that can become `DerivedColumn`; if they don't, that is the
+    measurement result). The ones plotted are, in the default shape, the first K as before, and otherwise a half-and-half mix of "formulas of
+    original columns only" and "chain formulas" (including deep chains; colors cycle through a fixed list).
+  - Additional records (the `view_load` stage): in addition to the point where drawing settles (the current end), also take the time and RSS
+    at the point where **the background all-rows computation (ch. 55's `DeferredColumn`) has completely finished** (the `view_load_full`
+    column; the upper limit of the wait is `--stage-timeout`). At both points, count the kind of column of each virtual variable
+    (`DerivedColumn` / `DeferredColumn` (whether computed) / `MaterializedColumn`), output per name in JSON and in the table in the form
+    "Derived 18 / Deferred 2 / Materialized 0". Which columns hold all rows is material for the design of 2-1 to 2-3.
+  - `--purge`: empty the page cache before each stage (just before the measured stage, not counting preparation stages that are not
+    recorded). macOS uses `sudo -n purge`; Linux uses `sync` and then `sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'`. Try it once in the
+    parent process before starting, and if it fails because a password is needed, show "Run `sudo -v` first, or allow purge without a
+    password" and stop (if it fails in a middle stage, mark that stage `error` and continue). The time to empty is not included in the
+    measurement. Leave whether `purge` was used in the JSON and the table header.
+  - Tests (`tests/parquet_analyzer/test_bench_view_shape.py`, new): make the formula builder a pure function; with the default shape it equals the
+    current list / with N=10, M=20 all original columns are used, there are chains, no duplicate names, it includes `rolling_mean`, `delta` and
+    `where`, the number plotted is K, all formulas are syntactically valid (`referenced_names` passes), and every reference is "an original
+    column or an earlier virtual variable" / assembly of the purge command (per OS) and how it stops on failure (`subprocess.run` is replaced;
+    the real `sudo` is not called) / on a small file (100,000 rows x 12 columns, `generate_wide_parquet.py`), `--stages view_load --view-raw 10
+    --view-derived 20` runs to the end and the sum of the column-kind counts is 20 (run in a child process; keep the row count small so it
+    does not take too long).
+  - The measurement itself (generating the file of about 51 GB and each stage) is done after this implementation is merged, when there is no
+    heavy work such as the user's real-machine check.
+  - Decided during implementation (2026-10-15, `feat/58-bench-view-shape`):
+    - Default shape = 4 original columns and 10 or fewer virtual variables (the current list or its beginning). Anything else is a generated list
+      (e.g. N=4, M=12 is also generated). If the argument ranges (N, M >= 1, 0 <= K <= M) are violated, stop before starting (exit code 2).
+    - If purge fails in a middle stage, that stage is marked `error` ("purge failed: ...") **without measuring** and the run moves on (so that
+      values measured while still warm are not kept).
+    - The `view_load` row (time, RSS, CPU) is for the point where drawing settles (to compare with stage 1). The `view_load_full` row is up to
+      the end of the all-rows computation (`TIMEOUT` if the limit is reached). The read speed of the `view_load` row is blank.
+    - **Finding**: the background computation for view loading (`view_compute` in 55.3) computes **only the virtual variables plotted and the
+      virtual variables they use**. Virtual variables not plotted stay `DeferredColumn` and are not computed (they are computed when used).
+      The wait for drawing to settle also waits for `view_compute`, so the settled point and the end of the all-rows computation are nearly the
+      same. In the 100,000 rows x 12 columns trial (`--view-raw 10 --view-derived 20 --view-plotted 5`) the result was "Derived 0 / Deferred 20
+      (17 ready) / Materialized 0" (a small file keeps the original columns resident, so they do not become `DerivedColumn`). At 500 million
+      rows the issue becomes "all rows of the virtual variables plotted and those they use (4 GB each)".
+
+#### 58.6 Test plan (stage 1)
+
+- Small runs of `generate_wide_parquet.py` (10,000 rows x 5 columns, 1,000-row row groups) in pytest: row count, column names, types, number of
+  row groups, known relations (with tolerance), same content for the same `--seed`, number of time jumps, and the disk-estimate function (stops
+  when free space is insufficient; the free-space value is replaced).
+- The measurement script does not turn the measurement itself into a test (same as ch. 41). Only confirm that new stages run to the end on a small
+  file (100,000 rows).
+
+### 59. Correctness and boundary conditions on large data (added 2026-10-15)
+
+Requirement: 5.53. Background: the confirmation results of external review 3, and the response to the review's "verify boundary
+conditions, and measure performance and numerical correctness at 500M rows" (user's decision, 2026-10-15). Order: 59.2 and 59.3 (one branch,
+`fix/59-pyramid-alignment`, medium -> `implementer`) can start right away. 59.1 (`feat/59-bench-verify`, medium -> `implementer`) touches the
+measurement script, so create it from `main` after `feat/58-bench-view-shape` of 58.5.1 is merged, and **merge it before the stage 2-0
+measurement of ch. 58** (so correctness is also checked in that measurement).
+
+#### 59.1 Add correctness checks to the measurement (`bench_large_file.py --verify`)
+
+- After each stage (after recording time and RSS; the check time is not included in the stage time), compare that stage's result with a value
+  calculated by a **path separate from the app**. The separate path = read directly with `pyarrow.parquet` (`iter_batches`, `read_row_group`)
+  and calculate with numpy. The app's `ParquetDataSource`, `WindowedColumn`, `TimeIndex`, `chunked_stats` and pyramid are not used. Only
+  expression evaluation may use the app's `evaluate_expression` (what is to be checked is the correctness of chunks, windows, chains and
+  background computation, not numpy's operations themselves).
+- `--verify` is on by default, `--no-verify` turns it off. The result is stored in JSON per stage as `verify` (`ok` / `failed: <detail>` /
+  `skipped: <reason>`) together with the check seconds, and a "correctness" column is added to the table. Measurement continues even on failure.
+  Checks may read all rows (statistics, histogram), so they may take time. Checking reads warm the page cache, but with `--purge` it is emptied
+  before the next stage (58.5.1).
+- What is checked (per stage; `skipped` if the target stage did not run):
+  - `stats_full`, `derived_full`: count, NaN count, min and max **match**; mean and standard deviation within relative error 1e-9. The separate
+    path reads per row group, and the mean uses two scans (the first for the mean, the second for the sum of squared deviations; sums add the
+    per-chunk partial sums with `math.fsum`). The `derived_full` formula (`a*b+c`) is computed per row group with numpy.
+  - `hist_full`: the count in each bin **matches** the sum of per-chunk `np.histogram` over the same bin edges. The total count = the number of
+    finite values.
+  - Pyramid (after `home1`, if a pyramid was built): the bucket start rows are all multiples of 8192 and line up as `0, 8192, 16384, ...` without
+    gaps / the overall min and max match the column's min and max (the values from the check above) / for 20 buckets chosen with a fixed-seed
+    random number, the min and max of the rows read directly **match**.
+  - Time -> row (after `zoom10`, `zoom1000`, `stats_zoom`): for the times at both ends of the displayed range, read the rows before and after
+    the row `r` the app found, and check that `t[r-1] < x <= t[r]` (left side) / `t[r-1] <= x < t[r]` (right side) hold (matching the
+    convention of `row_range_for_x`). Also the same check for 20 times chosen with a fixed-seed random number, and for times at the first, last
+    and row-group boundaries.
+  - Window values (after `zoom1000`, `derived_plot`): for the displayed row range, the windowed values of original columns (float32 converted
+    to float64 as `to_numeric` does) and virtual variables match values read directly and calculated (original columns **match**; virtual
+    variables within relative error 1e-12; NaN positions match).
+  - `view_load` (after 58.5.1's `view_load_full`): for each of the 20 virtual variables, take three windows (10,000 rows each) at the start,
+    middle and end, read the original columns directly with enough margin before and after the window (a fixed value larger than the sum of the
+    margins of the measurement view's formulas, e.g. 1000 rows), compute in chain order with `evaluate_expression`, and compare (within relative
+    error 1e-9; looser for `rolling_mean` because the order of rounding may change at the start of a chunk; NaN positions match). Both
+    `DeferredColumn` (holds all rows) and `DerivedColumn` (computed by window) are covered.
+  - `parquet_export` (once the stage actually performs an export): the exported file's row count, column names and types, and the values at 20
+    rows match the original columns and the computed values. Until then `skipped`.
+- Implementation: the comparison functions (statistics, histogram, pyramid, time -> row, window) are pure functions that take numbers and
+  arrays rather than app objects (easy to test and clearly a separate path).
+- Tests (`tests/parquet_analyzer/test_bench_verify.py`, new): match and mismatch per pure function (shifting one value gives `failed`; a
+  difference in NaN positions is also detected) / on a small file (100,000 rows, 7,000-row row groups, with float32 columns and time jumps), a
+  measurement with `--verify` runs to the end and every stage is `ok` or `skipped` / deliberately breaking one place in the app's result
+  (monkeypatching a statistics maximum, one pyramid bucket, one value of a virtual variable window) makes that stage `failed` (when run in a
+  child process, the breaking hook is passed to the child via an environment variable; it does not affect the production path).
+
+#### 59.2 Align pyramid buckets ourselves (`core/pyramid.py`)
+
+- Current state (confirmation of external review 3 #1): `build_pyramid` treats each batch returned by `iter_batches(batch_size=bucket_rows)` as one
+  bucket. pyarrow 25 returns `bucket_rows` rows at a time across row groups, so bucket start rows are multiples of 8192 and match the
+  `TimeIndex` anchors (data 36.6 D, `ANCHOR_ROWS = DEFAULT_BUCKET_ROWS`). But this is pyarrow's behavior; in versions or settings that cut
+  batches at row-group boundaries, the start rows shift and `TimeIndex.take` reads non-anchor rows one at a time (drawing becomes slow; values
+  are correct). The tests also do not confirm this (`test_pyramid.py` uses 5000-row row groups and 1000-row buckets, and 5000 is a multiple of
+  1000, so there is no shift).
+- Change: `build_pyramid` repacks rows into buckets of `bucket_rows` regardless of the sizes of the batches returned (joining the remainder of
+  the previous batch to the head of the next. The calculation "read in bulk, reshape, then min/max" shared with `build_pyramid_from_windows` may
+  be made a common function). The size of the batch read is a multiple of `bucket_rows` (e.g. 64 buckets) to reduce the number of calls. The
+  result has bucket start rows `arange(n_buckets) * bucket_rows`, and only the last bucket may be shorter. Handling of NaN and Inf (a bucket with
+  no finite value is NaN) is the same as now.
+- Guard: `WindowedColumn.set_pyramid` (and the same handling in `DerivedColumn`) does not accept a pyramid whose start rows are not multiples of
+  `ANCHOR_ROWS` or that has gaps, and treats it as a build failure (counted as in 28.2; the reason is logged). It does not occur as long as
+  the pyramid is built correctly.
+- Tests (add to `test_pyramid.py`): row groups of 5000, 7000, 8192 and 1 million rows, and a row count that is not a multiple of 8192: all start
+  rows are `k * 8192`, and min and max match the values found per bucket from all rows / a **regression test**: even if `iter_batches` is
+  replaced to return batches of uneven sizes (e.g. 5000, 3192, 7000, ...), the start rows line up (this must fail with the current code) /
+  guard: passing a shifted pyramid to `set_pyramid` is counted as a failure, and drawing returns to actual reads.
+
+- Decided during implementation (2026-10-15, `fix/59-pyramid-alignment`): the batch read is 64 buckets. The per-bucket min and max is
+  `_bucket_minmax`, shared with `build_pyramid_from_windows`. A pyramid that was not accepted follows 28.2's failure counting, so it is rebuilt
+  at most 3 times (`MAX_PYRAMID_FAILURES`), after which drawing uses actual reads. A windowed column does not send a failure notice (a
+  virtual-variable column still reports `ok=False` as before). On 20 million rows (float32) the result matches the old version and the time went
+  from 0.07 s to 0.04 s. The regression test was confirmed to fail before the fix.
+
+#### 59.3 Add property tests for boundary conditions (hypothesis, app ch. 46 settings)
+
+- Add to the existing property tests (`test_property_time_index.py`, `test_property_windowed.py`, `test_property_row_range.py`,
+  `test_property_analysis.py`). Before adding, check what the current tests generate so as not to overlap existing checks (do not add what
+  overlaps).
+- What is generated: row count (1 to 50,000), row-group size (any value from 1 to 20,000, many not multiples of 8192), value type (float64,
+  float32, int32), and NaN, +Inf, -Inf, runs of duplicate times and all-NaN buckets placed before and after bucket boundaries (multiples of
+  8192, row-group boundaries, `chunked_stats` chunk boundaries).
+- Properties checked:
+  - Pyramid (after 59.2): start rows line up, the min and max per bucket match the values found from all rows, and `pyramid_bounds` is the min
+    and max of the finite values.
+  - `TimeIndex`: `take`, `searchsorted` and `value_at` match the results on the full array (including NaN and duplicates at boundaries. Also
+    confirm that a non-ascending or non-finite time axis does not build a `TimeIndex` and falls on the warning side, per the current agreement
+    (ch. 29, 36.6 D)).
+  - Windowed columns: for float32 and int32 columns, the values of any window match `to_numeric` of the full column.
+  - Window-computed virtual variables (`delta`, `rolling_mean`, `trailing_mean`, `where`): in windows with NaN or Inf at the boundaries, they
+    match the full computation (including NaN positions).
+  - `chunked_stats`: even if the chunk size changes (1 row, all NaN at a boundary), count, NaN count, min and max match, and mean and
+    standard deviation are within relative error 1e-9.
+- The number of examples is the default of 46.1 (do not make CI too slow; if a single test exceeds a few seconds, lower `max_examples`). Fix
+  failing examples with `@example`.
+
+#### 59.4 Test plan (summary)
+
+- Decided during implementation of 59.1 (2026-10-16): the check is run by a child process after the stage's RESULT line and returned in a separate
+  `VERIFY` line (the check time is not in `wall_s` or RSS). If `--verify-timeout` (default 3600 s) is exceeded, the stage becomes "skipped", the
+  child is stopped, and the remaining stages continue in a new child. The reference side is `ParquetRef` in `bench_verify.py` (pyarrow/numpy
+  only; it does not use `ParquetDataSource`, `WindowedColumn`, `TimeIndex`, `chunked_stats` or pyramid construction). Tolerances: mean and
+  standard deviation of statistics 1e-9, virtual-variable windows 1e-12 (chained `view_load` 1e-9), raw columns exact. The relative tolerance is
+  `rel*max(|a|,|b|) + rel*the maximum absolute value of the reference inside the window` (so that values cancelling to near 0 are not judged
+  against themselves). The pyramid check runs only when there is a pyramid (the app builds one when displayed rows exceed 5 million), otherwise
+  "skipped". The `parquet_export` stage is "skipped" until the export entry point exists. The fault hook for tests, `BENCH_VERIFY_FAULT`
+  (`stats_max` / `pyramid_bucket` / `derived_window`), and `BENCH_VERIFY_PYRAMID_THRESHOLD` are not used in production. Unconfirmed: the check
+  time at 500M rows and the effect of `--purge`.
+- As in each section of 59.1, 59.2 and 59.3. The full test suite passes, and `uv run ruff check` passes.
+- The regression test of 59.2 fails before the fix (confirm with the replaced batches).
+- Confirmation at merge for 59.1: run a measurement with `--verify` on a small file (100,000 rows) and on something like
+  `daily_cycle_500mb.parquet`; everything is `ok` or `skipped`.
+
 ## Relations to other domains
 
 - **Plots** ([plots.md](./plots.md)): drawing series uses this document's downsampling, windowed reads and
@@ -1060,9 +1545,6 @@ that stage). The RSS at the start of the stage was about 1,350 MB (the resident 
   materializing only the columns the expression refers to.
 - **Persistence** ([persistence.md](./persistence.md)): settings such as `eager_load_limit_mb`, recently used
   folders.
-- **History** (dev notes): the details of the design and measurements of lazy/windowed reads and
-  the pyramid are in old 13.5.1 (the large-file memory problem). Always consult it when changing this domain's
-  design.
 - **All domains (background work)** (2026-10-03): background work follows ch. 28 (failure reporting) and ch. 37
   (`WorkerHub`, GC only on the UI thread). Plots, analysis, statistics and FFT work all use this mechanism.
 - **Plots, analysis** (ch. 29): a time axis that isn't ascending or has missing values triggers a warning.
@@ -1074,3 +1556,7 @@ that stage). The RSS at the start of the stage was about 1,350 MB (the resident 
 - **Persistence** (persistence ch. 54, 2026-10-14): a signal alias adds the same `Column` under the alias to `_file_columns` after the file
   is opened (no copy). The time-axis selection and a view's `time_column` are also resolved through the alias. The choices for variables are
   built from the "names shown in the list" (54.2).
+- **Plots** (59.2, 2026-10-15): the start rows of pyramid buckets always match `TimeIndex` anchors (every 8192 rows); a misaligned pyramid is not accepted. This is the premise that lets drawing look up bucket start times (`x[bucket_starts]`) without reading disk.
+- **Analysis, plots** (ch. 56, 2026-10-15): when the time axis is not ascending, statistics, XY, histogram, FFT, cursor and hover show a warning (they look at `MainWindow.time_order_unreliable()`). In stage 2: sorted display (`SortedColumn`, original row number) and UTC display of time-zone-aware times (time display gathered in one place in `core/`).
+- **Image export / Parquet export** (56.4, ch. 57): when exporting while displayed sorted, a column `source_row` with the original row number is added.
+- **All domains** (ch. 58, 2026-10-15): measurement for large data (target 500 million rows x 50 columns; stage 1 was done with 1 billion rows x 20 columns). Stage 2 decides the memory-limit setting, the handling of the time axis and calculations run in parallel chunks.

@@ -51,6 +51,6 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-# Any test running longer than this dumps every thread's stack (dev notes 13.6), so a hang
+# Any test running longer than this dumps every thread's stack, so a hang
 # diagnoses itself instead of stopping silently.
 faulthandler_timeout = 120

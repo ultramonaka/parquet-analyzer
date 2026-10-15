@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QInputDialog, QMessageBox
 
 from parquet_analyzer import config
 from parquet_analyzer.io import view as view_io
+from parquet_analyzer.ui import messages
 from parquet_analyzer.ui.main_window import MainWindow
 from parquet_analyzer.ui.view_manager import ViewManagerDialog
 
@@ -26,6 +27,10 @@ def boxes(monkeypatch):
     monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
     monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a: calls["warning"].append(a[2])))
     monkeypatch.setattr(QMessageBox, "critical", staticmethod(lambda *a: calls["critical"].append(a[2])))
+    # a missing signal adds the "assign substitute signals" button (persistence 54.6): same warning text
+    monkeypatch.setattr(
+        messages, "warning_with_button", lambda _p, _t, text, _b: calls["warning"].append(text) or False
+    )
     return calls
 
 

@@ -31,12 +31,23 @@ class StatsDialog(QDialog):
     drawn on screen (core/analysis.py basic_stats, via core/background_worker.py).
     """
 
-    def __init__(self, range_label: str, results: dict[str, dict], parent: QWidget | None = None):
+    def __init__(
+        self,
+        range_label: str,
+        results: dict[str, dict],
+        parent: QWidget | None = None,
+        time_unreliable: bool = False,
+    ):
         super().__init__(parent)
         self.setWindowTitle(tr("toolbar.stats"))
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(tr("stats.range_label", range=range_label)))
+        self.warning_label = QLabel(tr("time_order.range_warning"))  # 56.1: values are still shown below
+        self.warning_label.setStyleSheet("color: #b45309;")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setVisible(bool(time_unreliable))
+        layout.addWidget(self.warning_label)
 
         columns = [tr(key) for key in _COLUMN_KEYS]
         table = QTableWidget(len(results), len(columns))

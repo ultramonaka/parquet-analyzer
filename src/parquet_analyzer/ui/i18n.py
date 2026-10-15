@@ -256,6 +256,35 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ja": "区切りが多いため線で表示（{n}件）",
     },
     "hist.status_trend_none": {"en": "No bucket value to draw", "ja": "描ける区切りの値がありません"},
+    # time of day (analysis 42.13)
+    "hist.view_timeofday": {"en": "Time of day", "ja": "時刻別"},
+    "hist.view_timeofday_tooltip": {
+        "en": "The value for each time-of-day slot, folded over all days of the range.",
+        "ja": "範囲の全日を1日に畳んで、1日の中の時刻の枠ごとの値を表示します。",
+    },
+    "hist.tod_slot": {"en": "Slot", "ja": "時刻の枠"},
+    "hist.tod_value": {"en": "Value", "ja": "値"},
+    "hist.tod_per_day": {"en": "Per day", "ja": "1日あたりにする"},
+    "hist.tod_per_day_tooltip": {
+        "en": "Divide the integral by the number of days that had valid time in the slot (days without data are not counted as 0).",
+        "ja": "積算を、その枠に有効な時間があった日の数で割ります（データの無い日を0として数えません）。",
+    },
+    "hist.tod_x_label": {"en": "Time of day", "ja": "時刻"},
+    "hist.tod_y_integral": {"en": "{name} (integral [×{unit}]{perday})", "ja": "{name}（積算 [×{unit}]{perday}）"},
+    "hist.tod_y_per_day": {"en": ", per day", "ja": "・1日あたり"},
+    "hist.tod_summary": {"en": "Time of day ({slot}, {value})", "ja": "時刻別（{slot}・{value}）"},
+    "hist.hover_tod": {"en": "{start}-{end} {kind}: {values}", "ja": "{start}〜{end} {kind}: {values}"},
+    "hist.hover_tod_days": {"en": "{n} days", "ja": "{n}日"},
+    "hist.hover_tod_partial": {"en": ", {n} partial", "ja": "、うち一部だけの日 {n}日"},
+    "hist.status_tod_days": {"en": "{name}: {lo}-{hi} days per slot", "ja": "{name}: 枠ごとの日数 {lo}〜{hi}"},
+    "hist.export_slots": {"en": "Save slot values...", "ja": "枠の値を保存..."},
+    "hist.export_slots_tooltip": {
+        "en": "Save one row per time-of-day slot (value, valid time, number of days) as Parquet or CSV.",
+        "ja": "時刻の枠ごとの値（有効な時間、日の数）を1行ずつParquetまたはCSVに保存します。",
+    },
+    "hist.export_slots_title": {"en": "Save slot values", "ja": "枠の値を保存"},
+    "hist.export_slots_saved": {"en": "Slot values saved: {path} ({rows} rows)", "ja": "枠の値を保存しました: {path}（{rows}行）"},
+    "hist.export_slots_failed": {"en": "Could not save the slot values:\n{error}", "ja": "枠の値を保存できませんでした:\n{error}"},
     "xyz.need_xyz": {"en": "Select X, Y and Z.", "ja": "X・Y・Zを選択してください。"},
     "xyz.status_points": {
         "en": "Points: {points} (excluded {excluded} rows with NaN/Inf)",
@@ -342,6 +371,19 @@ _STRINGS: dict[str, dict[str, str]] = {
     "xy.agg_max": {"en": "Max", "ja": "最大"},
     "xy.agg_min": {"en": "Min", "ja": "最小"},
     "xy.agg_count": {"en": "Point count", "ja": "点数"},
+    "xy.agg_time": {"en": "Time", "ja": "時間"},
+    "xy.map_time_unit": {"en": "Time unit", "ja": "時間の単位"},
+    "xy.map_time_label": {"en": "Time [{unit}]", "ja": "時間 [{unit}]"},
+    "xy.map_time_name": {"en": "Time", "ja": "時間"},
+    "xy.map_status_time": {
+        "en": "Time in the grid: {total} {unit} (gaps: {gaps})",
+        "ja": "有効な時間の合計: {total} {unit}（すき間: {gaps}か所）",
+    },
+    "xy.map_err_time_not_ascending": {
+        "en": "The time axis is not ascending in this range, so the time cannot be computed.",
+        "ja": "この範囲の時間軸が昇順でないため、時間を計算できません。",
+    },
+    "xy.map_time_no_axis": {"en": "The time axis is not available.", "ja": "時間軸がありません。"},
     "xy.map_min_count": {"en": "Min. points", "ja": "最少点数"},
     "xy.map_min_count_tooltip": {
         "en": "Cells with fewer points than this have no data",
@@ -384,6 +426,11 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "On: click a point (or a grey cross to restore it), or drag a rectangle, to take measured points out of the map",
         "ja": "ONの間、点をクリック（灰色の×をクリックで戻す）または四角でドラッグして、実測の点をマップの計算から外します",
     },
+    "xy.exclude_mode_time_curve": {
+        "en": "Points cannot be excluded from a curve of times",
+        "ja": "集計が「時間」のカーブでは点を外せません",
+    },
+    "xy.map_z_unused_tooltip": {"en": "Not used by the aggregate \"Time\"", "ja": "集計「時間」ではZを使いません"},
     "xy.exclude_mode_3d": {"en": "Points can be picked in 2D", "ja": "2Dで選べます"},
     "xy.exclude_reset": {"en": "Restore all", "ja": "全部戻す"},
     "xy.exclude_reset_tooltip": {"en": "Put all excluded points back into the map", "ja": "外した点をすべてマップの計算に戻します"},
@@ -590,6 +637,26 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "\u26a0 Time axis has {count} non-finite value(s) (NaN/Inf).",
         "ja": "\u26a0 時間軸に欠損・無限大が{count}件あります。",
     },
+    "time_order.has_duplicates": {
+        "en": "\u26a0 Time axis has {count} duplicate timestamp(s).",
+        "ja": "\u26a0 時間軸に同じ時刻が{count}件あります。",
+    },
+    "time_order.tooltip_duplicates": {
+        "en": "First duplicate at row {row}. Calculations stay correct; only the same time repeats.",
+        "ja": "最初の重複: {row}行目。計算は正しく行われます（同じ時刻が続いているだけです）。",
+    },
+    "time_order.range_warning": {
+        "en": "\u26a0 The time axis is not ascending, so range statistics may be wrong.",
+        "ja": "\u26a0 時間軸が昇順ではないため、範囲の統計は正しくない可能性があります。",
+    },
+    "time_order.range_warning_short": {
+        "en": "\u26a0 Time axis not ascending: range may be wrong",
+        "ja": "\u26a0 時間軸が昇順ではありません（範囲が正しくない可能性）",
+    },
+    "time_order.readout_tooltip": {
+        "en": "The time axis is not ascending, so values at this position may be wrong.",
+        "ja": "時間軸が昇順ではないため、この位置の値が正しくない可能性があります。",
+    },
     "time_order.tooltip": {
         "en": "First problem at row {row}. Try selecting a different column as the time axis.",
         "ja": "最初に乱れる行: {row}。時間軸を別の列に切り替えてみてください。",
@@ -660,6 +727,106 @@ _STRINGS: dict[str, dict[str, str]] = {
         "ja": "保存するプロットがありません。",
     },
     "export.filter_pdf": {"en": "PDF document (*.pdf)", "ja": "PDF文書 (*.pdf)"},
+    # Parquet export (export.ja.md 57)
+    "toolbar.export_parquet": {"en": "Export Parquet...", "ja": "Parquetに書き出す..."},
+    "toolbar.export_parquet_tooltip": {
+        "en": "Write the plotted signals (including derived variables) to a Parquet file",
+        "ja": "プロットに出している信号（仮想変数を含む）をParquetファイルに書き出す",
+    },
+    "export_parquet.title": {"en": "Export to Parquet", "ja": "Parquetに書き出す"},
+    "export_parquet.range_group": {"en": "Rows to export", "ja": "書き出す範囲"},
+    "export_parquet.range_all": {"en": "All rows ({rows} rows)", "ja": "全行（{rows} 行）"},
+    "export_parquet.range_visible": {"en": "Visible range ({rows} rows)", "ja": "表示中の範囲（{rows} 行）"},
+    "export_parquet.columns_group": {"en": "Signals to export", "ja": "書き出す信号"},
+    "export_parquet.time_note": {
+        "en": "The time axis ({name}) is always written as the first column.",
+        "ja": "時間軸の列（{name}）は必ず先頭に書き出します。",
+    },
+    "export_parquet.select_all": {"en": "All", "ja": "全部"},
+    "export_parquet.select_none": {"en": "None", "ja": "なし"},
+    "export_parquet.export_button": {"en": "Export...", "ja": "書き出す..."},
+    "export_parquet.nothing_selected": {
+        "en": "Select at least one signal to export.",
+        "ja": "書き出す信号を1つ以上選んでください。",
+    },
+    "export_parquet.filter": {"en": "Parquet file (*.parquet)", "ja": "Parquetファイル (*.parquet)"},
+    "export_parquet.busy": {
+        "en": "A Parquet export is already running.",
+        "ja": "Parquetを書き出し中です。",
+    },
+    "export_parquet.progress": {"en": "Exporting to Parquet {percent}%", "ja": "Parquetに書き出し中 {percent}%"},
+    "export_parquet.progress_range": {"en": "Searching the range...", "ja": "範囲を探しています..."},
+    "export_parquet.progress_full": {"en": "Computing all rows...", "ja": "全行を計算中..."},
+    "export_parquet.same_as_source": {
+        "en": "The output file is the source Parquet file. Choose another file name.",
+        "ja": "書き出し先が元のParquetファイルです。別のファイル名を選んでください。",
+    },
+    "export_parquet.cancel": {"en": "Cancel", "ja": "キャンセル"},
+    "export_parquet.saved": {
+        "en": "Parquet exported: {path} ({rows} rows, {seconds} s)",
+        "ja": "Parquetを書き出しました: {path}（{rows} 行、{seconds} 秒）",
+    },
+    "export_parquet.saved_full": {
+        "en": "Parquet exported: {path} ({rows} rows, {seconds} s; computed over all rows first: {names})",
+        "ja": "Parquetを書き出しました: {path}（{rows} 行、{seconds} 秒。全行を先に計算した変数: {names}）",
+    },
+    "export_parquet.cancelled": {"en": "Parquet export cancelled.", "ja": "書き出しをキャンセルしました。"},
+    "export_parquet.failed": {
+        "en": "Could not export the Parquet file:\n{error}",
+        "ja": "Parquetファイルを書き出せませんでした:\n{error}",
+    },
+    # ... from a saved view (export 57.7)
+    "export_parquet.source_label": {"en": "Source:", "ja": "元:"},
+    "export_parquet.source_current": {"en": "Current screen", "ja": "今の画面"},
+    "export_parquet.source_view": {"en": "Saved view: {name}", "ja": "保存したビュー: {name}"},
+    "export_parquet.source_file_label": {"en": "File:", "ja": "ファイル:"},
+    "export_parquet.source_other_button": {"en": "Other file...", "ja": "別のファイル..."},
+    "export_parquet.source_view_file_button": {"en": "View's file", "ja": "ビューのファイル"},
+    "export_parquet.range_saved": {
+        "en": "The view's saved range ({range})",
+        "ja": "ビューに保存した範囲（{range}）",
+    },
+    "export_parquet.source_missing": {
+        "en": "The file was not found: {path}",
+        "ja": "ファイルが見つかりません: {path}",
+    },
+    "export_parquet.source_unreadable": {
+        "en": "The file cannot be read: {error}",
+        "ja": "ファイルを読めません: {error}",
+    },
+    "export_parquet.view_unreadable": {
+        "en": "The view cannot be read: {error}",
+        "ja": "ビューを読めません: {error}",
+    },
+    "export_parquet.time_missing": {
+        "en": "The time axis ({name}) is not in this file.",
+        "ja": "時間軸の列（{name}）がこのファイルにありません。",
+    },
+    "export_parquet.busy_view_load": {
+        "en": "A view is still being computed. Try again when it has finished.",
+        "ja": "ビューを計算中です。終わってからやり直してください。",
+    },
+    "export_parquet.no_rows": {
+        "en": "There are no rows in the selected range.",
+        "ja": "範囲に行がありません。",
+    },
+    "view.export_button": {"en": "Export to Parquet...", "ja": "Parquetに書き出す..."},
+    "view.problem_alias_name": {
+        "en": "named like a signal alias",
+        "ja": "信号の別名と同じ名前",
+    },
+    "view.problem_column_name": {"en": "named like a column", "ja": "列と同じ名前"},
+    "view.problem_syntax": {"en": "invalid formula", "ja": "式の文法の誤り"},
+    "view.problem_missing_column": {"en": "no column {name}", "ja": "列 {name} がない"},
+    "view.problem_dependency": {
+        "en": "uses {name}, which cannot be used",
+        "ja": "使えない {name} を使っている",
+    },
+    "view.problem_time_name": {
+        "en": "named like the exported time column",
+        "ja": "書き出す時間軸の列と同じ名前",
+    },
+    "view.problem_time": {"en": "time axis {name} not found", "ja": "時間軸 {name} がない"},
     "view.none_saved": {"en": "There are no saved views.", "ja": "保存済みのビューがありません。"},
     "view.select_label": {"en": "View:", "ja": "ビュー:"},
     "view.manager_title": {"en": "Views", "ja": "ビュー"},
@@ -720,6 +887,24 @@ _STRINGS: dict[str, dict[str, str]] = {
         "（データファイルは読み込み済みです）:\n{error}",
     },
     "view.skipped_not_in_file": {"en": "not in the open file", "ja": "開いているファイルに無い"},
+    "view.skipped_cancelled": {"en": "cancelled", "ja": "キャンセル"},
+    "view.skipped_dependency": {"en": "depends on {name}, which could not be computed", "ja": "{name}が計算できなかったため"},
+    "view.skipped_compute_failed": {"en": "computation failed: {error}", "ja": "計算に失敗: {error}"},
+    "view_compute.estimating": {
+        "en": "Opening view {done} / {total} - estimating remaining time",
+        "ja": "ビューを開いています {done} / {total} ・残りを見積もり中",
+    },
+    "view_compute.progress": {
+        "en": "Opening view {done} / {total} - about {remaining} left",
+        "ja": "ビューを開いています {done} / {total} ・残り約 {remaining}",
+    },
+    "view_compute.seconds": {"en": "{n} s", "ja": "{n} 秒"},
+    "view_compute.minutes": {"en": "{m} min {s} s", "ja": "{m} 分 {s} 秒"},
+    "view_compute.busy": {
+        "en": "The view is still being opened; try again when it is finished.",
+        "ja": "ビューを開いている途中です。終わってからもう一度お試しください。",
+    },
+    "view_compute.cancel": {"en": "Cancel", "ja": "キャンセル"},
     "view.skipped_variables": {
         "en": 'The following items of view "{name}" could not be restored (everything else was '
         "restored):\n{list}",
@@ -773,6 +958,7 @@ _STRINGS: dict[str, dict[str, str]] = {
     "shortcut.cursor": {"en": "Toggle cursor", "ja": "カーソル有効/無効切替"},
     "shortcut.remove_series": {"en": "Remove selected series", "ja": "選択中の系列を削除"},
     "shortcut.export_image": {"en": "Save image", "ja": "画像を保存"},
+    "shortcut.export_parquet": {"en": "Export Parquet", "ja": "Parquetに書き出す"},
     "scroll_action.x_zoom": {"en": "Time (X) zoom", "ja": "時間(X)軸ズーム"},
     "scroll_action.y_zoom": {"en": "Amp (Y) zoom", "ja": "Amp(Y)軸ズーム"},
     "scroll_action.pan": {"en": "Time pan", "ja": "時間移動（パン）"},
@@ -1078,6 +1264,29 @@ _STRINGS: dict[str, dict[str, str]] = {
     "alias.save_failed": {"en": "Could not save the signal aliases: {error}", "ja": "信号の別名を保存できません: {error}"},
     "alias.refused": {"en": "Not saved: these aliases are in use.\n{list}", "ja": "保存しませんでした。使用中の別名があります。\n{list}"},
     "alias.toggle_refused": {"en": "Signal aliases were not turned off: these aliases are in use.\n{list}", "ja": "信号の別名をOFFにしませんでした。使用中の別名があります。\n{list}"},
+    # persistence 54.6: assign substitute signals from the view-load warning
+    "alias.assign_button": {"en": "Assign substitute signals...", "ja": "代わりの信号を割り当てる..."},
+    "alias.assign_title": {"en": "Assign substitute signals", "ja": "代わりの信号を割り当てる"},
+    "alias.assign_intro": {
+        "en": "These signals of view \"{view}\" are not in the open file. Pick a column of this file for each one; "
+        "the choice is stored as a signal alias (used for every file) and the view is loaded again.",
+        "ja": "ビュー「{view}」の次の信号は今のファイルにありません。それぞれに、このファイルの列を選んでください。"
+        "選んだ内容は信号の別名として保存され（どのファイルでも使われます）、ビューを読み直します。",
+    },
+    "alias.assign_none": {"en": "Do not assign", "ja": "割り当てない"},
+    "alias.assign_note_new": {"en": "A new alias {name} will be created.", "ja": "新しい別名 {name} を作ります。"},
+    "alias.assign_note_append": {
+        "en": "The column is added to the end of the candidates of alias {name}.",
+        "ja": "別名 {name} の候補の最後にその列を足します。",
+    },
+    "alias.assign_note_reenable": {
+        "en": "Alias {name} is disabled: the column is added to its candidates and the alias is enabled again.",
+        "ja": "別名 {name} は無効です。候補にその列を足し、別名を有効に戻します。",
+    },
+    "alias.assign_note_reserved": {
+        "en": "{name} is a function or map name, so it cannot be an alias.",
+        "ja": "{name} は関数・マップの名前なので、別名にできません。",
+    },
     "alias.used_series": {"en": "{alias}: plotted in plot {plot}", "ja": "{alias}: プロット{plot}に表示中"},
     "alias.used_derived": {"en": "{alias}: used by derived variable {name}", "ja": "{alias}: 仮想変数 {name} の式で使用中"},
     "alias.used_time": {"en": "{alias}: selected as the time axis", "ja": "{alias}: 時間軸に選択中"},

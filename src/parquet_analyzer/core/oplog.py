@@ -366,8 +366,16 @@ class compound_op:
     load_view -> add_plot ...): only the first becomes the operation that gets a
     result; later ones are recorded as its children (`parent`)."""
 
+    def __init__(self, owner: int | None = None):
+        # `owner`: an operation whose result is still pending but whose handler has returned
+        # (load_view waiting for its background computation, expressions 55.3): the ops logged
+        # inside this scope become its children although the event loop has turned since.
+        self._owner = owner
+
     def __enter__(self):
         _S.scope_depth += 1
+        if self._owner is not None and _S.scope_owner is None:
+            _S.scope_owner = self._owner
         return self
 
     def __exit__(self, *exc):

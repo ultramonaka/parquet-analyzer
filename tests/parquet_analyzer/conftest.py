@@ -32,7 +32,7 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "default"))
 
 @pytest.fixture(autouse=True, scope="session")
 def _gc_on_main_thread_only():
-    """detailed_specification.md 37.2 / dev notes 13.6: automatic cyclic GC can run on a
+    """detailed_specification.md 37.2 /: automatic cyclic GC can run on a
     QThreadPool worker and destroy Qt objects off the UI thread (intermittent crash in a
     later, unrelated test). Disable it; `_collect_between_tests` collects on the main thread."""
     was_enabled = gc.isenabled()
@@ -57,6 +57,16 @@ def qapp():
         QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     yield app
+
+
+@pytest.fixture(autouse=True)
+def _no_blocking_message_box(monkeypatch):
+    """A `QMessageBox` built by hand and run with `exec()` (e.g. `messages.warning_with_button`)
+    would wait for a click forever; make it return at once. Tests that care patch
+    `messages.warning_with_button` themselves."""
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
 
 
 @pytest.fixture

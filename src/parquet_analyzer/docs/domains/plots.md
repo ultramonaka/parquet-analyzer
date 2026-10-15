@@ -194,7 +194,7 @@ per-series select / remove / show-hide, independent X axes per plot, the "A" but
   ("＋ Add plot", "Split into a new plot", and plots created by loading a view).
 - The navigator picture (the first shown series of the linked top plot, the anchor) shows the current series after any operation that changes
   that series. This is also true when the top plot is unlinked.
-- Bugs (2026-10-13, found by the investigation of state owners, reproduced without a screen; dev notes "result of the state-owner investigation"):
+- Bugs:
   (1) If decimation is turned OFF and then a plot is added, only the new plot is decimated. Loading a view saved with decimation OFF, the second and
   later plots are decimated. (2) With the top plot unlinked, dropping a variable onto the anchor does not change the navigator picture.
 - Details in [ch. 50](#50-decimation-setting-for-new-plots-and-navigator-picture-follows-the-series-added-2026-10-13-from-the-state-owner-investigation).
@@ -703,8 +703,7 @@ only the switching UI (menu item, chain icon) is hidden; the internal mechanism 
     layout change reset the selection to the whole data; an existing bug that also happened with ch. 22's
     reordering).
   - (2026-10-06) The range is put back inside the overview update. On the synchronous path, `_refresh_navigator_overview` returns the
-    selection to the linked group's range every time (when derived variables are added, edited or deleted, when maps or functions change,
-    or on a drop onto the top plot; this was the 6th recurrence, dev notes 14). Opening a file and switching the time-axis column keep the
+    selection to the linked group's range every time. Opening a file and switching the time-axis column keep the
     whole range with `keep_region=False` (home).
 - Switching the time-axis column (`set_time_axis_data`) replaces the X values of every time-domain plot,
   unlinked ones included, and does `go_home` (as before; linking states are kept).
@@ -803,7 +802,7 @@ nothing.
 
 | Input | Handling |
 |---|---|
-| A range change from a plot after it was removed | Ignored (a plot not in the grid has its `rangeChanged` not forwarded to the navigator). The **fifth path** of the navigator re-sync bug (dev rules, dev notes 2026-10-02) |
+| A range change from a plot after it was removed | Ignored (a plot not in the grid has its `rangeChanged` not forwarded to the navigator). The **fifth path** of the navigator re-sync bug |
 | A non-finite X to `set_x_range`, the navigator's `set_selected_range`, or adding/moving a cursor | Ignored |
 | Moving a removed cursor ID, removing/moving a removed plot | Nothing happens (no exception) |
 | Dropping a string that isn't a variable name (a selection from another app, an old name, the time-axis column) | Ignored and logged. Dropping a non-numeric column is data 29.5 |
@@ -815,10 +814,10 @@ Test plan: `test_plots_errors.py` (degenerate series and ranges, the navigator, 
 linking in the grid, cursors, switching the time axis, real clicks and wheel). A bug fix comes with a
 regression test that fails before the fix.
 
-#### 24.9 One place for navigator synchronization (`NavigatorSync`) (added 2026-10-08, dev notes 20)
+#### 24.9 One place for navigator synchronization (`NavigatorSync`)
 
 Purpose: prevent, by **structure** rather than by caller discipline, the bug "the navigator selection jumps to the whole range while the plots stay zoomed"
-(24.1; recurred 6 times; dev notes 2026-10-02 and 2026-10-06). This is the first of the splits of `main_window.py` (2155 lines). The screen's look and
+. This is the first of the splits of `main_window.py` (2155 lines). The screen's look and
 behaviour do not change (refactoring plus the latent bug fix below).
 
 Cause pattern: `NavigatorWidget.set_overview_data` resets the selection to the whole range each time, and the paths in `main_window.py` that draw the
@@ -877,7 +876,7 @@ state `_navigator_overview_gen`, `_nav_pyramid_column`, `_navigator_hub` (`Worke
 
 **(3) Moves and commits**
 
-- dev rules rule 7: separate the "move only" commit (methods moved to `NavigatorSync` and delegated from `MainWindow`; behaviour unchanged, all tests
+-: separate the "move only" commit (methods moved to `NavigatorSync` and delegated from `MainWindow`; behaviour unchanged, all tests
   pass) from the "content change" commit (making `keep_region` the default, collecting into `_apply`, blocking signals in `setBounds`, removing the delegation).
 
 **Test plan** (`tests/parquet_analyzer/test_navigator_sync.py`, new; the existing `test_navigator_resync.py` must also pass)
@@ -888,10 +887,10 @@ state `_navigator_overview_gen`, `_nav_pyramid_column`, `_navigator_hub` (`Worke
 2. After every synchronous path (opening a file, switching the time axis, adding/removing/reordering series, changing linking, adding/editing/deleting a
    derived variable, changing maps), if the plots are zoomed the navigator range equals the linked group's range. After opening a file or switching the
    time axis, the whole range.
-3. **Asynchronous paths** (decided in dev notes 20): with a windowed column (`WindowedColumn`, a file with few row groups), when the refined overview from
+3. **Asynchronous paths**: with a windowed column (`WindowedColumn`, a file with few row groups), when the refined overview from
    `_on_navigator_overview_ready` arrives while plots are zoomed, the range stays at the linked group's range. Same when a derived variable's pyramid
    arrives. If another overview is requested before a result arrives, the stale result is dropped (generation counter). On failure the coarse overview
-   stays and `busy` is cleared. Tests wait for worker results in real time (dev rules: no fixed-count loops).
+   stays and `busy` is cleared. Tests wait for worker results in real time.
 4. Structure: `main_window.py` contains no call to `navigator.set_overview_data` (a simple source-reading test). In `navigator_sync.py`, only `_apply`
    calls `set_overview_data`.
 5. Real operations: with zoom on, run each path above, then drag the navigator range (real mouse events) and confirm the plots do not jump to the whole range.
@@ -904,7 +903,7 @@ Scale: large (Sonnet plus reviewer). Touches WorkerHub and the navigator invaria
 
 ### 39. Showing the values under the mouse (hover readout) (added 2026-10-03, user request)
 
-Requirement: 5.32. In the discussion in dev notes, all five open questions were decided with the
+Requirement: 5.32. In the discussion, all five open questions were decided with the
 recommended options (2026-10-03).
 
 #### 39.1 Parts
@@ -1012,8 +1011,7 @@ it visible, then `QTest.mouseClick` on the button's position in the viewport).
 ### 50. Decimation setting for new plots, and navigator picture follows the series (added 2026-10-13, from the state-owner investigation)
 
 Requirement: [5.43](#543-decimation-setting-for-new-plots-and-navigator-picture-follows-the-series-added-2026-10-13-from-the-state-owner-investigation).
-Approach: where **several paths write the same state and each path syncs it by hand**, move the state to **one owner** and fix it there (items (1) and (2) of
-dev notes "result of the state-owner investigation"). No big-bang rewrite.
+Approach: where **several paths write the same state and each path syncs it by hand**, move the state to **one owner** and fix it there. No big-bang rewrite.
 
 #### 50.0 Cause of the bugs
 

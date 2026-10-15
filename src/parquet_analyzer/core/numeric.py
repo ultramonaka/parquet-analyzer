@@ -78,6 +78,10 @@ class TimeOrderReport:
     nan_count: int  # non-finite values (NaN / +-Inf)
     decreasing_count: int  # places where a finite value is smaller than the previous finite one
     first_decreasing_index: int | None  # original row index of the first such value, if any
+    # 56.2: finite values equal to the previous finite one (NaN/Inf between them are skipped,
+    # the same rule as decreasing_count). Does not affect `ok`: duplicates keep ranges correct.
+    duplicate_count: int = 0
+    first_duplicate_index: int | None = None  # original row index of the first such value, if any
 
     @property
     def ok(self) -> bool:
@@ -97,6 +101,8 @@ class TimeOrderScanner:
         self.nan_count = 0
         self.decreasing = 0
         self.first_bad: int | None = None
+        self.duplicates = 0  # 56.2
+        self.first_dup: int | None = None
         self._prev: float | None = None  # last finite value of the previous chunks
 
     def feed(self, chunk: np.ndarray, start: int) -> None:
@@ -115,6 +121,10 @@ class TimeOrderScanner:
             self.decreasing += 1
             if self.first_bad is None:
                 self.first_bad = start + (int(idx[0]) if idx is not None else 0)
+        if self._prev is not None and v[0] == self._prev:
+            self.duplicates += 1
+            if self.first_dup is None:
+                self.first_dup = start + (int(idx[0]) if idx is not None else 0)
         if v.size > 1:
             bad = np.nonzero(np.diff(v) < 0)[0]
             if bad.size:
@@ -122,10 +132,16 @@ class TimeOrderScanner:
                 if self.first_bad is None:
                     j = int(bad[0]) + 1
                     self.first_bad = start + (int(idx[j]) if idx is not None else j)
+            dup = np.nonzero(np.diff(v) == 0)[0]
+            if dup.size:
+                self.duplicates += int(dup.size)
+                if self.first_dup is None:
+                    j = int(dup[0]) + 1
+                    self.first_dup = start + (int(idx[j]) if idx is not None else j)
         self._prev = v[-1]
 
     def report(self) -> TimeOrderReport:
-        return TimeOrderReport(self.nan_count, self.decreasing, self.first_bad)
+        return TimeOrderReport(self.nan_count, self.decreasing, self.first_bad, self.duplicates, self.first_dup)
 
 
 def check_time_order(values: np.ndarray) -> TimeOrderReport:

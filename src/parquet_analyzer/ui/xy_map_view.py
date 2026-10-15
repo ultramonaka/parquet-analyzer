@@ -49,6 +49,8 @@ class XYMapViewMixin:
         self._grid_vars: tuple = ()
         self._x_grid, self._y_grid = xm.GridAxisEdit(), xm.GridAxisEdit()
         self._agg_combo, self._fill_combo = QComboBox(), QComboBox()
+        self._time_unit_combo = QComboBox()  # 44.14: shown only with agg "time"
+        self._time_unit_group = QWidget()
         self._kind3d_combo = QComboBox()
         self._min_count_spin = QSpinBox()
         self._points_check = QCheckBox(tr("xy.map_overlay_points"))
@@ -67,6 +69,10 @@ class XYMapViewMixin:
         for key in xm_agg_keys():
             self._agg_combo.addItem(tr(f"xy.agg_{key}"), key)
         self._agg_group, _l = self._group(flow, tr("xy.map_agg"), self._agg_combo)
+        for key in xm.TIME_UNITS:  # the unit of the aggregate "time" (44.14); default hours
+            self._time_unit_combo.addItem(tr(f"hist.unit_{key}"), key)
+        self._time_unit_combo.setCurrentIndex(self._time_unit_combo.findData("h"))
+        self._time_unit_group, _l = self._group(flow, tr("xy.map_time_unit"), self._time_unit_combo)
         self._min_count_spin.setRange(1, 1_000_000)
         self._min_count_spin.setValue(1)
         self._min_count_spin.setToolTip(tr("xy.map_min_count_tooltip"))
@@ -86,7 +92,8 @@ class XYMapViewMixin:
         self._auto_button.setToolTip(tr("xy.map_auto_tooltip"))
         self._auto_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         flow.addWidget(self._auto_button)
-        self._map_groups = [self._x_grid_group, self._y_grid_group, self._agg_group, self._min_group,
+        self._map_groups = [self._x_grid_group, self._y_grid_group, self._agg_group, self._time_unit_group,
+                            self._min_group,
                             self._fill_group, self._points_check, self._auto_button]
         if exclude_group is not None:
             self._map_groups += [self._keep_sparse_check, exclude_group]
@@ -95,6 +102,7 @@ class XYMapViewMixin:
         self._x_grid.edited.connect(self._on_setting_changed)
         self._y_grid.edited.connect(self._on_setting_changed)
         self._agg_combo.currentIndexChanged.connect(self._on_setting_changed)
+        self._time_unit_combo.currentIndexChanged.connect(self._on_setting_changed)
         self._fill_combo.currentIndexChanged.connect(self._on_setting_changed)
         self._min_count_spin.valueChanged.connect(self._on_setting_changed)
         self._keep_sparse_check.toggled.connect(self._on_setting_changed)
@@ -115,13 +123,18 @@ class XYMapViewMixin:
         """3D and 2D with one Y coloured by Z give a map z(x, y); 2D otherwise gives a curve per Y."""
         if self._mode == "3d":
             return "map"
-        single = len(self.selected_y()) == 1 and self._color_mode() == "z" and bool(self._z_combo.currentText())
+        z_ok = self._time_agg() or bool(self._z_combo.currentText())  # "time" does not use Z (44.14)
+        single = len(self.selected_y()) == 1 and self._color_mode() == "z" and z_ok
         return "map" if single else "curve"
+
+    def _time_agg(self) -> bool:
+        """The aggregate "time" (44.14) is chosen."""
+        return self._agg_combo.currentData() == "time"
 
     def _map_blocked_reason(self) -> str:
         """"" or why no map can be made: a map on the time axis could not be used in expressions."""
         names = [self._x_combo.currentText(), *self.selected_y()]
-        if self._map_kind() == "map":
+        if self._map_kind() == "map" and not self._time_agg():  # "time" does not use Z (44.14)
             names.append(self._z_combo.currentText())
         return tr("xy.map_blocked_time") if any(self._is_time(n) for n in names) else ""
 
@@ -154,8 +167,16 @@ class XYMapViewMixin:
         for g in self._map_groups:
             g.setVisible(active)
         self._y_grid_group.setVisible(active and self._map_kind() == "map")
-        count = self._agg_combo.currentData() == "count"
+        timed = self._time_agg()
+        self._time_unit_group.setVisible(active and timed)  # 44.14
+        if timed:  # Z is not used: greyed out with the reason
+            self._z_combo.setEnabled(False)
+            self._z_combo.setToolTip(tr("xy.map_z_unused_tooltip"))
+        else:
+            self._z_combo.setToolTip("")
+        count = self._agg_combo.currentData() == "count" or timed  # "time" uses neither min. points nor the fill
         self._fill_group.setEnabled(not count)
+        self._min_group.setEnabled(not timed)
         self._keep_sparse_check.setEnabled(not count and self._fill_combo.currentData() != "none")  # 44.13
         self._exclude.update_buttons()
         self._update_median_item()
@@ -208,8 +229,9 @@ class XYMapViewMixin:
         if not x_name or not ys:
             raise ValueError(tr("xy.need_xy"))
         kind = self._map_kind()
-        z_name = self._z_combo.currentText() or None
-        if kind == "map" and not z_name:
+        timed = self._time_agg()
+        z_name = (self._z_combo.currentText() or None) if not timed else None  # 44.14: Z is not used
+        if kind == "map" and not z_name and not timed:
             raise ValueError(tr("xyz.need_xyz"))
         reason = self._map_blocked_reason()
         if reason:
@@ -232,11 +254,18 @@ class XYMapViewMixin:
         keep_sparse = self._keep_sparse_check.isChecked() and self._keep_sparse_check.isEnabled()
         excluded = self._exclude.rows  # replaced, never mutated: safe to hand to the worker (44.13)
         main = self._main
-        columns = self._resolve_columns([x_name, *ys, *([z_name] if kind == "map" else [])])
+        columns = self._resolve_columns([x_name, *ys, *([z_name] if kind == "map" and z_name else [])])
         time_name = main._time_column
+        times = main._time_values
+        time_unit = self._time_unit_combo.currentData()
+        if timed and times is None:
+            raise ValueError(tr("xy.map_time_no_axis"))
 
         def fetch(name: str, a: int, b: int) -> np.ndarray:
             return columns[name].window(a, b)
+
+        def fetch_time(a: int, b: int) -> np.ndarray:
+            return np.asarray(times[a:b])
 
         log_op(
             "xy_plot_compute", mode="map", kind=kind, view=("3d" if three else "2d"), x=x_name, y=ys,
@@ -244,11 +273,13 @@ class XYMapViewMixin:
             min_count=min_count, fill=fill, keep_sparse_empty=keep_sparse, excluded_rows=int(len(excluded)),
             x_grid=self._x_grid.describe(),
             y_grid=self._y_grid.describe() if kind == "map" else None,
+            **({"time_unit": time_unit} if timed else {}),
         )
         return lambda: xm.compute_xy_map(
             fetch, x_name, ys, z_name, kind, x_req, y_req, agg, min_count, fill, row_start, row_end,
             chunk_rows=xpw.XY_CHUNK_ROWS, scatter_limit=xpw.XY_SCATTER_LIMIT, cancelled=cancelled,
             time_name=time_name, is_3d=three, excluded_rows=excluded, keep_sparse_empty=keep_sparse,
+            fetch_time=fetch_time if timed else None, time_unit=time_unit,
         )
 
     def _show_map(self, r: xm.XYMapResult) -> None:
@@ -278,11 +309,15 @@ class XYMapViewMixin:
             shown = max((len(p) for p in r.excluded_point_rows), default=0)
             parts.append(tr("xy.map_status_user_excluded_thinned", n=r.n_user_excluded, shown=shown)
                          if r.excluded_thinned else tr("xy.map_status_user_excluded", n=r.n_user_excluded))
-        if r.n_valid == 0:
+        if r.time_refused:  # 44.14: the time axis is not ascending in the range: say why, compute nothing
+            parts.append(tr(f"xy.map_err_{r.time_refused}"))
+        elif r.n_valid == 0:
             parts.append(tr("xy.status_no_points"))
         else:
             parts.append(tr("xy.map_status_points", valid=r.n_valid, excluded=r.n_excluded, outside=r.n_outside))
-            if r.grids:
+            if r.is_time and r.grids:  # total valid time and the number of gaps (44.14)
+                parts.append(tr("xy.map_status_time", total=f"{r.time_total:.6g}", unit=r.unit_text(), gaps=r.gap_count))
+            elif r.grids:
                 measured, filled, empty = r.cell_counts()
                 parts.append(tr("xy.map_status_cells", measured=measured, filled=filled, empty=empty))
             if r.no_data:
@@ -376,6 +411,7 @@ class XYMapViewMixin:
             plot.addItem(crosses)
             self._map_items["excluded"] = crosses
         self._set_colorbar(levels, time_ticks=False)
+        self._colorbar.axis.setLabel(r.value_label if r.is_time else "")  # the unit of the time (44.14)
         if not self._keep_view_now():
             plot.setRange(xRange=(float(xe[0]), float(xe[-1])), yRange=(float(ye[0]), float(ye[-1])), padding=0)
 
@@ -385,7 +421,7 @@ class XYMapViewMixin:
         )
 
         plot = self._plot
-        plot.setLabel("left", ", ".join(r.names))
+        plot.setLabel("left", r.value_label if r.is_time else ", ".join(r.names))
         for i, (name, g) in enumerate(zip(r.names, r.grids)):
             base = _COLOR_CYCLE[i % len(_COLOR_CYCLE)]
             visible = self._legend_series_visible(name)
@@ -435,7 +471,7 @@ class XYMapViewMixin:
         rng = r.color_range()  # 44.11: the minimum-width rule reaches the colouring and the Z axis alike
         wide = self._overlays.widened_bounds(self._map_bounds_3d(r)).get("z")
         z_range = wide if (rng is not None and wide is not None) else rng
-        view.set_surface(g.x_axis, g.y_axis, g.value, labels=(r.x_name, r.y_names[0], r.z_name or "Z"), extra=extra,
+        view.set_surface(g.x_axis, g.y_axis, g.value, labels=(r.x_name, r.y_names[0], r.value_label), extra=extra,
                          z_range=z_range)
         rng = z_range or rng
         view.set_colorbar(rng if rng and rng[1] > rng[0] else None)

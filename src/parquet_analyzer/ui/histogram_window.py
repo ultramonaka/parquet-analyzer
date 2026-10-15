@@ -45,6 +45,7 @@ from ..core.histogram import (
     HIST_TREND_BAR_MAX,
     INTEGRAL_UNITS,
     STAGE2_AGGREGATIONS,
+    TOD_SLOTS_S,
     Cancelled,
     HistogramError,
     HistogramResult,
@@ -52,6 +53,7 @@ from ..core.histogram import (
     TimeFilter,
     active_filter,
     compute_histogram,
+    format_clock,
     validate_bucket,
     validate_two_stage,
 )
@@ -80,7 +82,7 @@ _STAGE1_DEFAULT = 180.0
 _STAGE1_CUSTOM_UNITS = (("min", 60.0), ("h", 3600.0))
 _UNIT_KEYS = ("s", "min", "h")
 _FILL_ALPHA = 90
-_VIEWS = ("dist", "duration", "trend")
+_VIEWS = ("dist", "duration", "trend", "timeofday")
 _WEEKDAY_PRESETS = {"all": (0, 1, 2, 3, 4, 5, 6), "weekdays": (0, 1, 2, 3, 4), "weekend": (5, 6)}
 _ALL_DAYS = (0, 1, 2, 3, 4, 5, 6)
 _BAR_FILL = 0.95  # share of a bar's slot that is filled; the rest is the gap between neighbours (42.12)
@@ -111,6 +113,24 @@ def _length_text(seconds: float) -> str:
     return f"{seconds:g}{tr('hist.unit_s')}"
 
 
+class _ClockAxis(pg.AxisItem):
+    """Bottom axis of the time-of-day view (42.13): values are seconds after the origin, the labels are
+    `HH:MM` clock times with a tick every 10 min .. 6 h, whichever keeps about a dozen labels."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.origin_s = 0
+
+    def tickValues(self, minVal, maxVal, size):
+        span = max(maxVal - minVal, 1.0)
+        step = next((sp for sp in (600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0) if span / sp <= 13), 21600.0)
+        first = math.ceil(minVal / step) * step
+        return [(step, [float(v) for v in np.arange(first, maxVal + 1e-6, step)])]
+
+    def tickStrings(self, values, scale, spacing):
+        return [format_clock(self.origin_s + v) for v in values]
+
+
 def _fmt(v: float) -> str:
     return "-" if not math.isfinite(v) else f"{v:.6g}"
 
@@ -129,6 +149,7 @@ class HistogramWindow(AnalysisWindow):
         self._apply_enabled()
         self._plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self._trend_plot.scene().sigMouseMoved.connect(self._on_trend_mouse_moved)
+        self._tod_plot.scene().sigMouseMoved.connect(self._on_tod_mouse_moved)
         model = main.variable_panel.model()
         for sig in (model.rowsInserted, model.rowsRemoved, model.modelReset):
             sig.connect(self._schedule_refresh)
@@ -178,9 +199,11 @@ class HistogramWindow(AnalysisWindow):
         # The display kind comes first (42.11): distribution / duration curve / trend.
         self._view_combo = self._combo([
             (tr("hist.view_dist"), "dist"), (tr("hist.view_duration"), "duration"), (tr("hist.view_trend"), "trend"),
+            (tr("hist.view_timeofday"), "timeofday"),
         ])
         self._view_combo.setObjectName("histogram_view")
         self._view_combo.setItemData(2, tr("hist.view_trend_tooltip"), Qt.ItemDataRole.ToolTipRole)
+        self._view_combo.setItemData(3, tr("hist.view_timeofday_tooltip"), Qt.ItemDataRole.ToolTipRole)
         self._group(flow, tr("hist.view"), self._view_combo)
         self._mode_before_trend: str | None = None  # the aggregation to return to when leaving "trend"
 
@@ -300,6 +323,20 @@ class HistogramWindow(AnalysisWindow):
         self._yaxis_combo.setObjectName("histogram_yaxis")
         self._yaxis_group = self._group(flow, tr("hist.yaxis"), self._yaxis_combo)
 
+        # Time of day (42.13): slot length, value, per-day. The origin (above) is where the axis starts.
+        self._slot_combo = self._combo([(_length_text(sec), sec) for sec in TOD_SLOTS_S])
+        self._slot_combo.setObjectName("histogram_tod_slot")
+        self._slot_combo.setCurrentIndex(self._slot_combo.findData(3600.0))
+        self._slot_group = self._group(flow, tr("hist.tod_slot"), self._slot_combo)
+        self._tod_agg_combo = self._combo([(tr("hist.agg_mean"), "mean"), (tr("hist.agg_integral"), "integral")])
+        self._tod_agg_combo.setObjectName("histogram_tod_value")
+        self._tod_agg_group = self._group(flow, tr("hist.tod_value"), self._tod_agg_combo)
+        self._tod_per_day = QCheckBox(tr("hist.tod_per_day"))
+        self._tod_per_day.setObjectName("histogram_tod_per_day")
+        self._tod_per_day.setChecked(True)
+        self._tod_per_day.setToolTip(tr("hist.tod_per_day_tooltip"))
+        self._tod_per_day_group = self._group(flow, "", self._tod_per_day)
+
         # Time-of-day / weekday filter (42.10): the checkbox, the range, the weekday preset + toggles.
         self._tf_check = QCheckBox(tr("hist.time_filter"))
         self._tf_check.setObjectName("histogram_time_filter")
@@ -355,6 +392,9 @@ class HistogramWindow(AnalysisWindow):
         hook(self._bins_spin, self._bins_spin.valueChanged, "bins", self._bins_value)
         hook(self._yaxis_combo, self._yaxis_combo.currentIndexChanged, "yaxis", self._yaxis_combo.currentData)
         self._view_combo.currentIndexChanged.connect(self._on_view_changed)
+        hook(self._slot_combo, self._slot_combo.currentIndexChanged, "tod_slot", self._slot_combo.currentData)
+        hook(self._tod_agg_combo, self._tod_agg_combo.currentIndexChanged, "tod_value", self._tod_agg_combo.currentData)
+        hook(self._tod_per_day, self._tod_per_day.toggled, "tod_per_day", self._tod_per_day.isChecked)
         hook(self._tf_check, self._tf_check.toggled, "time_filter", self._tf_dict)
         hook(self._tf_start, self._tf_start.timeChanged, "time_filter", self._tf_dict)
         hook(self._tf_end, self._tf_end.timeChanged, "time_filter", self._tf_dict)
@@ -420,6 +460,9 @@ class HistogramWindow(AnalysisWindow):
             stage1_agg=self._stage1_agg_combo.currentData(),
             view=self.view(),
             time_filter=self.current_time_filter(),
+            slot_s=float(self._slot_combo.currentData()),
+            tod_agg=self._tod_agg_combo.currentData(),
+            tod_per_day=self._tod_per_day.isChecked(),
         )
 
     def _apply_enabled(self) -> None:
@@ -456,6 +499,20 @@ class HistogramWindow(AnalysisWindow):
         self._gap_group.setEnabled(time_used)
         self._gap_spin.setEnabled(time_used and self._gap_combo.currentData() == "value")
         self._bins_spin.setEnabled(self._bins_combo.currentData() == "value")
+        if view == "timeofday":  # 42.13: bucket / bin / count settings do not apply; the origin does
+            for grp in (self._mode_group, self._weight_group, self._bucket_group, self._agg_group, self._exclude_group,
+                        self._two_group, self._stage1_group, self._stage1_agg_group, self._bins_group, self._yaxis_group):
+                grp.setEnabled(False)
+            self._origin_group.setEnabled(True)
+            self._gap_group.setEnabled(True)
+            self._gap_spin.setEnabled(self._gap_combo.currentData() == "value")
+        tod = view == "timeofday"
+        tod_integral = tod and self._tod_agg_combo.currentData() == "integral"
+        self._slot_group.setEnabled(tod)
+        self._tod_agg_group.setEnabled(tod)
+        self._tod_per_day_group.setEnabled(tod_integral)
+        if tod:
+            self._unit_group.setEnabled(tod_integral)
         reason = self.setting_error()
         # the reason sits next to the input it is about (42.2 / 42.8)
         stage_reason = reason if reason and reason.startswith("stage") else None
@@ -465,7 +522,7 @@ class HistogramWindow(AnalysisWindow):
 
     def setting_error(self) -> str | None:
         """The reason id when the bucket / window lengths cannot be computed (no data needed), else None."""
-        if self._mode_combo.currentData() != "bucket":
+        if self._mode_combo.currentData() != "bucket" or self.view() == "timeofday":
             return None
         if self.two_stage():
             return validate_two_stage(self.stage1_seconds(), self.bucket_seconds())
@@ -541,7 +598,7 @@ class HistogramWindow(AnalysisWindow):
             self._single_agg = value
         self._apply_enabled()
         if item == "yaxis":  # display only: redraw the shown result
-            if self._result is not None and self._result.settings.view != "trend":
+            if self._result is not None and self._result.settings.view in ("dist", "duration"):
                 self._draw(self._result)
             return
         self.recompute(keep_range=True)
@@ -599,9 +656,21 @@ class HistogramWindow(AnalysisWindow):
         self._trend_vb.disableAutoRange()
         self._trend_vb.sigXRangeChanged.connect(self._trend_fit_y)
         self._trend_series: list[tuple[np.ndarray, np.ndarray]] = []  # drawn (x0, value) arrays per variable
+        # The time-of-day view (42.13) also has its own plot: a clock axis, no mouse zoom.
+        self._clock_axis = _ClockAxis("bottom")
+        self._tod_widget = pg.PlotWidget(axisItems={"bottom": self._clock_axis})
+        self._tod_widget.setObjectName("histogram_tod_plot")
+        self._tod_plot = self._tod_widget.getPlotItem()
+        self._tod_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._tod_plot.setMenuEnabled(False)
+        self._tod_legend = self._tod_plot.addLegend()
+        self._tod_vb = self._tod_plot.getViewBox()
+        self._tod_vb.setMouseEnabled(x=False, y=False)
+        self._tod_vb.disableAutoRange()
         self._stack = QStackedWidget()
         self._stack.addWidget(self._plot_widget)
         self._stack.addWidget(self._trend_widget)
+        self._stack.addWidget(self._tod_widget)
         lay.addWidget(self._stack, 1)
         # The hover readout is a normal label below the plot (nothing is laid over the plot).
         self._hover_label = QLabel(tr("hist.hover_hint"))
@@ -645,6 +714,8 @@ class HistogramWindow(AnalysisWindow):
             "histogram_compute", variables=names, mode=settings.mode, weight=settings.weight,
             row_start=row_start, row_end=row_end, two_stage=settings.two_stage,
             view=settings.view, time_filter=self._tf_dict(),
+            **({"slot_s": settings.slot_s, "tod_agg": settings.tod_agg, "tod_per_day": settings.tod_per_day}
+               if settings.view == "timeofday" else {}),
         )
 
         def job():
@@ -685,6 +756,10 @@ class HistogramWindow(AnalysisWindow):
 
     # -- status --------------------------------------------------------------------
 
+    def _time_order_parts(self) -> list[str]:
+        """56.1: a short warning next to the range display when the time axis is not ascending."""
+        return [tr("time_order.range_warning_short")] if self._main.time_order_unreliable() else []
+
     def _range_text(self, r: HistogramResult) -> str:
         main = self._main
         times = main._time_values
@@ -696,7 +771,10 @@ class HistogramWindow(AnalysisWindow):
         return tr("stats.empty_range")
 
     def _update_status(self, r: HistogramResult) -> None:
-        parts = [tr("xy.status_range", range=self._range_text(r), rows=r.row_end - r.row_start)]
+        parts = [*self._time_order_parts(), tr("xy.status_range", range=self._range_text(r), rows=r.row_end - r.row_start)]
+        if r.settings.view == "timeofday":
+            self._update_status_tod(r, parts)
+            return
         bucket = r.settings.mode == "bucket"
         unit = tr("hist.count_buckets" if bucket else "hist.count_rows")
         for v in r.variables:
@@ -719,6 +797,21 @@ class HistogramWindow(AnalysisWindow):
             parts.append(tf_text)
         if r.settings.view == "trend" and self._trend_as_line(r):
             parts.append(tr("hist.status_trend_line", n=len(r.bucket_start)))
+        if all(v.n == 0 for v in r.variables):
+            parts.append(tr("hist.status_no_data"))
+        self.set_status("  |  ".join(parts))
+
+    def _update_status_tod(self, r: HistogramResult, parts: list[str]) -> None:
+        """Status of the time-of-day view (42.13): the range of day counts per slot, gaps, the filter."""
+        for v in r.variables:
+            days = np.asarray(v.slot_days)[np.asarray(v.slot_days) > 0]
+            if len(days):
+                parts.append(tr("hist.status_tod_days", name=v.name, lo=int(days.min()), hi=int(days.max())))
+        if r.gap_count:
+            parts.append(tr("hist.status_gaps", n=r.gap_count, gap=_fmt(r.gap_s if r.gap_s is not None else math.nan)))
+        tf_text = self.time_filter_text(r)
+        if tf_text:
+            parts.append(tf_text)
         if all(v.n == 0 for v in r.variables):
             parts.append(tr("hist.status_no_data"))
         self.set_status("  |  ".join(parts))
@@ -750,6 +843,8 @@ class HistogramWindow(AnalysisWindow):
         self._legend.clear()
         self._trend_plot.clear()
         self._trend_legend.clear()
+        self._tod_plot.clear()
+        self._tod_legend.clear()
         self._trend_series = []
         self._lines_visible = []
         self._hover_label.setText(tr("hist.hover_hint"))
@@ -800,6 +895,12 @@ class HistogramWindow(AnalysisWindow):
 
     def _drawable(self, r: HistogramResult) -> bool:
         """False when an edge or a bar height is not finite (e.g. values near the float limit)."""
+        if r.settings.view == "timeofday":
+            if r.slot_start is None or not np.isfinite(r.slot_start).all():
+                return False
+            # a slot with valid time whose value overflowed (inf / NaN) cannot be drawn (data 29.4)
+            return all(bool(np.isfinite(np.asarray(v.slot_values)[np.asarray(v.slot_valid_s) > 0]).all())
+                       for v in r.variables)
         if r.settings.view == "duration":
             return all(np.isfinite(d["x"]).all() and np.isfinite(d["v"]).all() for d in self._duration_data(r))
         if r.settings.view == "trend":
@@ -815,6 +916,8 @@ class HistogramWindow(AnalysisWindow):
             self._draw_duration(r)
         elif view == "trend":
             self._draw_trend(r)
+        elif view == "timeofday":
+            self._draw_timeofday(r)
         else:
             self._draw_dist(r)
 
@@ -1102,6 +1205,97 @@ class HistogramWindow(AnalysisWindow):
             return
         self._hover_label.setText(self.trend_hover_text(float(self._trend_vb.mapSceneToView(pos).x())))
 
+    # -- time of day (42.13) -------------------------------------------------------
+
+    @staticmethod
+    def tod_summary(s: HistogramSettings) -> str:
+        """"1 h, mean" for the export note and the status."""
+        value = tr("hist.agg_" + s.tod_agg)
+        if s.tod_agg == "integral":
+            key = next((k for k, sec in INTEGRAL_UNITS.items() if sec == s.integral_unit_s), "h")
+            value += f" [×{tr('hist.unit_' + key)}]" + (tr("hist.tod_y_per_day") if s.tod_per_day else "")
+        return tr("hist.tod_summary", slot=_length_text(s.slot_s), value=value)
+
+    def tod_y_label(self, r: HistogramResult) -> str:
+        """Mean: the variable names; integral: "name (integral [x h], per day)" (42.13)."""
+        s = r.settings
+        names = ", ".join(v.name for v in r.variables)
+        if s.tod_agg != "integral":
+            return names
+        key = next((k for k, sec in INTEGRAL_UNITS.items() if sec == s.integral_unit_s), "h")
+        return tr("hist.tod_y_integral", name=names, unit=tr("hist.unit_" + key),
+                  perday=tr("hist.tod_y_per_day") if s.tod_per_day else "")
+
+    @staticmethod
+    def tod_runs(values: np.ndarray) -> list[tuple[int, int]]:
+        """Index ranges [i, j) of consecutive slots with a value: the line breaks at slots without one."""
+        ok = np.isfinite(values)
+        if not ok.any():
+            return []
+        idx = np.flatnonzero(ok)
+        cuts = np.flatnonzero(np.diff(idx) != 1) + 1
+        return [(int(g[0]), int(g[-1]) + 1) for g in np.split(idx, cuts)]
+
+    def _draw_timeofday(self, r: HistogramResult) -> None:
+        self._stack.setCurrentWidget(self._tod_widget)
+        self._clear_plot()
+        slot_s = float(r.settings.slot_s)
+        self._clock_axis.origin_s = r.settings.origin_s
+        self._tod_plot.setLabel("bottom", tr("hist.tod_x_label"))
+        self._tod_plot.setLabel("left", self.tod_y_label(r))
+        edges = np.append(np.asarray(r.slot_start, dtype=np.float64), float(r.slot_start[-1]) + slot_s)
+        lo, hi = 0.0, 0.0
+        for i, v in enumerate(r.variables):
+            vals = np.asarray(v.slot_values, dtype=np.float64)
+            color = QColor(_COLOR_CYCLE[i % len(_COLOR_CYCLE)])
+            named = False
+            for a, b in self.tod_runs(vals):  # one item per run: no NaN reaches pyqtgraph (data 29.4)
+                item = pg.PlotDataItem(edges[a:b + 1], vals[a:b], stepMode="center", pen=pg.mkPen(color, width=2),
+                                       name=None if named else v.name)
+                item.setObjectName(f"hist_tod_line_{i}")
+                self._tod_plot.addItem(item)
+                named = True
+            fin = vals[np.isfinite(vals)]
+            if len(fin):
+                lo, hi = min(lo, float(fin.min())), max(hi, float(fin.max()))
+        pad = 0.06 * ((hi - lo) or abs(hi) or 1.0)
+        self._tod_plot.setRange(xRange=(0.0, float(edges[-1])), yRange=(lo - (pad if lo < 0 else 0.0), hi + pad), padding=0.01)
+        self._hover_label.setText(tr("hist.hover_hint"))
+
+    @staticmethod
+    def _tod_days_text(v, k: int) -> str:
+        """'9 days' or '9 days, 1 partial' (42.13: a partly covered day still counts as a day in the
+        per-day integral, so the hover says how many there were)."""
+        days = tr("hist.hover_tod_days", n=int(v.slot_days[k]))
+        partial = 0 if v.slot_partial_days is None else int(v.slot_partial_days[k])
+        return days + (tr("hist.hover_tod_partial", n=partial) if partial else "")
+
+    def tod_hover_text(self, x: float) -> str:
+        r = self._result
+        if r is None or r.settings.view != "timeofday" or r.slot_start is None or not math.isfinite(x):
+            return tr("hist.hover_hint")
+        slot_s = float(r.settings.slot_s)
+        k = int(math.floor(x / slot_s))
+        if k < 0 or k >= len(r.slot_start):
+            return tr("hist.hover_hint")
+        origin = r.settings.origin_s
+        parts = []
+        for v in r.variables:
+            val = float(v.slot_values[k])
+            text = tr("hist.hover_trend_none") if not math.isfinite(val) else (
+                _fmt(val) + f" ({self._tod_days_text(v, k)})")
+            parts.append(text if len(r.variables) == 1 else f"{v.name}: {text}")
+        return tr("hist.hover_tod", start=format_clock(origin + k * slot_s), end=format_clock(origin + (k + 1) * slot_s),
+                  kind=tr("hist.agg_" + r.settings.tod_agg), values=", ".join(parts))
+
+    def _on_tod_mouse_moved(self, pos) -> None:
+        if self._closed or self._result is None or self._result.settings.view != "timeofday":
+            return
+        if not self._tod_plot.sceneBoundingRect().contains(pos):
+            self._hover_label.setText(tr("hist.hover_hint"))
+            return
+        self._hover_label.setText(self.tod_hover_text(float(self._tod_vb.mapSceneToView(pos).x())))
+
     # -- lifecycle -----------------------------------------------------------------
 
     def on_close(self) -> None:
@@ -1120,6 +1314,15 @@ class HistogramWindow(AnalysisWindow):
             return None
         s = r.settings
         lines = [tr("hist.stamp_variables", names=", ".join(v.name for v in r.variables))]
+        if s.view == "timeofday":  # 42.13
+            lines.append(tr("hist.stamp_view", text=self.tod_summary(s)))
+            origin = format_clock(s.origin_s)
+            if s.origin_s:
+                lines.append(tr("hist.stamp_origin", time=origin))
+            tf_text = self.time_filter_text(r)
+            if tf_text:
+                lines.append(tf_text)
+            return lines
         if s.mode == "bucket":
             start = f"{s.origin_s // 3600}:{s.origin_s % 3600 // 60:02d}"
             text = f"{_length_text(s.bucket_s)} ({tr('hist.stamp_origin', time=start)}), " + self.aggregation_summary(s, length=False)
@@ -1157,7 +1360,14 @@ class HistogramWindow(AnalysisWindow):
     def _sync_export_action(self) -> None:
         """Enabled only with a bucketed result that has a per-bucket table (42.8)."""
         r = self._result
-        ok = r is not None and r.settings.mode == "bucket" and r.bucket_start is not None and len(r.bucket_start) > 0
+        if r is not None and r.settings.view == "timeofday":  # 42.13: "save slot values"
+            ok = r.slot_start is not None and len(r.slot_start) > 0
+            self.export_windows_action.setText(tr("hist.export_slots"))
+            self.export_windows_action.setToolTip(tr("hist.export_slots_tooltip"))
+        else:
+            ok = r is not None and r.settings.mode == "bucket" and r.bucket_start is not None and len(r.bucket_start) > 0
+            self.export_windows_action.setText(tr("hist.export_windows"))
+            self.export_windows_action.setToolTip(tr("hist.export_windows_tooltip"))
         self.export_windows_action.setEnabled(bool(ok))
 
     def _time_is_datetime(self) -> bool:
@@ -1176,9 +1386,8 @@ class HistogramWindow(AnalysisWindow):
         folder = self._export_dir or str(source.parent)
         default = Path(folder) / f"{hexport.default_file_stem(r)}.parquet"
         filters = [tr("hist.export_windows_filter_parquet"), tr("hist.export_windows_filter_csv")]
-        path, selected = QFileDialog.getSaveFileName(
-            self, tr("hist.export_windows_title"), str(default), ";;".join(filters)
-        )
+        title = tr("hist.export_slots_title" if r.settings.view == "timeofday" else "hist.export_windows_title")
+        path, selected = QFileDialog.getSaveFileName(self, title, str(default), ";;".join(filters))
         if not path:
             return
         # The format always follows the chosen filter (42.8). If the suffix does not match,
@@ -1198,12 +1407,16 @@ class HistogramWindow(AnalysisWindow):
         incomplete ones too) as Parquet (key-value metadata) or CSV (+ sidecar .json), on the UI
         thread; failures go through ui/messages (42.8)."""
         r = self._result
-        if r is None or r.bucket_start is None or not len(r.bucket_start):
-            messages.information(self, tr("hist.export_windows_title"), tr("export.nothing_to_export"))
+        slots = r is not None and r.settings.view == "timeofday"
+        table_start = None if r is None else (r.slot_start if slots else r.bucket_start)
+        title = tr("hist.export_slots_title" if slots else "hist.export_windows_title")
+        if r is None or table_start is None or not len(table_start):
+            messages.information(self, title, tr("export.nothing_to_export"))
             return False
         fmt = "csv" if Path(path).suffix.lower() == ".csv" else "parquet"
         is_dt = self._time_is_datetime()
-        log_op("histogram_export_windows", path=path, format=fmt, rows=int(len(r.bucket_start)))
+        log_op("histogram_export_windows", path=path, format=fmt, rows=int(len(table_start)),
+               view=r.settings.view)
         try:
             cols, mapping = hexport.build_columns(r, is_dt)
             times = self._main._time_values
@@ -1217,10 +1430,10 @@ class HistogramWindow(AnalysisWindow):
             rows = (hexport.write_csv if fmt == "csv" else hexport.write_parquet)(path, cols, meta)
         except Exception as e:  # noqa: BLE001 - OSError, Arrow errors...: shown, nothing else changes
             logger.exception("failed to export bucket values: %s", path)
-            messages.warning(self, tr("hist.export_windows_title"), tr("hist.export_windows_failed", error=e))
+            messages.warning(self, title, tr("hist.export_slots_failed" if slots else "hist.export_windows_failed", error=e))
             return False
         self._export_dir = str(Path(path).resolve().parent)
-        self._main._show_notice(tr("hist.export_windows_saved", path=path, rows=rows), 10_000)
+        self._main._show_notice(tr("hist.export_slots_saved" if slots else "hist.export_windows_saved", path=path, rows=rows), 10_000)
         return True
 
     def build_export_figure(self, stamp_lines: list[str], size_px: tuple[int, int]):
@@ -1248,7 +1461,7 @@ def build_histogram_figure(win: HistogramWindow, r: HistogramResult, stamp_lines
         fig.get_layout_engine().set(rect=(0, stamp_h, 1, 1 - stamp_h))
         ax = fig.subplots()
         if view != "dist":
-            (_plot_duration_axes if view == "duration" else _plot_trend_axes)(win, r, ax)
+            {"duration": _plot_duration_axes, "trend": _plot_trend_axes, "timeofday": _plot_tod_axes}[view](win, r, ax)
             ax.grid(True, alpha=0.3)
             if stamp_lines:
                 fig.text(0.995, 0.004, "\n".join(stamp_lines), ha="right", va="bottom", fontsize=7, color="#666666")
@@ -1327,5 +1540,26 @@ def _plot_trend_axes(win: HistogramWindow, r: HistogramResult, ax) -> None:
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         ax.xaxis.get_offset_text().set_visible(False)
     ax.set_ylabel(win.x_label(r))
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
+
+
+def _plot_tod_axes(win: HistogramWindow, r: HistogramResult, ax) -> None:
+    """Time of day (42.13): matplotlib `stairs` per variable (a slot without a value stays NaN = a break),
+    `HH:MM` ticks from the origin."""
+    from matplotlib.ticker import FuncFormatter, MultipleLocator
+
+    slot_s = float(r.settings.slot_s)
+    edges = np.append(np.asarray(r.slot_start, dtype=np.float64), float(r.slot_start[-1]) + slot_s)
+    for i, v in enumerate(r.variables):
+        color = _COLOR_CYCLE[i % len(_COLOR_CYCLE)]
+        ax.stairs(np.asarray(v.slot_values, dtype=np.float64), edges, baseline=None, color=color, linewidth=1.6,
+                  label=v.name)
+    origin = r.settings.origin_s
+    ax.set_xlim(0, float(edges[-1]))
+    ax.xaxis.set_major_locator(MultipleLocator(7200.0))  # a tick every 2 h keeps the labels apart
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _pos: format_clock(origin + x)))
+    ax.set_xlabel(tr("hist.tod_x_label"))
+    ax.set_ylabel(win.tod_y_label(r))
     if ax.get_legend_handles_labels()[0]:
         ax.legend(loc="upper right", fontsize=8, framealpha=0.7)

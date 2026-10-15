@@ -860,3 +860,68 @@ def test_excluded_rows_survive_a_change_of_the_row_range(qapp, mw, monkeypatch):
     w.recompute()
     _wait(qapp, w)
     assert w._result.n_user_excluded == 1
+
+
+# -- aggregate "time" with excluded rows (44.14) -----------------------------------------------
+
+TOTAL_S = (N - 1) * 0.1  # 100 ms rows; the last row of the range weighs 0
+
+
+def test_time_map_click_excludes_a_row_and_its_time(qapp, mw):
+    w = _open(qapp, mw, agg="time")
+    r0 = w._result
+    assert r0.is_time and r0.time_total * 3600 == pytest.approx(TOTAL_S)
+    _turn_on(w)
+    _click(qapp, w, 50.0, 50.0)  # the outlier A, through the real mouse routing
+    assert w._exclude.rows.tolist() == [OUT_A]
+    r = w._result
+    assert r is not r0 and r.is_time and r.n_user_excluded == 1 and r.n_valid == N - 1
+    assert r.time_total * 3600 == pytest.approx(TOTAL_S - 0.1)  # only the row's own 0.1 s is gone
+
+
+def test_time_curve_with_excluded_rows_has_no_crosses_and_no_crash(qapp, mw, tmp_path):
+    w = _open(qapp, mw, color="single")
+    w._exclude._set_rows(np.arange(100, 200, dtype=np.int64))
+    w._agg_combo.setCurrentIndex(w._agg_combo.findData("time"))
+    _wait(qapp, w)
+    r = w._result
+    assert r.is_curve and r.is_time and r.n_user_excluded == 100 and r.excluded_points == []
+    assert w._exclude.rows.size == 100  # still excluded (and left out of the time); "Restore all" works
+    assert r.time_total * 3600 == pytest.approx(TOTAL_S - 10.0)
+    assert not w._exclude.mode_button.isEnabled()
+    assert w._exclude.mode_button.toolTip() == tr("xy.exclude_mode_time_curve")
+    assert w._exclude.reset_button.isEnabled()
+    assert "no longer available" not in w.status_text()
+    out = tmp_path / "curve.png"
+    assert w.export_image(str(out)) and out.stat().st_size > 1000
+    w._exclude.mode_button.setChecked(True)  # a disabled button can still be set by code: still not active
+    assert not w._exclude.active()
+    w._exclude.mode_button.setChecked(False)
+    w._exclude.reset()
+    _wait(qapp, w)
+    assert w._exclude.rows.size == 0 and w._result.time_total * 3600 == pytest.approx(TOTAL_S)
+
+
+def test_time_map_keeps_excluded_rows_when_z_changes(qapp, mw):
+    w = _open(qapp, mw)
+    w._exclude._set_rows(np.array([OUT_A], dtype=np.int64))
+    w._agg_combo.setCurrentIndex(w._agg_combo.findData("time"))
+    _wait(qapp, w)
+    assert w._exclude.rows.tolist() == [OUT_A]
+    first = w._result
+    w._z_combo.setCurrentText("px")  # not used by the time: neither clears the rows nor recomputes
+    _drain(qapp)
+    assert w._exclude.rows.tolist() == [OUT_A] and w._result is first and not w.is_computing()
+
+
+def test_time_refused_still_reads_the_crosses_of_a_map():
+    px, py, _pz = _data()
+    t = np.arange(N, dtype=float)
+    t[500] = -1.0  # not ascending
+    cols = {"px": px, "py": py}
+    req = ("count", None)
+    r = xm.compute_xy_map(
+        lambda n, a, b: cols[n][a:b], "px", ["py"], None, "map", req, req, "time", 1, "none", 0, N,
+        chunk_rows=1000, scatter_limit=1000, excluded_rows=np.array([OUT_A, 5]), fetch_time=lambda a, b: t[a:b])
+    assert r.time_refused == "time_not_ascending" and not r.grids
+    assert len(r.excluded_points) == 1 and len(r.excluded_points[0][0]) == 2

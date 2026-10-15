@@ -56,8 +56,12 @@ class ExportValues:
 
 
 def default_name(r: XYMapResult, index: int = 0) -> str:
-    """`<Z>_map` for a map, `<Y>_curve` for a curve, made a valid identifier."""
-    base = (r.z_name or "z") + "_map" if not r.is_curve else r.names[index] + "_curve"
+    """`<Z>_map` for a map, `<Y>_curve` for a curve, made a valid identifier. The aggregate "time"
+    (44.14) gives `<X>_<Y>_time` / `<X>_time`, which is the series name `compute_xy_map` made."""
+    if r.is_time:
+        base = r.names[index]
+    else:
+        base = (r.z_name or "z") + "_map" if not r.is_curve else r.names[index] + "_curve"
     base = re.sub(r"\W", "_", base, flags=re.ASCII)
     return "_" + base if base[:1].isdigit() else base
 
@@ -82,7 +86,7 @@ def table_from_result(r: XYMapResult, index: int, name: str, interpolation: str,
         table = LookupTable(name, "curve", g.x_axis, g.value, None, interpolation, extrapolation, axis_names=names)
         filled = [[int(i)] for i in np.flatnonzero(g.filled_mask)]
     else:
-        names = (r.x_name, r.y_names[0], r.z_name or "")
+        names = (r.x_name, r.y_names[0], r.z_name or ("time" if r.is_time else ""))
         table = LookupTable(name, "map", g.x_axis, g.y_axis, g.value, interpolation, extrapolation, axis_names=names)
         filled = [[int(iy), int(ix)] for iy, ix in zip(*np.nonzero(g.filled_mask))]
     return table, filled
@@ -113,6 +117,7 @@ def origin_info(main, r: XYMapResult, index: int) -> dict:
     time_range = None
     if tv is not None and len(tv) and r.row_end > r.row_start:
         time_range = [float(tv[r.row_start]), float(tv[min(r.row_end, len(tv)) - 1])]
+    extra = {"time_unit": r.time_unit} if r.is_time else {}  # 44.14: the values are times in this unit
     return {
         "kind": "xy_map",
         "file": str(main._data_source.path) if main._data_source is not None else "",
@@ -122,6 +127,7 @@ def origin_info(main, r: XYMapResult, index: int) -> dict:
         "z": r.z_name,
         "grid": {"x": _spec_dict(r.x_spec), "y": _spec_dict(r.y_spec)},
         "agg": r.agg,
+        **extra,
         "min_count": r.min_count,
         "fill": r.fill,
         "keep_sparse_empty": r.keep_sparse_empty,

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
+import threading
 from collections import ChainMap
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 from PySide6.QtCore import Qt, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (
@@ -29,10 +32,12 @@ from PySide6.QtWidgets import (
 
 from .. import __version__, features
 from ..core import oplog
+from ..core import parquet_export as pq_export
 from ..core.analysis import basic_stats, chunked_stats, fft, sampling_report
 from ..core.background_worker import WorkerHub
 from ..core.column import (
     Column,
+    DeferredColumn,
     DerivedColumn,
     LazyColumn,
     LazyVariables,
@@ -61,6 +66,7 @@ from ..core.signal_aliases import (
 )
 from ..core.time_index import TimeIndex
 from ..core.variable import DerivedVariable, dependency_order, dependents_of
+from ..core.view_check import classify_derived
 from ..io import maps as maps_io
 from ..io import signal_aliases as alias_io
 from ..io import user_functions as uf_io
@@ -73,11 +79,19 @@ from .i18n import set_language, tr
 from .image_export import EXPORT_FORMATS, export_plots_image
 from .navigator import NavigatorWidget
 from .navigator_sync import NavigatorSync
+from .parquet_export_dialog import (
+    ExportChoices,
+    ExportItemChoice,
+    ParquetExportDialog,
+    ParquetExportProgress,
+)
 from .plot_grid import PlotGridWidget
 from .settings_dialog import SettingsDialog
+from .signal_alias_assign_dialog import AssignRow, SignalAliasAssignDialog
 from .stats_dialog import StatsDialog
 from .variable_panel import VariablePanel
-from .view_manager import ViewManagerDialog, view_error_text
+from .view_compute import ViewComputeProgress, ViewComputeResult, ViewComputeRunner
+from .view_manager import ViewManagerDialog, problem_text, view_error_text
 
 _APP_TITLE = f"Parquet Analyzer v{__version__}"
 # QMainWindow.saveState version (app 48.3): 1 = file_view_toolbar + analysis_toolbar layout.
@@ -92,6 +106,50 @@ logger = logging.getLogger(__name__)
 # (detailed_specification.md 13.5.1), with this cap so an accidental zoomed-way-out
 # request doesn't reintroduce the same memory problem.
 _FFT_MAX_ROWS = 8_000_000
+
+# View load (expressions 55.3): how many derived variables are computed at the same time, and how
+# long the run must last before the status-bar progress appears (55.4). The measurement behind
+# the default is recorded in expressions 55.6: more than 4 at once barely gains time but every running
+# variable holds several full-length temporaries (20M rows: 11 at once peaked at 8.4 GB, 4 at 7.1 GB).
+_VIEW_COMPUTE_PARALLEL_MAX = 4
+_VIEW_COMPUTE_PARALLEL = max(1, min((os.cpu_count() or 2) - 1, _VIEW_COMPUTE_PARALLEL_MAX))
+_VIEW_COMPUTE_SHOW_DELAY_MS = 300
+
+
+class _NoRows:
+    """The export worker's result when the saved time range holds no rows (57.7.4)."""
+
+
+_NO_ROWS = _NoRows()
+
+
+class _ParquetExportJob:
+    """The running Parquet export (export.ja.md 57.3): the plan, the cancel flag the worker polls and
+    an event set when the worker has really finished (it removes its `.part` first)."""
+
+    def __init__(self, plan: pq_export.ExportPlan, path: str):
+        self.plan = plan
+        self.path = path
+        self.cancel_event = threading.Event()
+        self.worker_done = threading.Event()
+        self.token = 0
+        self.progress_key = 0
+
+
+class _ViewExportContext:
+    """A saved view and its source file's footer, as read for an export that does not open the view
+    (export 57.7). `error` (translated) is why nothing can be exported; `info` is None until the
+    footer was read."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.view = None
+        self.view_file = ""
+        self.source_path: Path | None = None
+        self.total_rows = 0
+        self.info: pq_export.ViewExport | None = None
+        self.time_type = None  # Arrow type of the time column, for showing the saved range
+        self.error = ""
 
 
 class MainWindow(QMainWindow):
@@ -162,6 +220,21 @@ class MainWindow(QMainWindow):
         # request time and are dropped if it changed (app 46.5 S-5/F-5).
         self._file_generation: int = 0
         self._busy_sources: set[str] = set()  # e.g. {"plot_grid", "fft", "stats"}
+        # Deferred computation of a loaded view's derived variables (expressions 55.3): the
+        # running scheduler (None when idle), a generation counter bumped on every start / cancel /
+        # abort, and the hub that runs its jobs.
+        self._view_compute_hub = WorkerHub(self._analysis_thread_pool)
+        self._view_compute: ViewComputeRunner | None = None
+        self._view_compute_generation = 0
+        self._view_compute_ctx: dict | None = None
+        # Parquet export (export.ja.md 57.3): one job at a time on its own single-thread pool, so a
+        # long export never starves the analysis jobs; `_parquet_export` is the running job (None when
+        # idle), `_parquet_export_cancelled` the jobs cancelled whose worker may still be cleaning up.
+        self._parquet_export_pool = QThreadPool(self)
+        self._parquet_export_pool.setMaxThreadCount(1)
+        self._parquet_export_hub = WorkerHub(self._parquet_export_pool)
+        self._parquet_export: _ParquetExportJob | None = None
+        self._parquet_export_cancelled: list[_ParquetExportJob] = []
         # Live, per-session (not persisted to Settings — saved per-View instead, like
         # x/y axis ranges) toggle for TimePlotWidget/PlotGridWidget.set_downsample_enabled.
         # Off means "always show real per-sample data" — still coherent with the
@@ -255,6 +328,14 @@ class MainWindow(QMainWindow):
         self._progress_bar.setFormat(tr("app.rendering"))
         self._progress_bar.setMaximumWidth(160)
         self._progress_bar.setVisible(False)
+        self._view_compute_progress = ViewComputeProgress(self._on_view_compute_cancel_clicked)  # 55.4
+        self._view_compute_show_timer = QTimer(self)
+        self._view_compute_show_timer.setSingleShot(True)
+        self._view_compute_show_timer.setInterval(_VIEW_COMPUTE_SHOW_DELAY_MS)
+        self._view_compute_show_timer.timeout.connect(self._show_view_compute_progress)
+        self.statusBar().addPermanentWidget(self._view_compute_progress)
+        self._parquet_export_progress = ParquetExportProgress(self._on_parquet_export_cancel_clicked)  # 57.3
+        self.statusBar().addPermanentWidget(self._parquet_export_progress)
         self.statusBar().addPermanentWidget(self._progress_bar)
 
         # Shown while >=1 windowed series (13.5.1 Phase D) is displaying its pyramid's
@@ -329,6 +410,11 @@ class MainWindow(QMainWindow):
         ):
             self.addAction(self._add_action(key, tr(label_key), self.view_menu, callback))  # shortcut live while closed
         self._add_action("export_image", tr("toolbar.export_image"), toolbar, self.export_image_dialog)
+        if features.is_enabled("parquet_export"):  # developer feature flag (export 57.1)
+            export_parquet_action = self._add_action(
+                "export_parquet", tr("toolbar.export_parquet"), toolbar, lambda *_: self.export_parquet_dialog()
+            )
+            export_parquet_action.setToolTip(tr("toolbar.export_parquet_tooltip"))
         toolbar.addSeparator()
         home_action = self._add_action("home", tr("toolbar.home"), toolbar, self.plot_grid.go_home)
         home_action.setToolTip(tr("toolbar.home_tooltip"))
@@ -447,7 +533,8 @@ class MainWindow(QMainWindow):
         # Several independent background-work sources (downsampling, FFT, stats) share
         # one indicator, so none of them can clear it while another is still running.
         self._busy_sources.discard(source) if not busy else self._busy_sources.add(source)
-        self._progress_bar.setVisible(bool(self._busy_sources))
+        # the view-load computation has its own progress widget (55.4); the indeterminate bar is for drawing
+        self._progress_bar.setVisible(bool(self._busy_sources - {"view_compute"}))
 
     def _is_settling(self) -> bool:
         """True while drawing is in flight or about to start (a plot's redraw debounce is
@@ -473,6 +560,7 @@ class MainWindow(QMainWindow):
                 "nan_count": getattr(report, "nan_count", None),
                 "decreasing_count": getattr(report, "decreasing_count", None),
                 "first_decreasing_index": getattr(report, "first_decreasing_index", None),
+                "duplicate_count": getattr(report, "duplicate_count", None),
             }
         anchor = self.plot_grid.anchor_plot()
         selected = getattr(self.plot_grid, "_selected", None)  # chapter 23, when present
@@ -549,7 +637,8 @@ class MainWindow(QMainWindow):
         else:
             report = check_time_order(tv)
         self._time_order_report = report
-        if report is None or report.ok:
+        self._apply_time_order_to_readouts()  # 56.1: cached flag for cursor / hover
+        if report is None or (report.ok and not report.duplicate_count):
             self._time_order_label.setText("")
             self._time_order_label.setToolTip("")
             self._time_order_label.setVisible(False)
@@ -559,11 +648,18 @@ class MainWindow(QMainWindow):
             parts.append(tr("time_order.not_sorted", count=report.decreasing_count))
         if report.nan_count:
             parts.append(tr("time_order.has_nan", count=report.nan_count))
+        if report.duplicate_count:  # 56.2: a note only; ranges stay correct
+            parts.append(tr("time_order.has_duplicates", count=report.duplicate_count))
         text = " ".join(parts)
         if report.first_decreasing_index is not None:
             tip = tr("time_order.tooltip", row=report.first_decreasing_index + 1)
-        else:
+        elif report.nan_count:
             tip = tr("time_order.tooltip_nan")
+        else:
+            tip = ""
+        if report.first_duplicate_index is not None:
+            dup_tip = tr("time_order.tooltip_duplicates", row=report.first_duplicate_index + 1)
+            tip = f"{tip}\n{dup_tip}" if tip else dup_tip
         self._time_order_label.setText(text)
         self._time_order_label.setToolTip(tip)
         self._time_order_label.setVisible(True)
@@ -575,7 +671,19 @@ class MainWindow(QMainWindow):
             nan_count=report.nan_count,
             decreasing_count=report.decreasing_count,
             first_decreasing_index=report.first_decreasing_index,
+            duplicate_count=report.duplicate_count,
         )
+
+    def time_order_unreliable(self) -> bool:
+        """56.1: True when range-based values (stats, analysis windows, cursor / hover) may be wrong
+        because the time axis decreases somewhere. NaN-only or duplicates-only axes are fine."""
+        report = getattr(self, "_time_order_report", None)
+        return report is not None and report.decreasing_count > 0
+
+    def _apply_time_order_to_readouts(self) -> None:
+        """Hand the flag to the plots once per time-axis decision, so hover only reads a cached bool."""
+        flag = self.time_order_unreliable()
+        self.plot_grid.set_time_unreliable(flag, tr("time_order.readout_tooltip") if flag else "")
 
     # -- data loading -------------------------------------------------------------
 
@@ -649,6 +757,7 @@ class MainWindow(QMainWindow):
             messages.critical(self, tr("error.load_failed_title"), tr("error.load_failed_body", error=e))
             return False
 
+        self._abort_view_compute()  # a pending view layout belongs to the previous file (55.3)
         self._close_analysis_windows()  # their variables belong to the previous file (25.1)
         self._file_generation += 1  # in-flight stats/FFT results of the previous file get dropped (46.5)
         self._data_source = data_source
@@ -743,6 +852,10 @@ class MainWindow(QMainWindow):
         completely different from the old time column's.
         """
         if not name or self._time_values is None or name not in self._file_columns:
+            return
+        if self._view_compute_active():  # the layout is still pending (55.3)
+            self._show_notice(tr("view_compute.busy"), 5_000)
+            self._sync_time_axis_combo()
             return
         name = self._alias_sources.get(name, name)  # the combo passes the displayed (alias) text
         if name == self._time_column:
@@ -1009,6 +1122,80 @@ class MainWindow(QMainWindow):
             self._apply_alias_resolution(new_res, affected)
         return ""
 
+    # -- assigning substitute signals from the view-load warning (persistence 54.6) -------------
+
+    def _can_offer_alias_assignment(self) -> bool:
+        """The button needs a switched-on, writable dictionary (an assignment would do nothing
+        otherwise; 54.10)."""
+        return self.settings.signal_aliases_enabled and self._aliases_saveable
+
+    def _view_missing_signals(self, ctx: dict) -> list[str]:
+        """The names a just-loaded view needed but the open file lacks: its series and time axis
+        (`ctx["missing"]`) plus the names inside skipped derived variables' formulas that are no
+        column, derived variable, function or map. In order, without duplicates."""
+        missing = list(ctx["missing"])
+        known = set(self._file_columns) | set(ctx["saved"]) | self.callable_names()
+        for dname in sorted(ctx["skipped_derived"]):
+            d = ctx["saved"].get(dname)
+            if d is None:
+                continue
+            try:
+                refs = referenced_names(d.expression)
+            except ExpressionError:
+                continue
+            missing.extend(n for n in sorted(refs) if n not in known and n not in missing)
+        return missing
+
+    def _alias_assign_rows(self, missing: list[str]) -> list[AssignRow]:
+        reserved = self.callable_names()
+        rows = []
+        for name in missing:
+            if name in reserved:
+                rows.append(AssignRow(name, tr("alias.assign_note_reserved", name=name), selectable=False))
+            elif name in self._aliases:
+                key = "alias.assign_note_reenable" if name in self._alias_disabled else "alias.assign_note_append"
+                rows.append(AssignRow(name, tr(key, name=name)))
+            else:
+                rows.append(AssignRow(name, tr("alias.assign_note_new", name=name)))
+        return rows
+
+    def _offer_alias_assignment(self, view_name: str, missing: list[str]) -> None:
+        """The button of the view-load warning: choose substitutes, store them, reload the view."""
+        if self._data_source is None:
+            return
+        listed = self.visible_column_names(include_time=True, include_derived=False)
+        choices = listed + [c for c in self._data_source.columns if c not in listed]
+        dialog = SignalAliasAssignDialog(self, view_name, self._alias_assign_rows(missing), choices)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dialog.assignments()
+        # a listed alias name stands for the column it is attached to
+        pairs = {n: self._alias_sources.get(c, c) for n, c in chosen.items()}
+        if not pairs:
+            return  # "do not assign" everywhere: the dictionary stays as it is, nothing reloads
+        log_op("signal_alias_assign_from_view", view=view_name, assigned=[[n, c] for n, c in pairs.items()])
+        reason = self.assign_aliases_from_view(pairs)
+        if reason:
+            messages.warning(self, tr("alias.assign_title"), reason)
+            return
+        self.load_view(view_name)
+
+    def assign_aliases_from_view(self, pairs: Mapping[str, str]) -> str:
+        """Add `{missing name: file column}` to the dictionary (54.6): the column goes to the end of
+        an existing alias's candidates (a disabled alias is enabled again), else a new alias is made.
+        Goes through `save_signal_aliases`, so the same refusals apply. Returns "" or the reason."""
+        new = self.signal_aliases
+        disabled = set(self._alias_disabled)
+        for name, column in pairs.items():
+            sources = new.setdefault(name, [])
+            if column not in sources:
+                sources.append(column)
+            disabled.discard(name)
+        reason = self.save_signal_aliases(new, disabled)
+        if not reason and self._alias_manager is not None:
+            self._alias_manager.reload_from_dictionary()
+        return reason
+
     def set_signal_aliases_enabled(self, enabled: bool) -> str:
         """The global switch "use signal aliases" (54.9): saved to the settings and applied to the
         open file at once. Returns "" or the reason it was refused (an in-use alias would detach)."""
@@ -1132,23 +1319,37 @@ class MainWindow(QMainWindow):
         `window()` calls must never see `update_registry` mutating the live dicts mid-job."""
         return FunctionRegistry(self._function_registry.user_functions, self._function_registry.maps)
 
+    def _is_uncomputed(self, name: str) -> bool:
+        """A derived variable still held as a not yet computed DeferredColumn (expressions 55.2):
+        a recompute must rebuild it deferred, never force its full computation."""
+        column = self._raw_variables.get(name)
+        return isinstance(column, DeferredColumn) and not column.is_ready
+
     def _derived_expressions(self) -> dict[str, str]:
         return {n: d.expression for n, d in self._derived.items()}
 
-    def _build_derived_column(self, expression: str, columns: Mapping[str, Column], registry) -> Column:
+    def _build_derived_column(
+        self, expression: str, columns: Mapping[str, Column], registry, *, deferred: bool = False
+    ) -> Column:
         """The one place a derived variable's Column is made (add, edit, registry update).
         With the `big_c_windowed_derived` flag (36.6 C) an expression over a WindowedColumn
         whose margins are all known becomes a DerivedColumn (computed per window); everything
         else is evaluated in full into a MaterializedColumn, as always. Raises on a bad
-        expression before the caller commits anything."""
+        expression before the caller commits anything.
+
+        `deferred` (view load and the recompute of a not yet computed variable, expressions 55.2):
+        instead of the full evaluation, a DeferredColumn that only validates by a trial computation
+        on the first rows and is computed later (in a background job, or on first use)."""
         if features.is_enabled("big_c_windowed_derived") and self._time_values is not None:
             column = make_derived_column(expression, columns, len(self._time_values), registry)
             if column is not None:
                 return column
+        if deferred and self._time_values is not None:
+            return DeferredColumn(expression, columns, len(self._time_values), registry)
         value = evaluate_expression(expression, LazyVariables(columns), registry)
         return MaterializedColumn(self._series_value(value))
 
-    def _on_add_derived_variable(self, name: str, expression: str) -> None:
+    def _on_add_derived_variable(self, name: str, expression: str, *, deferred: bool = False) -> None:
         if name in self._derived:
             # Redefinition via ExpressionBar: same path as the context-menu edit, so
             # dependents and plotted curves don't keep showing stale values (18.2).
@@ -1169,7 +1370,9 @@ class MainWindow(QMainWindow):
         # of that whole column, same cost as the old eager-load-everything path —
         # deriving a variable isn't itself windowed in this pass (deferred; see
         # detailed_specification.md 13.5.1 Phase D's scope note on required_halo).
-        column = self._build_derived_column(expression, self._raw_variables, self._registry_snapshot())  # before committing anything
+        column = self._build_derived_column(
+            expression, self._raw_variables, self._registry_snapshot(), deferred=deferred
+        )  # before committing anything
         self._derived[name] = DerivedVariable(name=name, expression=expression)
         self._raw_variables[name] = column
         self.variable_panel.add_variable(name, expression)
@@ -1192,7 +1395,10 @@ class MainWindow(QMainWindow):
         overlay: dict[str, Column] = {}
         columns = ChainMap(overlay, self._raw_variables)  # new columns shadow the cached (old) ones
         for n in [name, *dependents]:
-            overlay[n] = self._build_derived_column(exprs[n], columns, self._registry_snapshot())
+            # a dependent that was never computed stays uncomputed (expressions 55.2)
+            overlay[n] = self._build_derived_column(
+                exprs[n], columns, self._registry_snapshot(), deferred=n != name and self._is_uncomputed(n)
+            )
 
         self._derived[name] = DerivedVariable(name=name, expression=expression)
         for n, column in overlay.items():
@@ -1344,6 +1550,8 @@ class MainWindow(QMainWindow):
         `persist` runs after the recompute succeeded and before anything is committed; if it
         raises, the exception propagates and nothing is changed.
         """
+        if self._view_compute_active():  # a swapped column would not be the one being computed (55.3)
+            return [("", tr("view_compute.busy"))]
         candidate = FunctionRegistry(
             self._function_registry.user_functions if user_functions is None else user_functions,
             self._function_registry.maps if maps is None else maps,
@@ -1386,7 +1594,7 @@ class MainWindow(QMainWindow):
                 failed.add(n)  # only the root cause is reported
                 continue
             try:
-                overlay[n] = self._build_derived_column(exprs[n], columns, candidate)
+                overlay[n] = self._build_derived_column(exprs[n], columns, candidate, deferred=self._is_uncomputed(n))
             except UnknownFunctionError as e:
                 failed.add(n)
                 failures.append((n, tr("error.unknown_function", name=e.name)))
@@ -1817,7 +2025,9 @@ class MainWindow(QMainWindow):
     def _show_stats_dialog(self, batch: dict) -> None:
         # Preserve the order the user selected the variables in, not completion order.
         ordered_results = {name: batch["results"][name] for name in batch["names"]}
-        dialog = StatsDialog(batch["range_label"], ordered_results, parent=self)
+        dialog = StatsDialog(
+            batch["range_label"], ordered_results, parent=self, time_unreliable=self.time_order_unreliable()
+        )
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.show()
 
@@ -1850,6 +2060,9 @@ class MainWindow(QMainWindow):
         return name.strip()
 
     def save_view_dialog(self) -> None:
+        if self._view_compute_active():  # the layout is still pending (55.3)
+            self._show_notice(tr("view_compute.busy"), 5_000)
+            return
         if self._data_source is None:
             messages.information(self, tr("toolbar.save_view_title"), tr("error.open_file_first"))
             return
@@ -1941,7 +2154,13 @@ class MainWindow(QMainWindow):
             alias_names=set(self._aliases),
         )
         dialog.viewDeleted.connect(self._on_view_deleted)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        result = dialog.exec()
+        if result == ViewManagerDialog.EXPORT_RESULT:  # "Export to Parquet..." (57.7.1); works without a file
+            name = dialog.selected_view_name()
+            if name:
+                self.export_parquet_dialog(name)
+            return
+        if result != QDialog.DialogCode.Accepted:
             return
         name = dialog.selected_view_name()
         if name:
@@ -1961,7 +2180,9 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001 (surfaced to the user, not swallowed)
             logger.exception("failed to load view: %s", name)
             messages.critical(self, tr("view.load_error_title"), tr("view.load_failed_body", error=view_error_text(e)))
-            return
+            return  # a view still being computed is kept: nothing was replaced
+        # Only now is the running view replaced: drop it without laying it out (55.3)
+        self._abort_view_compute()
 
         # If *any* file is already open — a different one, or literally the view's own
         # recorded source — apply only the saved waveform layout to it rather than
@@ -1999,6 +2220,11 @@ class MainWindow(QMainWindow):
         # one consolidated warning at the end instead of per-item dialogs.
         skipped: list[str] = []
         skipped_derived: set[str] = set()  # their series aren't listed again (persistence 8.1)
+        missing: list[str] = []  # names the file lacks, for "assign substitute signals" (54.6)
+        saved = {d.name: d for d in view.derived_variables}
+        targets: dict[str, DeferredColumn] = {}
+        # Phase 1 of 3 (expressions 55.3): definitions, synchronous and quick. Derived variables
+        # are registered deferred -- checked by a trial computation, computed later.
         try:
             # Time axis first (persistence 33): saved X ranges are in that column's units, and
             # set_time_column go_home()s the plots, so it must precede the layout rebuild.
@@ -2008,20 +2234,204 @@ class MainWindow(QMainWindow):
                         self.set_time_column(view.time_column)
                 else:
                     skipped.append(tr("view.time_column_missing", name=view.time_column))
+                    missing.append(view.time_column)
             # Applied before plotting any series, so their first draw already respects
             # the loaded setting instead of drawing once and immediately redrawing.
             self._apply_downsample_enabled(view.downsample_enabled, update_action=True)
 
-            saved = {d.name: d for d in view.derived_variables}
+            # What cannot be used is decided by the one rule the view manager's marks and the export
+            # from a saved view share (core.view_check); a trial computation can still skip more.
+            problems = classify_derived(
+                {n: d.expression for n, d in saved.items()},
+                set(self._raw_variables),
+                alias_names=set(self._aliases) | set(self._alias_sources),
+                registry=self._function_registry,
+            )
             for derived in (saved[n] for n in dependency_order({n: d.expression for n, d in saved.items()})):
+                problem = problems.get(derived.name)
+                if problem is not None:
+                    if problem.kind == "unknown_function":
+                        skipped.append(f"{derived.name} ({tr('error.unknown_function', name=problem.detail)})")
+                    else:
+                        skipped.append(derived.name)
+                    skipped_derived.add(derived.name)
+                    continue
                 try:
-                    self._on_add_derived_variable(derived.name, derived.expression)
+                    self._on_add_derived_variable(derived.name, derived.expression, deferred=True)
                 except UnknownFunctionError as e:
                     skipped.append(f"{derived.name} ({tr('error.unknown_function', name=e.name)})")
                     skipped_derived.add(derived.name)
                 except (ExpressionError, KeyError):
                     skipped.append(derived.name)
                     skipped_derived.add(derived.name)
+            targets = self._view_compute_targets(view)
+        except Exception as e:  # noqa: BLE001 (surfaced to the user, not swallowed)
+            logger.exception("failed to rebuild view layout: %s", name)
+            messages.warning(self, tr("view.load_error_title"), tr("view.partial_restore_failed", name=name, error=e))
+            self._on_grid_layout_changed()
+            return
+
+        ctx = {
+            "name": name, "view": view, "skipped": skipped, "skipped_derived": skipped_derived, "saved": saved,
+            "missing": missing,
+            "op": oplog.current_op(),  # the operation the layout of phase 3 belongs to
+        }
+        if targets:
+            self._start_view_compute(ctx, targets)  # phase 2; phase 3 follows from its completion
+        else:
+            self._finish_load_view(ctx, None)
+
+    # -- deferred computation of a view's derived variables (expressions 55.3-55.5) --------
+
+    def _view_compute_targets(self, view) -> dict[str, DeferredColumn]:
+        """The not yet computed DeferredColumns the view's plots need: the derived variables it
+        plots and, transitively, the derived variables they use. Unplotted ones are left alone."""
+        derived_names = set(self._derived)
+        needed: dict[str, DeferredColumn] = {}
+        seen: set[str] = set()
+        stack = [s.variable for plot_def in view.plots for s in plot_def.series if s.variable in derived_names]
+        while stack:
+            n = stack.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            column = self._raw_variables.get(n)
+            if isinstance(column, DeferredColumn) and not column.is_ready:
+                needed[n] = column
+            stack.extend(referenced_names(self._derived[n].expression) & derived_names)
+        return needed
+
+    def _start_view_compute(self, ctx: dict, targets: dict[str, DeferredColumn]) -> None:
+        self._view_compute_generation += 1
+        gen = self._view_compute_generation
+        exprs = {n: self._derived[n].expression for n in targets}
+        order = [n for n in dependency_order(exprs) if n in targets]
+        deps = {n: referenced_names(exprs[n]) & set(targets) for n in targets}
+        parallel = max(1, min(_VIEW_COMPUTE_PARALLEL, self._analysis_thread_pool.maxThreadCount()))
+        runner = ViewComputeRunner(
+            self._view_compute_hub,
+            {n: targets[n] for n in order},
+            deps,
+            parallel,
+            on_progress=lambda done, total: self._on_view_compute_progress(gen, done, total),
+            on_finished=lambda result: self._on_view_compute_finished(gen, result),
+        )
+        self._view_compute = runner
+        self._view_compute_ctx = ctx
+        bounds = self._time_finite_bounds()  # the empty grid shows the whole axis, like the navigator (plots 50.2)
+        if bounds is not None and bounds[0] < bounds[1]:
+            self.plot_grid.set_x_range(*bounds)
+        self._on_grid_layout_changed()
+        self._set_view_compute_locks(True)
+        self._set_busy("view_compute", True)  # the operation log's result waits for the end (55.3)
+        for widget in (self.plot_grid, self.variable_panel, self.expression_bar):
+            widget.setEnabled(False)  # no drops / new formulas while the layout is pending
+        self._view_compute_show_timer.start()
+        runner.start()
+
+    def _show_view_compute_progress(self) -> None:
+        runner = self._view_compute
+        if runner is not None and runner.active:
+            self._view_compute_progress.begin(runner.started_at, runner.done, runner.total)
+            self._view_compute_progress.setVisible(True)
+
+    def _on_view_compute_progress(self, gen: int, done: int, total: int) -> None:
+        if gen == self._view_compute_generation and self._view_compute is not None:
+            self._view_compute_progress.set_progress(done, total)
+
+    # Entry points that touch the registry, the layout, the aliases or the time axis while the layout
+    # of a loading view is pending (expressions 55.3, found in review).
+    _VIEW_COMPUTE_LOCKED_ACTIONS = (
+        "user_functions", "maps", "signal_aliases", "toggle_signal_aliases", "add_plot", "save_view",
+        "export_parquet",
+    )
+
+    def _set_view_compute_locks(self, locked: bool) -> None:
+        for key in self._VIEW_COMPUTE_LOCKED_ACTIONS:
+            action = self._actions.get(key)
+            if action is not None:
+                action.setEnabled(not locked)
+        self.time_axis_combo.setEnabled(not locked)
+
+    def _view_compute_active(self) -> bool:
+        return self._view_compute is not None and self._view_compute.active
+
+    def _end_view_compute_ui(self, *, keep_busy: bool = False) -> None:
+        """Back to normal after phase 2. `keep_busy`: the caller lays the view out next and clears
+        the busy mark itself afterwards, so the operation log's result sees the finished layout."""
+        self._view_compute = None
+        self._view_compute_ctx = None
+        self._view_compute_show_timer.stop()
+        self._view_compute_progress.end()
+        for widget in (self.plot_grid, self.variable_panel, self.expression_bar):
+            widget.setEnabled(True)
+        self._set_view_compute_locks(False)
+        if not keep_busy:
+            self._set_busy("view_compute", False)
+
+    def _on_view_compute_cancel_clicked(self) -> None:
+        """The status-bar cancel button (55.5): lay the view out with what is computed so far."""
+        log_op("view_compute_cancel")
+        runner = self._view_compute
+        if runner is not None and runner.active:
+            runner.cancel()  # calls _on_view_compute_finished synchronously
+            self._view_compute_generation += 1  # late results of the jobs still running are ignored
+
+    def _abort_view_compute(self, *, resync: bool = True) -> None:
+        """Another view / file is being opened (55.3): drop the running computation and its
+        pending layout without laying anything out. Results still in flight are ignored."""
+        runner = self._view_compute
+        if runner is None:
+            return
+        self._view_compute_generation += 1
+        runner.abort()
+        self._end_view_compute_ui()
+        if resync:  # leave a consistent state even if nothing lays out afterwards
+            self._on_grid_layout_changed()
+
+    def _on_view_compute_finished(self, gen: int, result: ViewComputeResult) -> None:
+        runner = self._view_compute
+        if runner is None or gen != self._view_compute_generation:
+            return
+        ctx = self._view_compute_ctx
+        self._end_view_compute_ui(keep_busy=True)
+        try:
+            oplog.record_job(
+                "view_compute",
+                "cancel" if result.cancelled else "finish",
+                target=f"{len(result.computed)} of {runner.total} computed, parallel {result.parallel}",
+                ms=result.elapsed * 1000,
+            )
+            if ctx is not None:
+                still_mine = oplog.has_pending() and oplog.current_op() == ctx["op"]
+                with oplog.compound_op(ctx["op"] if still_mine else None):
+                    self._finish_load_view(ctx, result)
+        finally:
+            self._set_busy("view_compute", False)
+
+    def _finish_load_view(self, ctx: dict, result: ViewComputeResult | None) -> None:
+        """Phase 3 (expressions 55.3): lay the view out -- plots, series, heights, X link, ranges,
+        the consolidated warning. Values are computed by now, so nothing heavy happens here. A
+        derived variable whose computation failed is dropped like one that failed to register; a
+        series whose variable is still not computed (cancelled) is skipped and listed."""
+        name, view, saved = ctx["name"], ctx["view"], ctx["saved"]
+        skipped: list[str] = ctx["skipped"]
+        skipped_derived: set[str] = ctx["skipped_derived"]
+        try:
+            if result is not None and result.failed:
+                exprs = self._derived_expressions()
+                for n, reason in result.failed.items():
+                    skipped.append(f"{n} ({reason})")
+                    skipped_derived.add(n)
+                for n in list(result.failed):
+                    for dep in dependents_of(n, exprs):  # unplotted ones too: they could never be computed
+                        if dep not in skipped_derived:
+                            skipped.append(f"{dep} ({tr('view.skipped_dependency', name=n)})")
+                            skipped_derived.add(dep)
+                for n in skipped_derived & set(self._derived):
+                    del self._derived[n]
+                    self._raw_variables.pop(n, None)
+                self._refresh_variable_panel()
 
             # The grid was already cleared above (either branch) down to a single plot,
             # which is guaranteed time-domain: PlotGridWidget.remove_plot() refuses to
@@ -2032,8 +2442,16 @@ class MainWindow(QMainWindow):
             kept_plots: list[tuple] = []  # (plot, PlotDef) of each plot that survived (24.5)
             for i, plot_def in enumerate(view.plots):
                 plot = first_plot if i == 0 else self.plot_grid.add_plot()
+                cancelled_here = False  # a series of this plot was skipped only because of the cancel
                 for series in plot_def.series:
                     try:
+                        column = self._raw_variables.get(series.variable)
+                        if isinstance(column, DeferredColumn) and not column.is_ready:
+                            cancelled_here = True
+                            note = f"{series.variable} ({tr('view.skipped_cancelled')})"
+                            if note not in skipped:
+                                skipped.append(note)
+                            continue
                         # A hand-edited colour Qt can't parse would raise and abort the rest of
                         # the view (persistence 35.1): use the automatic palette colour instead.
                         color = series.color if QColor(series.color).isValid() else None
@@ -2045,11 +2463,14 @@ class MainWindow(QMainWindow):
                             pass  # already listed, with its reason, as a derived variable
                         elif series.variable not in self._file_columns and series.variable not in saved:
                             skipped.append(f"{series.variable} ({tr('view.skipped_not_in_file')})")
+                            if series.variable not in ctx["missing"]:
+                                ctx["missing"].append(series.variable)
                         else:
                             skipped.append(series.variable)
-                if plot is not first_plot and not plot.series_names():
+                if plot is not first_plot and not plot.series_names() and not cancelled_here:
                     # Every series meant for this plot failed to apply — drop the empty
-                    # plot itself rather than leaving a blank pane in the grid.
+                    # plot itself rather than leaving a blank pane in the grid. (A plot emptied
+                    # at least partly by the user's cancel is kept, expressions 55.5.)
                     self.plot_grid.remove_plot(plot)
                     continue
                 kept_ratios.append(plot_def.height_ratio)
@@ -2091,15 +2512,17 @@ class MainWindow(QMainWindow):
         else:
             if skipped:
                 logger.info("view %r: items not restored: %s", name, skipped)
-                messages.warning(
-                    self,
-                    tr("toolbar.load_view"),
-                    tr(
-                        "view.skipped_variables",
-                        name=name,
-                        list="\n".join(f"- {v}" for v in skipped),
-                    ),
-                )
+                text = tr("view.skipped_variables", name=name, list="\n".join(f"- {v}" for v in skipped))
+                missing = self._view_missing_signals(ctx) if self._can_offer_alias_assignment() else []
+                if missing:
+                    if messages.warning_with_button(
+                        self, tr("toolbar.load_view"), text, tr("alias.assign_button")
+                    ):
+                        # after this load has fully settled: the assignment saves the dictionary and
+                        # reloads the view, which must not run inside this view's own layout step
+                        QTimer.singleShot(0, lambda: self._offer_alias_assignment(name, missing))
+                else:
+                    messages.warning(self, tr("toolbar.load_view"), text)
         finally:
             # Whatever ended up on plot 1 (fully applied, partially applied, or
             # untouched) is what the navigator should reflect -- and its region must stay
@@ -2164,6 +2587,368 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self._show_notice(tr("export.saved", path=path), 10_000)
         return True
+
+    # -- Parquet export (export.ja.md 57) ----------------------------------------------------
+
+    _PARQUET_EXPORT_CHUNK_ROWS = pq_export.DEFAULT_CHUNK_ROWS  # a class attribute so tests can shrink it
+
+    def _exportable_signal_names(self) -> list[str]:
+        """The signals on the plots, in plot order then in-plot order, each once, hidden series
+        included (57.1). FFT plots hold static results, not variables, and are skipped."""
+        names: list[str] = []
+        for plot in self._time_plots():
+            for name in plot.series_names():
+                if name in self._raw_variables and name not in names:
+                    names.append(name)
+        return names
+
+    def export_parquet_dialog(self, view_name: str | None = None) -> None:
+        """Write signals to a Parquet file (requirement 5.51, design 57.1, 57.7.1): ask for the source
+        (the current screen or a saved view), the range and the signals, then for the file, then run
+        the export in the background. `view_name` preselects a saved view (the view manager's button).
+        With no file open the saved views are still usable (57.7.1)."""
+        title = tr("toolbar.export_parquet")
+        if self._view_compute_active():
+            messages.information(self, title, tr("export_parquet.busy_view_load"))
+            return
+        if self._parquet_export_busy():
+            messages.information(self, title, tr("export_parquet.busy"))
+            return
+        views = view_io.list_views()
+        have_file = self._data_source is not None and self._time_values is not None
+        names = self._exportable_signal_names() if have_file else []
+        if not have_file and not views:
+            messages.information(self, title, tr("error.open_file_first"))
+            return
+        if not names and not views:
+            messages.information(self, title, tr("export.nothing_to_export"))
+            return
+        sources: list[tuple[str, str | None]] = []
+        if names:
+            sources.append((tr("export_parquet.source_current"), None))
+        sources.extend((tr("export_parquet.source_view", name=v), v) for v in views)
+        initial = view_name if view_name in views else (None if names else views[0])
+
+        def provider(key: str | None, override: str | None) -> ExportChoices:
+            if key is None:
+                total = len(self._time_values)
+                v_start, v_end = self._visible_row_range()
+                return ExportChoices(
+                    [ExportItemChoice(n) for n in self._exportable_signal_names()],
+                    full_rows=total,
+                    visible_rows=max(0, v_end - v_start),
+                    time_name=self._display_name(self._time_column) or "",
+                )
+            return self._view_export_choices(key, override)
+
+        def pick_other_file() -> str | None:
+            return pick_parquet_file(self, self.settings.last_data_folder, self.settings.recent_data_folders)
+
+        dialog = ParquetExportDialog(
+            names, 0, 0, "", self, sources=sources, provider=provider, pick_file=pick_other_file, initial_key=initial
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        key = dialog.selected_source()
+        if key is not None:
+            source = self._view_export_context(key, dialog.source_file_override()).source_path
+        else:
+            source = Path(self._data_source.path)
+        folder = self.settings.last_export_folder or str(source.parent)
+        default = Path(folder) / f"{source.stem}_{datetime.now():%Y%m%d_%H%M%S}.parquet"
+        path, _selected = QFileDialog.getSaveFileName(self, title, str(default), tr("export_parquet.filter"))
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += ".parquet"
+        if key is not None:
+            self.export_parquet_from_view(
+                path, key, dialog.selected_names(), dialog.use_visible_range(), dialog.source_file_override()
+            )
+            return
+        total = len(self._time_values)
+        v_start, v_end = self._visible_row_range()
+        row_range = (v_start, v_end) if dialog.use_visible_range() else (0, total)
+        self.export_parquet(path, dialog.selected_names(), row_range)
+
+    def _parquet_export_busy(self) -> bool:
+        """An export is running, or a cancelled one's worker has not finished removing its `.part`
+        yet (a new export must not meet it)."""
+        self._parquet_export_cancelled = [j for j in self._parquet_export_cancelled if not j.worker_done.is_set()]
+        return self._parquet_export is not None or bool(self._parquet_export_cancelled)
+
+    def _is_source_file(self, path: str, source: str | os.PathLike | None = None) -> bool:
+        """True when `path` is the source Parquet file (57.2; default: the open file): `samefile` when
+        it exists (case-insensitive file systems, hard links), else the resolved paths."""
+        source = str(self._data_source.path if source is None else source)
+        try:
+            if os.path.exists(path) and os.path.exists(source):
+                return os.path.samefile(path, source)
+        except OSError:
+            pass
+        return Path(path).resolve() == Path(source).resolve()
+
+    def _build_export_plan(self, names: list[str], row_range: tuple[int, int]) -> pq_export.ExportPlan:
+        """The immutable snapshot the worker runs (57.2): taken here on the UI thread, so editing
+        variables or functions during the export changes nothing in it."""
+        alias = self._alias_sources
+        signals = [
+            pq_export.ExportColumn(n) if n in self._derived else pq_export.ExportColumn(n, alias.get(n, n))
+            for n in names
+        ]
+        file_columns = {n: alias.get(n, n) for n in self._raw_variables if n not in self._derived}
+        return pq_export.build_plan(
+            source_path=str(self._data_source.path),
+            total_rows=len(self._time_values),
+            row_range=row_range,
+            time=pq_export.ExportColumn(self._display_name(self._time_column), self._time_column),
+            signals=signals,
+            derived_expressions=self._derived_expressions(),
+            file_columns=file_columns,
+            registry=self._registry_snapshot(),
+            metadata={"view": self._view_name, "software": f"Parquet Analyzer v{__version__}"},
+            chunk_rows=self._PARQUET_EXPORT_CHUNK_ROWS,
+        )
+
+    def export_parquet(self, path: str, names: list[str], row_range: tuple[int, int]) -> bool:
+        """Start the background export of `names` (rows `row_range`) to `path`; False when it could
+        not be started (a dialog says why)."""
+        log_op(
+            "export_parquet", path=path, range=list(row_range), columns=len(names),
+            rows=max(0, row_range[1] - row_range[0]),
+        )
+        title = tr("toolbar.export_parquet")
+        if self._data_source is None or self._time_values is None:
+            messages.information(self, title, tr("error.open_file_first"))
+            return False
+        if self._parquet_export_busy():
+            messages.information(self, title, tr("export_parquet.busy"))
+            return False
+        if self._is_source_file(path):
+            messages.warning(self, title, tr("export_parquet.same_as_source"))
+            return False
+        try:
+            plan = self._build_export_plan(names, row_range)
+        except pq_export.ExportError as e:
+            messages.warning(self, title, tr("export_parquet.failed", error=e))
+            return False
+        return self._start_parquet_export(plan, path)
+
+    def _start_parquet_export(self, plan: pq_export.ExportPlan, path: str) -> bool:
+        """Run `plan` on the export worker (57.3); the plan is a snapshot, nothing of the window is read
+        again. Shared by the current screen and a saved view as the source."""
+        job = _ParquetExportJob(plan, str(path))
+        hub = self._parquet_export_hub
+        job.progress_key, emit = hub.progress_sink(
+            lambda done, total: self._on_parquet_export_progress(job, done, total)
+        )
+
+        def run() -> pq_export.ExportResult | None | _NoRows:
+            try:
+                return pq_export.export_parquet(plan, job.path, emit, job.cancel_event.is_set)
+            except pq_export.ExportCancelled:
+                return None
+            except pq_export.NoRowsInRange:  # an expected outcome of a saved range (57.7.4), not an error
+                return _NO_ROWS
+            finally:
+                job.worker_done.set()
+
+        self._parquet_export = job
+        self._parquet_export_progress.begin()
+        job.token = hub.submit(
+            run,
+            lambda result: self._on_parquet_export_finished(job, result),
+            lambda error: self._on_parquet_export_failed(job, error),
+            job="parquet_export",
+            target=job.path,
+        )
+        return True
+
+    # -- Parquet export from a saved view, without opening it (export 57.7) --------------------
+
+    def _view_export_context(
+        self, name: str, override: str | None, on_resolved: Callable[[_ViewExportContext], None] | None = None
+    ) -> _ViewExportContext:
+        """Read the saved view and the footer of its source file (or `override`) on the UI thread:
+        schema and row count only, no data. Nothing of the open file / variables is used."""
+        ctx = _ViewExportContext(name)
+        try:
+            view = view_io.load_view(name)
+            ctx.view = view
+            ctx.view_file = str(view_io.view_path(name))
+            ctx.source_path = Path(override) if override else view_io.resolve_source(view)[0]
+        except Exception as e:  # noqa: BLE001 (shown in the dialog, not swallowed)
+            ctx.error = tr("export_parquet.view_unreadable", error=view_error_text(e))
+            return ctx
+        if on_resolved is not None:
+            on_resolved(ctx)
+        if not ctx.source_path.is_file():
+            ctx.error = tr("export_parquet.source_missing", path=ctx.source_path)
+            return ctx
+        try:
+            schema = pq.read_schema(ctx.source_path)
+            ctx.total_rows = pq.read_metadata(ctx.source_path).num_rows
+        except Exception as e:  # noqa: BLE001 (not a Parquet file, unreadable...)
+            ctx.error = tr("export_parquet.source_unreadable", error=e)
+            return ctx
+        ctx.info = pq_export.view_export_info(
+            view, list(schema.names), self._effective_aliases(), self._registry_snapshot(),
+            alias_names=set(self._aliases),
+        )
+        if ctx.info.time_source in schema.names:
+            ctx.time_type = schema.field(ctx.info.time_source).type
+        if ctx.info.time_problem is not None:
+            ctx.error = tr("export_parquet.time_missing", name=ctx.info.time_problem.detail)
+        return ctx
+
+    def _view_export_choices(self, name: str, override: str | None) -> ExportChoices:
+        ctx = self._view_export_context(name, override)
+        shown = str(ctx.source_path) if ctx.source_path is not None else ""
+        if ctx.info is None:
+            return ExportChoices([], source_file=shown, error=ctx.error)
+        items = [
+            ExportItemChoice(i.name, i.checked, i.usable, problem_text(i.problem) if i.problem else "")
+            for i in ctx.info.items
+        ]
+        saved = ctx.info.saved_range
+        saved_text = ""
+        if saved is not None:
+            # the file's own representation, the same form as the written metadata's range (57.7.4)
+            saved_text = " - ".join(pq_export.format_time_value(x, ctx.time_type) for x in saved)
+        return ExportChoices(
+            items,
+            full_rows=ctx.total_rows,
+            time_name=ctx.info.time_name or "",
+            source_file=shown,
+            error=ctx.error,
+            saved_range_text=saved_text,
+        )
+
+    def _build_view_export_plan(
+        self, ctx: _ViewExportContext, names: list[str], use_saved_range: bool
+    ) -> pq_export.ExportPlan:
+        return pq_export.plan_from_view(
+            ctx.view,
+            ctx.info,
+            source_path=str(ctx.source_path),
+            total_rows=ctx.total_rows,
+            selected=names,
+            use_saved_range=use_saved_range,
+            view_file=ctx.view_file,
+            software=f"Parquet Analyzer v{__version__}",
+            registry=self._registry_snapshot(),
+            chunk_rows=self._PARQUET_EXPORT_CHUNK_ROWS,
+        )
+
+    def export_parquet_from_view(
+        self,
+        path: str,
+        view_name: str,
+        names: list[str],
+        use_saved_range: bool = False,
+        source_file: str | None = None,
+    ) -> bool:
+        """Export `names` of the saved view `view_name` to `path` without opening the view (57.7):
+        the plan comes from the view's JSON and the file's footer; the app's open file, variables
+        and plots are not touched. `source_file`: a file other than the view's. False when it could
+        not be started (a dialog says why)."""
+        logged = False
+
+        def log_start(resolved: _ViewExportContext) -> None:  # once, before any footer is read
+            nonlocal logged
+            logged = True
+            log_op(
+                "export_parquet", path=path, from_view=view_name,
+                source=str(resolved.source_path) if resolved.source_path is not None else None,
+                range="saved" if use_saved_range else "all", columns=len(names),
+            )
+
+        ctx = self._view_export_context(view_name, source_file, on_resolved=log_start)
+        if not logged:  # the view itself could not be read
+            log_start(ctx)
+        title = tr("toolbar.export_parquet")
+        if self._view_compute_active():
+            messages.information(self, title, tr("export_parquet.busy_view_load"))
+            return False
+        if self._parquet_export_busy():
+            messages.information(self, title, tr("export_parquet.busy"))
+            return False
+        if ctx.error:
+            messages.warning(self, title, tr("export_parquet.failed", error=ctx.error))
+            return False
+        if self._is_source_file(path, ctx.source_path):
+            messages.warning(self, title, tr("export_parquet.same_as_source"))
+            return False
+        try:
+            plan = self._build_view_export_plan(ctx, names, use_saved_range)
+        except pq_export.ExportError as e:
+            messages.warning(self, title, tr("export_parquet.failed", error=e))
+            return False
+        return self._start_parquet_export(plan, path)
+
+    def _on_parquet_export_progress(self, job: _ParquetExportJob, done: int, total: int) -> None:
+        if job is self._parquet_export:
+            self._parquet_export_progress.set_progress(done, total)
+
+    def _end_parquet_export(self, job: _ParquetExportJob) -> None:
+        self._parquet_export_hub.drop_progress(job.progress_key)
+        if job is self._parquet_export:
+            self._parquet_export = None
+            self._parquet_export_progress.end()
+
+    def _on_parquet_export_finished(
+        self, job: _ParquetExportJob, result: pq_export.ExportResult | None | _NoRows
+    ) -> None:
+        if job is not self._parquet_export:
+            return
+        self._end_parquet_export(job)
+        if result is _NO_ROWS:
+            messages.warning(
+                self, tr("toolbar.export_parquet"), tr("export_parquet.failed", error=tr("export_parquet.no_rows"))
+            )
+            return
+        if result is None:  # cancelled inside the worker without the UI asking (not expected)
+            self._show_notice(tr("export_parquet.cancelled"), 8_000)
+            return
+        self.settings.last_export_folder = str(Path(result.path).resolve().parent)
+        save_settings(self.settings)
+        seconds = f"{result.elapsed:.1f}"
+        if result.full_computed:
+            text = tr(
+                "export_parquet.saved_full", path=result.path, rows=f"{result.rows:,}", seconds=seconds,
+                names=", ".join(result.full_computed),
+            )
+        else:
+            text = tr("export_parquet.saved", path=result.path, rows=f"{result.rows:,}", seconds=seconds)
+        self._show_notice(text, 20_000)
+
+    def _on_parquet_export_failed(self, job: _ParquetExportJob, error: str) -> None:
+        if job is not self._parquet_export:
+            return
+        self._end_parquet_export(job)
+        messages.warning(self, tr("toolbar.export_parquet"), tr("export_parquet.failed", error=error))
+
+    def _on_parquet_export_cancel_clicked(self) -> None:
+        """The status-bar cancel button (57.3)."""
+        log_op("export_parquet_cancel")
+        self._cancel_parquet_export(tr("export_parquet.cancelled"))
+
+    def _cancel_parquet_export(self, notice: str | None) -> None:
+        """Stop the running export (if any): the worker stops at the next chunk boundary and removes
+        its `.part`; its late result is ignored. `notice`: what the status bar says (None: nothing).
+        Only the cancel button and closing the window stop an export: opening another file or view
+        does not (it runs on its start-time snapshot, 57.3)."""
+        job = self._parquet_export
+        if job is None:
+            return
+        job.cancel_event.set()
+        self._parquet_export_hub.cancel(job.token)  # whatever arrives later is ignored
+        self._parquet_export_cancelled.append(job)
+        self._end_parquet_export(job)
+        if oplog.is_active():
+            oplog.record_job("parquet_export", "cancel", target=job.path)
+        if notice:
+            self._show_notice(notice, 8_000)
 
     def _image_stamp(
         self, now: datetime, range_override: tuple[float, float] | None = None
@@ -2278,6 +3063,9 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        self._abort_view_compute(resync=False)
+        self._cancel_parquet_export(None)  # no notice: the window is going away
+        self._parquet_export_pool.waitForDone(5000)  # the worker stops at its next chunk boundary (57.3)
         self._close_analysis_windows()  # cancels their in-flight jobs (children are not closeEvent'ed)
         oplog.flush_pending()  # the last operation's result must not be lost on exit
         self._save_layout()

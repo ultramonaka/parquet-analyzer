@@ -4,7 +4,7 @@ Qt-free and numpy-only (no scipy, as for the lookup tables, expressions 27.1). M
 assigned to the nearest grid point of each axis (cell borders at the midpoints between grid
 points; the outermost cells extend half a spacing outwards, points beyond are counted as "outside"),
 aggregated chunk by chunk (count / sum / max / min / mean, median only for a bounded number of
-points) and the empty cells are optionally filled: `smooth` (Laplace equation solved by a
+points; "time": the summed row durations of the points in a cell, 44.14) and the empty cells are optionally filled: `smooth` (Laplace equation solved by a
 matrix-free conjugate gradient in index space), `nearest` (nearest measured cell) or `none`.
 """
 
@@ -18,7 +18,7 @@ import numpy as np
 
 MAP_GRID_MAX_POINTS = 500  # grid points per axis (manager table / interpolation cost), 44.1
 MAP_MEDIAN_MAX_POINTS = 20_000_000  # above this many valid points the median is not offered, 44.2
-AGGREGATIONS = ("mean", "median", "max", "min", "count")
+AGGREGATIONS = ("mean", "median", "max", "min", "count", "time")
 FILLS = ("smooth", "nearest", "none")
 _NEAREST_BLOCK_ELEMENTS = 4_000_000  # empty x measured pairs handled per block of the nearest fill
 _CG_CHECK_EVERY = 100  # cancellation is polled every this many CG iterations (25.1)
@@ -235,6 +235,7 @@ class GridResult:
     fill: str
     sparse_mask: np.ndarray | None = None  # cells with 1 <= count < min_count (44.13); None = not computed
     keep_sparse_empty: bool = False
+    total_time: float = 0.0  # agg "time": summed weight (in the chosen unit) of the valid points inside the grid (44.14)
 
     @property
     def is_curve(self) -> bool:
@@ -250,7 +251,7 @@ class GridResult:
 
     @property
     def n_empty(self) -> int:
-        return int(np.isnan(self.value).sum()) if self.agg != "count" else int((~self.measured_mask).sum())
+        return int(np.isnan(self.value).sum()) if self.agg not in ("count", "time") else int((~self.measured_mask).sum())
 
     @property
     def no_data(self) -> bool:
@@ -273,8 +274,11 @@ def grid_aggregate(
     cancelled: Callable[[], bool] | None = None,
     median_limit: int | None = None,
     keep_sparse_empty: bool = False,
+    time_unit_s: float = 1.0,
 ) -> GridResult:
     """Aggregate `(x, y, z)` chunks (a curve: `(x, v)` with `y_axis` None) into the grid (44.2).
+    For agg "time" the last array of a chunk is the row's duration in seconds (44.14): the cell value is
+    the summed duration / `time_unit_s`, every cell is valid (0 where no point), min_count and fill are unused.
     Rows with any non-finite column are excluded (counted), points beyond the outer cell borders are
     counted as outside. `GridCancelled` is raised when `cancelled()` turns true. `keep_sparse_empty`
     (44.13): cells with 1 <= count < `min_count` stay empty after the fill instead of being filled
@@ -283,7 +287,7 @@ def grid_aggregate(
         raise MapGridError("unknown_agg", value=str(agg))
     if fill not in FILLS:
         raise MapGridError("unknown_fill", value=str(fill))
-    min_count = max(int(min_count), 1)
+    min_count = 1 if agg == "time" else max(int(min_count), 1)  # time: every cell is valid (44.14)
     median_limit = MAP_MEDIAN_MAX_POINTS if median_limit is None else median_limit
     x_axis = np.asarray(x_axis, dtype=np.float64)
     curve = y_axis is None
@@ -291,7 +295,7 @@ def grid_aggregate(
     ny = 1 if curve else len(y_axis)
     ncell = nx * ny
     count = np.zeros(ncell, dtype=np.int64)
-    total = np.zeros(ncell, dtype=np.float64) if agg == "mean" else None
+    total = np.zeros(ncell, dtype=np.float64) if agg in ("mean", "time") else None
     vmax = np.full(ncell, -np.inf) if agg == "max" else None
     vmin = np.full(ncell, np.inf) if agg == "min" else None
     keep_idx: list[np.ndarray] = []
@@ -337,9 +341,12 @@ def grid_aggregate(
             keep_idx.append(flat.astype(np.int32))
             keep_val.append(v.copy())
 
-    measured = count >= min_count
+    timed = agg == "time"
+    measured = np.ones(ncell, dtype=bool) if timed else count >= min_count
     with np.errstate(invalid="ignore", divide="ignore"):
-        if agg == "count":
+        if timed:
+            value = total / time_unit_s
+        elif agg == "count":
             value = count.astype(np.float64)
         elif agg == "mean":
             value = np.where(count > 0, total / np.maximum(count, 1), np.nan)
@@ -349,23 +356,23 @@ def grid_aggregate(
             value = np.where(count > 0, vmin, np.nan)
         else:
             value = _grouped_median(keep_idx, keep_val, ncell, count)
-    if agg != "count":
+    if agg not in ("count", "time"):
         value = np.where(measured, value, np.nan)  # below min_count: no data
     shape = (nx,) if curve else (ny, nx)
     value, measured_2d = value.reshape(shape), measured.reshape(shape)
     filled = np.zeros(shape, dtype=bool)
-    if agg != "count" and fill != "none" and measured_2d.any() and not measured_2d.all():
+    if agg not in ("count", "time") and fill != "none" and measured_2d.any() and not measured_2d.all():
         value, filled = fill_empty(value, measured_2d, fill, cancelled)
     count_nd = count.reshape(shape)
     sparse = (count_nd > 0) & (count_nd < min_count)
-    keep = bool(keep_sparse_empty) and agg != "count" and fill != "none"
+    keep = bool(keep_sparse_empty) and agg not in ("count", "time") and fill != "none"
     if keep and sparse.any():  # filled like any unknown cell above, then taken back (44.13)
         value = np.where(sparse, np.nan, value)
         filled = filled & ~sparse
     return GridResult(
         x_axis, None if curve else np.asarray(y_axis, dtype=np.float64), value, count_nd, measured_2d,
         filled, res["valid"], res["bad"], res["outside"], agg, min_count, fill, sparse_mask=sparse,
-        keep_sparse_empty=keep,
+        keep_sparse_empty=keep, total_time=float(total.sum()) / time_unit_s if timed else 0.0,
     )
 
 

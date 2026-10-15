@@ -27,6 +27,16 @@ def warning(parent, title, text, *args, **kwargs):
     return QMessageBox.warning(parent, title, text, *args, **kwargs)
 
 
+def warning_with_button(parent, title, text, button_text) -> bool:
+    """A warning with one extra action button next to OK; True when that button was pressed
+    (persistence 54.6). Like `warning`, it records the message first."""
+    _record("warning", text, title)
+    box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.Ok, parent)
+    extra = box.addButton(button_text, QMessageBox.ButtonRole.ActionRole)
+    box.exec()
+    return box.clickedButton() is extra
+
+
 def critical(parent, title, text, *args, **kwargs):
     _record("error", text, title)
     return QMessageBox.critical(parent, title, text, *args, **kwargs)

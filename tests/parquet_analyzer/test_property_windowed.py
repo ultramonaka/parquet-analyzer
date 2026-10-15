@@ -6,7 +6,7 @@ polars/pyarrow and turned into numbers with `to_numeric`; expressions are evalua
 cache hit and evict within one example.
 
 `trailing_mean` (expressions 31.2) is intentionally not in the expression list: it is added on
-another branch (dev notes 28), which adds it here.
+another branch, which adds it here.
 """
 from __future__ import annotations
 

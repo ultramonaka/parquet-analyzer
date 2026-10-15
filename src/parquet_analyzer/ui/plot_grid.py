@@ -184,6 +184,7 @@ class PlotGridWidget(QWidget):
         self._coarse_plots: set[TimePlotWidget] = set()
         self._cursor_mode_enabled = False
         self._downsample_enabled = True  # owned here so new plots inherit it (plots 50.1)
+        self._time_unreliable = (False, "")  # 56.1: applied to every time-domain plot, also new ones
         self._hover_enabled = True  # detailed_specification.md 39.3; MainWindow applies the saved setting
         # The one selected series across the whole grid (detailed_specification.md 23.2).
         self._selected: tuple[TimePlotWidget, str] | None = None
@@ -244,6 +245,8 @@ class PlotGridWidget(QWidget):
         plot.cursorAddRequested.connect(self._on_cursor_add_requested)
         plot.hoverXChanged.connect(self._on_hover_x_changed)
         plot.set_hover_enabled(self._hover_enabled)
+        if plot.x_axis_datetime:
+            plot.set_time_unreliable(*self._time_unreliable)
         plot.set_downsample_enabled(self._downsample_enabled)  # (plots 50.1)
         plot.cursorMoveRequested.connect(self._on_cursor_move_requested)
         plot.cursorRemoveRequested.connect(self._on_cursor_remove_requested)
@@ -692,6 +695,14 @@ class PlotGridWidget(QWidget):
             plot.set_cursor_mode_enabled(enabled)
         self._emit_cursors_changed()
 
+    def set_time_unreliable(self, flag: bool, tip: str = "") -> None:
+        """56.1: mark cursor / hover readouts of the time-domain plots as unreliable (time axis not
+        ascending). FFT plots (X in Hz) are left alone."""
+        self._time_unreliable = (bool(flag), tip)
+        for plot in self._plots:
+            if plot.x_axis_datetime:
+                plot.set_time_unreliable(bool(flag), tip)
+
     def set_hover_enabled(self, enabled: bool) -> None:
         """Hover value readout on/off for every plot (39.3)."""
         self._hover_enabled = bool(enabled)
@@ -856,7 +867,7 @@ class PlotGridWidget(QWidget):
         if source not in self._plots:
             # A plot just removed from the grid is still X-linked until it is deleted, and its
             # pane is re-laid-out outside the splitter (its range jumps): that must not drive
-            # the navigator away from the real group's range (24.1, dev notes 2026-10-02).
+            # the navigator away from the real group's range.
             return
         self.rangeChanged.emit(x_range)
 

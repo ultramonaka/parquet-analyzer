@@ -61,7 +61,7 @@ class TimeIndex:
         self._anchors = anchors  # anchors[k] = value at row k * ANCHOR_ROWS
         self._pins = pins
         self._last = float(last)
-        self.report = TimeOrderReport(0, 0, None)
+        self.report = TimeOrderReport(0, 0, None)  # build() replaces it with the scan result (56.2)
 
     # -- construction -------------------------------------------------------------
 
@@ -101,7 +101,9 @@ class TimeIndex:
                 pi += 1
             last = float(v[-1])
             del raw, v
-        return cls(data_source, column, n, np.concatenate(anchors), pins, last)
+        index = cls(data_source, column, n, np.concatenate(anchors), pins, last)
+        index.report = scanner.report()  # carries duplicate_count (56.2); ok/decreasing are 0 here
+        return index
 
     # -- array look-alike ---------------------------------------------------------
 

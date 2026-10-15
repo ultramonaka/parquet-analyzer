@@ -176,6 +176,106 @@ def case_export_image(c):
     )
 
 
+def _accept_parquet_export_dialog(monkeypatch):
+    from parquet_analyzer.ui.parquet_export_dialog import ParquetExportDialog
+
+    def exec_(dlg):
+        dlg.accept()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ParquetExportDialog, "exec", exec_)
+
+
+def case_export_parquet(c, monkeypatch):
+    out = str(c.tmp_path / "export.parquet")
+    _accept_parquet_export_dialog(monkeypatch)
+
+    def action():
+        c.win._actions["export_parquet"].trigger()
+        _wait_for(lambda: c.win._parquet_export is None)
+
+    return dict(
+        action=action,
+        allowed=[],
+        answers={"QFileDialog.getSaveFileName": (out, "")},
+        expected_dialogs=["QFileDialog.getSaveFileName"],
+    )
+
+
+def case_export_parquet_from_view(c, monkeypatch):
+    """Export a saved view without opening it (export 57.7): nothing on screen or in the open file changes."""
+    from PySide6.QtWidgets import QDialogButtonBox
+
+    from parquet_analyzer.io import view as view_io
+    from parquet_analyzer.ui.parquet_export_dialog import ParquetExportDialog
+
+    out = str(c.tmp_path / "export_view.parquet")
+    names = list(c.win._data_source.columns)
+    view_io.save_view(
+        view_io.View(
+            view_name="side_effect_export_view",
+            source=view_io.SourceDef(str(c.win._data_source.path), "absolute"),
+            plots=[view_io.PlotDef("p0", [view_io.SeriesDef(names[1], "#ff0000")])],
+            derived_variables=[view_io.DerivedVariableDef("se_dv", f"{names[1]} * 2")],
+            time_column=names[0],
+        )
+    )
+
+    def exec_(dlg):
+        dlg.source_combo.setCurrentIndex(dlg.source_combo.findData("side_effect_export_view"))
+        dlg.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ParquetExportDialog, "exec", exec_)
+
+    def action():
+        c.win._actions["export_parquet"].trigger()
+        _wait_for(lambda: c.win._parquet_export is None)
+
+    return dict(
+        action=action,
+        allowed=[],
+        answers={"QFileDialog.getSaveFileName": (out, "")},
+        expected_dialogs=["QFileDialog.getSaveFileName"],
+    )
+
+
+def case_export_parquet_cancel(c, monkeypatch):
+    import threading
+
+    from parquet_analyzer.core import parquet_export as pe
+
+    out = str(c.tmp_path / "export_cancel.parquet")
+    _accept_parquet_export_dialog(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    real = pe.evaluate_expression
+
+    def blocked(expr, variables, registry=None):
+        entered.set()
+        assert release.wait(30)
+        return real(expr, variables, registry)
+
+    monkeypatch.setattr(pe, "evaluate_expression", blocked)
+
+    def action():
+        try:
+            c.win._actions["export_parquet"].trigger()
+            _wait_for(entered.is_set)
+            job = c.win._parquet_export
+            QTest.mouseClick(c.win._parquet_export_progress.cancel_button, Qt.MouseButton.LeftButton)
+            assert c.win._parquet_export is None
+        finally:
+            release.set()
+        _wait_for(job.worker_done.is_set)
+
+    return dict(
+        action=action,
+        allowed=[],
+        answers={"QFileDialog.getSaveFileName": (out, "")},
+        expected_dialogs=["QFileDialog.getSaveFileName"],
+    )
+
+
 def case_toggle_downsample(c):
     return dict(action=c.win._actions["toggle_downsample"].trigger, allowed=["downsample_enabled"] + POINTS)
 
@@ -260,6 +360,46 @@ def case_expression_var_to_plot(c):
     )
 
 
+def case_view_compute_cancel(c, monkeypatch):
+    """Cancel the status-bar progress while a view's derived variables are being computed
+    (expressions 55.5). The view load is part of the action: the harness cannot rest while the
+    computation runs. Whole-layout changes are expected; a reload, a re-created data source, an
+    unexpected dialog or an exception record are not."""
+    import threading
+
+    from parquet_analyzer.core.column import DeferredColumn
+    from parquet_analyzer.io import view as view_io
+
+    release = threading.Event()
+    real = DeferredColumn.compute
+
+    def blocked(self):
+        release.wait(30)
+        return real(self)
+
+    monkeypatch.setattr(DeferredColumn, "compute", blocked)
+    view_io.save_view(
+        view_io.View(
+            view_name="slow_view",
+            source=view_io.SourceDef(str(c.win._data_source.path), "absolute"),
+            plots=[view_io.PlotDef("p1", [view_io.SeriesDef("a", "#ff0000"), view_io.SeriesDef("d1", "#00aa00")])],
+            derived_variables=[view_io.DerivedVariableDef("d1", "a * 2")],
+        )
+    )
+
+    def action():
+        try:
+            c.win.load_view("slow_view")
+            progress = c.win._view_compute_progress
+            _wait_for(lambda: not progress.isHidden())
+            QTest.mouseClick(progress.cancel_button, Qt.MouseButton.LeftButton)
+            assert c.win._view_compute is None
+        finally:
+            release.set()
+
+    return dict(action=action, allowed=["*"], expected_dialogs=["QMessageBox.warning"])
+
+
 def _drag(widget, p0: QPoint, p1: QPoint, steps: int = 6):
     """Press, move in steps, release -- real mouse events to the viewport."""
     btn = Qt.MouseButton.LeftButton
@@ -329,6 +469,9 @@ CASES = {
     "map_reimport": case_map_reimport,
     "save_view": case_save_view,
     "export_image": case_export_image,
+    "export_parquet": case_export_parquet,
+    "export_parquet_from_view": case_export_parquet_from_view,
+    "export_parquet_cancel": case_export_parquet_cancel,
     "toggle_downsample": case_toggle_downsample,
     "cursor_toggle": case_cursor_toggle,
     "hover_toggle": case_hover_toggle,
@@ -340,10 +483,11 @@ CASES = {
     "navigator_drag": case_navigator_drag,
     "recompute_xy": case_recompute_xy,
     "recompute_histogram": case_recompute_histogram,
+    "view_compute_cancel": case_view_compute_cancel,
 }
 
 # Rows whose real behaviour differs from the table (45.2: judged by the main session); a bug
-# found this way is marked xfail(strict=True) with its dev notes task. Never loosen the allowed set instead.
+# found this way is marked xfail(strict=True) with its own task. Never loosen the allowed set instead.
 XFAIL: dict[str, str] = {}
 
 
@@ -353,5 +497,5 @@ XFAIL: dict[str, str] = {}
 )
 def test_action_has_no_side_effects(ctx, monkeypatch, name):
     case = CASES[name]
-    kwargs = case(ctx, monkeypatch) if name == "settings_ok" else case(ctx)
+    kwargs = case(ctx, monkeypatch) if name in ("settings_ok", "view_compute_cancel", "export_parquet", "export_parquet_from_view", "export_parquet_cancel") else case(ctx)
     ctx.run(name, **kwargs)

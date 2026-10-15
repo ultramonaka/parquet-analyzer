@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from PySide6.QtWidgets import QMessageBox
+from view_load_helper import wait_view_loaded
 
 from parquet_analyzer.core.expression import ExpressionError
 from parquet_analyzer.io import view as view_io
@@ -120,6 +121,7 @@ def test_view_with_a_bad_expression_skips_only_that_chain(win):
         ["a", "bad", "dep", "ok", "deep", "big", "flag"],
     )
     win.load_view("v")  # used to abort with a raw TypeError at the first bad variable
+    wait_view_loaded(win)
 
     assert set(win._derived) == {"ok"}
     assert win.plot_grid.plots[0].series_names() == ["a", "ok"]
@@ -141,6 +143,7 @@ def test_view_load_order_does_not_matter_for_the_surviving_variables(win):
         ["ok2", "ok1"],
     )
     win.load_view("v")
+    wait_view_loaded(win)
     assert set(win._derived) == {"ok1", "ok2"}
     assert win.plot_grid.plots[0].series_names() == ["ok2", "ok1"]
     np.testing.assert_allclose(win.variable_values("ok2"), win.variable_values("a") * 2 + 1)

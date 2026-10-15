@@ -378,9 +378,9 @@ def test_many_tiny_row_groups_visible_range_stats_equal_full(qapp, isolated_conf
     captured = {}
     real_init = StatsDialog.__init__
 
-    def spy(self, label, results, parent=None):
+    def spy(self, label, results, parent=None, **kw):
         captured.update(results)
-        real_init(self, label, results, parent)
+        real_init(self, label, results, parent, **kw)
 
     monkeypatch.setattr(StatsDialog, "__init__", spy)
     win.variable_panel.clearSelection()

@@ -93,8 +93,7 @@ parquet-analyzer/
 
 #### 5.36 Side effects of operations: unrelated state must not change (added 2026-10-06, user request)
 - When a button or menu is pressed, an automated test checks that **state unrelated to that operation does not change**.
-  Examples: saving a map moved the plot range (dev notes item 14); removing a series shifted the navigator range
-  (the same kind of bug occurred 5 times, dev notes 2026-10-02).
+  Examples: saving a map moved the plot range; removing a series shifted the navigator range.
 - For each operation, keep a table of the state that **may** change. If the difference in state before and after the
   operation (the same diff as in the operation log, ch. 30) falls outside the table, the test fails. Re-reading a file,
   an unexpected dialog, and an exception also fail the test.
@@ -102,7 +101,7 @@ parquet-analyzer/
 - Details in [ch. 45](#45-side-effect-tests-unrelated-features-must-not-change-added-2026-10-06-user-request).
 
 #### 5.38 Stronger tests: random checks, failure paths, windowed reads, view backward compatibility (added 2026-10-08)
-- Candidate A of external review 2 (dev notes). The app's behavior does not change; tests are added to check more
+- Candidate A of external review 2. The app's behavior does not change; tests are added to check more
   mechanically that things have not broken. Split into 4 parts, one part = one branch, done in order (2026-10-08, user decision):
   1. **A1 Property tests on random data** (`hypothesis`): the expression evaluator, `TimeIndex.searchsorted`, `chunked_stats`,
      LTTB, `rolling_mean`/`rolling_nanmean` and `row_range_for_x` keep their stated properties on arbitrary inputs.
@@ -140,7 +139,7 @@ parquet-analyzer/
   (since the 10/13 merge).
 - Details in [ch. 51](#51-ci-setup-added-2026-10-13-user-decision).
 
-#### 5.45 Introducing lint (ruff) (added 2026-10-13, user decision; dev notes item 36)
+#### 5.45 Introducing lint (ruff)
 - Find unused imports, undefined names, import order and outdated syntax mechanically, and prevent new ones from being
   added in CI. Rules: `E`, `F`, `I`, `UP` (user decision). Line length (E501) is not checked. Formatting (`ruff format`)
   is not introduced (user decision). No type checking (mypy/pyright): the type information for PySide6 and pyqtgraph is
@@ -260,6 +259,7 @@ makes a general mechanism so new features can be "committed off until finished a
   | `xyz_3d` | `True` (on 2026-10-03 after review + real-machine check) | ch. 25 stage 2 |
   | `user_functions` | `True` (on 2026-10-03 after review + real-machine check) | ch. 26 |
   | `maps` | `True` (on 2026-10-03 after review + real-machine check) | ch. 27 |
+  | `parquet_export` | `True` (on 2026-10-16, after review and real-machine check) | export 57 |
   | `big_a_thin_first_draw`, `big_c_windowed_derived`, `big_d_time_index` | `True` (adopted 2026-10-04, data 36.8; the flags themselves are removed if everyday use shows no problems) | data ch. 36 A, C, D |
   Each is set to `True` once its chapter is implemented and reviewed (the main session makes that
   change).
@@ -409,7 +409,7 @@ clear from just reading the log had the state change after the operation been re
   `job`/`message`/`exception` records belonging to it. `--last N` (only the last N operations),
   `--session` (only the last start).
 - The settings menu (or "Help") gets "Open log folder" (`QDesktopServices.openUrl`).
-- The bug-report procedure (README, dev rules) becomes: "start normally and reproduce → hand over
+- The bug-report procedure becomes: "start normally and reproduce → hand over
   today's `*_ops_*.log` from the log folder" (reproducing in debug mode is no longer needed).
 
 #### 30.5 Performance
@@ -457,7 +457,7 @@ Requirements: 5.36. This chapter only adds tests; the app's behavior does not ch
 - **How one operation is checked**:
   1. Take the state (`MainWindow.state_snapshot()`).
   2. Trigger the operation **from the real entry point**: toolbar via `QAction.trigger()`, menu items via the `QAction` of that
-     menu, buttons, legend and navigator via `QTest` mouse operations (Qt's real routing, per the dev rules test rules).
+     menu, buttons, legend and navigator via `QTest` mouse operations.
      All dialogs are monkeypatched to return fixed answers (table below).
   3. Wait until settled: run `processEvents` until `_busy_sources` is empty and no operation-log result is pending
      (limit 5 seconds; exceeding it fails).
@@ -494,6 +494,8 @@ Requirements: 5.36. This chapter only adds tests; the app's behavior does not ch
 | Map manager: reload the same map from file | — | same as above |
 | Save view | Name given a fixed value; the "saved" notice (`QMessageBox.information`) may appear | none |
 | Save image | Destination given as a path in `tmp` | none |
+| Parquet export (when feature flag `parquet_export` is ON) | Press "Export" on the settings screen, destination given as a path in `tmp`; wait until it finishes | none |
+| Cancel Parquet export | Same. Hold the export, then press Cancel in the status bar | none |
 | Toggle coarse display | — | `downsample_enabled`, `plots.*.series_info.*.points`, `coarse` |
 | Toggle cursors | — | `cursors.*` |
 | Toggle value display | — | `hover_values` |
@@ -512,8 +514,8 @@ Requirements: 5.36. This chapter only adds tests; the app's behavior does not ch
 - **When the table and the actual behavior disagree**: the implementer does not loosen the test to match the table, nor
   change app code to match it. The implementer reports the operation, item and before/after values that disagree; the
   main session decides whether it is a bug or a table error. Items judged to be bugs are marked
-  `pytest.mark.xfail(strict=True, reason="dev notes item <number>")`, so that the fix is noticed automatically later
-  (example: saving or reloading a map returned the navigator range to the whole range = dev notes item 14; found during
+  `pytest.mark.xfail`, so that the fix is noticed automatically later
+  (example: saving or reloading a map returned the navigator range to the whole range; found during
   implementation, fixed by item 14's change (plots 24.1), so the xfail was removed).
 
 #### 45.3 Test plan
@@ -531,7 +533,7 @@ Requirements: 5.36. This chapter only adds tests; the app's behavior does not ch
 
 Requirements: 5.38. This chapter only adds tests; the app code (`src/`) does not change. If a test fails, do not loosen the test
 or fix the app. Report the input (the minimal example hypothesis shrank to), the expectation and the actual result. The main
-session decides whether it is a bug or a test error; if it is a bug, mark it `pytest.mark.xfail(strict=True, reason="dev notes item <number>")`
+session decides whether it is a bug or a test error; if it is a bug, mark it `pytest.mark.xfail`
 and fix it in separate work.
 
 #### 46.1 Common: hypothesis settings
@@ -582,7 +584,7 @@ and fix it in separate work.
 - The whole test suite (`uv run pytest -q -n auto`) passes, and the added time fits within a few seconds. Report the run time of
   the A1 tests alone (`-n 0`) in the report.
 
-#### 46.5 A2: exhaustive failure paths of background work (added 2026-10-08, dev notes item 25)
+#### 46.5 A2: exhaustive failure paths of background work
 
 Purpose: confirm, with a table, that `WorkerHub` (data ch. 37)'s rule "always exactly one result or failure, and cleanup
 once it is received" (overview ch. 2, data ch. 28) holds **for every owner and every event**. Only tests are added; `src/`
@@ -633,7 +635,7 @@ does not change (if something fails, report it and mark it xfail, as in 46).
 **Test plan**: every cell of the table is "existing", "new" or "out of scope". New tests all pass, or if a bug is found, are xfail (reported).
 The added total test time stays within 10 seconds (keep holds short and data small).
 
-**Decision for S-5 and F-5 (2026-10-13, user decision, dev notes item 31)**: if another file is opened while statistics or FFT jobs are
+**Decision for S-5 and F-5**: if another file is opened while statistics or FFT jobs are
 running, **the results of the previous file are discarded** (no statistics dialog, no spectrum plot is added).
 - `MainWindow` has `_file_generation: int` (starts at 0). `load_parquet` increments it by 1 **when it successfully switches to the new file**
   (not when loading fails; the previous file stays).
@@ -648,7 +650,7 @@ running, **the results of the previous file are discarded** (no statistics dialo
   (for F, and for the statistics `{"error"}`); when a file that fails to load is opened, the generation does not change and results still
   appear; the "computing" marker and `hub.pending` are empty. The existing tests for S-6 and F-6 still pass.
 
-#### 46.6 A3: windowed-read column agreement and watching for full reads (added 2026-10-08, dev notes item 26)
+#### 46.6 A3: windowed-read column agreement and watching for full reads
 
 As in the beginning of 46, only tests are added and `src/` does not change (report failures; xfail(strict) for bugs).
 
@@ -662,7 +664,7 @@ The oracle is built **without going through the class under test**: the column r
 | `ParquetDataSource.read_window`, `WindowedColumn.window` | A **sequence** of arbitrary `(lo, hi)` (including repeated identical ranges, adjacent ranges, ranges crossing block boundaries, `lo == hi`, `hi > row count`, `lo < 0`), read in order, each exactly equal to the full `[lo:hi]` (NaN positions included). `read_window` reading several columns at once too | `ParquetDataSource(path, block_rows=small, cache_blocks=small)` (e.g. 1000 rows, 2–4 blocks; both cache hits and evictions occur). Row count 0.5–20 times the block size; row-group sizes arbitrary. Columns `float64`, integer, with NaN. Since files are written, `max_examples` 30, with many ranges in each example |
 | `DerivedColumn.window` (data 36.6 C) | `window(lo, hi)` of a column built by `make_derived_column` equals `[lo:hi]` of the full computation (`assert_allclose`, `rtol=1e-12`, `equal_nan=True`; for functions with a margin, the edge rows too) | Expressions: element-wise (`a*2+b`), `delta(a)`, `rolling_mean(a, n)`, `rolling_nanmean(a, n)`, their nestings (`delta(rolling_mean(a, 5))`), and ones taking another `DerivedColumn` as input. Inputs are `WindowedColumn` (same small blocks as above). `n` from 1 to beyond the row count. An expression for which `make_derived_column` returns `None` (margin unknown) is out of scope; confirm this in one example. `max_examples` 50 |
 
-#### 46.7 A4: view backward compatibility (added 2026-10-08, dev notes item 27)
+#### 46.7 A4: view backward compatibility
 
 Purpose: confirm that view JSON saved by past versions can be read by the current code, using **files actually saved by that version's code**
 (persistence 8, 20, 33, 35: missing items are warned about and skipped; unknown keys are ignored; shape errors raise `ViewFormatError`).
@@ -773,7 +775,7 @@ dialog can then be used as they are).
 
 ### 51. CI setup (added 2026-10-13, user decision)
 
-Requirements: 5.44. Windows is still postponed along with the exe build (dev notes "exe build").
+Requirements: 5.44. Windows is still postponed along with the exe build.
 
 #### 51.1 The macOS job (manual runs only)
 
@@ -785,7 +787,6 @@ Requirements: 5.44. Windows is still postponed along with the exe build (dev not
 - Add `workflow_dispatch:` to the `on:` of `.github/workflows/test.yml` (Ubuntu), so a branch can also be tried with
   `gh workflow run test.yml --ref <branch>`. Behavior on push and on PR stays as now.
 - Guideline: use it before merging a change that affects plots or worker timing, or to isolate a failure that only happens on Ubuntu.
-  Add one line on how to run it to the Commands section of dev rules.
 
 #### 51.2 Fixing tests that fail on Ubuntu
 
@@ -798,7 +799,7 @@ Requirements: 5.44. Windows is still postponed along with the exe build (dev not
     (the "A" operation does not arrive). `test_a_button_with_cursor_fits_y_to_data_and_stays_put`, of the same shape, passes.
 - Policy: first confirm the cause (if it does not reproduce on the local Mac, push the branch and run the Ubuntu workflow by hand;
   add temporary diagnostic output if needed). **If it is a bug in the app, fix the app; if it is in how the test is written (differences
-  between real machine and CI, or waiting), fix the test.** Do not just loosen tests to make them pass. Waiting uses real-time `sleep` with a limit (dev rules rule).
+  between real machine and CI, or waiting), fix the test.** Do not just loosen tests to make them pass. Waiting uses real-time `sleep` with a limit.
 - Done when: the Ubuntu CI is green on the fixed branch, and all tests pass locally. Add the cause and the fix to this section.
   Also run the macOS job once by hand and record the result here.
 - **Cause and fix (2026-10-13)**: neither was an app bug; both were in how the tests were written.
@@ -816,7 +817,7 @@ Requirements: 5.44. Windows is still postponed along with the exe build (dev not
 
 ### 52. Introducing lint (ruff) (added 2026-10-13, user decision)
 
-Requirements: 5.45. Source: dev notes "research targets" (2026-10-13).
+Requirements: 5.45.
 
 #### 52.1 Configuration
 
@@ -856,8 +857,6 @@ Requirements: 5.45. Source: dev notes "research targets" (2026-10-13).
 
 - Add one step, `uv run ruff check`, to `.github/workflows/test.yml` (Ubuntu) after installing dependencies and before the tests (it fails faster than the tests).
   Do not add it to the macOS workflow (51.1), since the result would be identical (wasted run time).
-- Add `uv run ruff check [--fix]` as one line to the Commands section of dev rules. Check whether dev rules needs a lint note; if it departs from
-  the template, raise its version and changelog.
 
 #### 52.4 Test plan
 

@@ -8,6 +8,7 @@ import json
 import numpy as np
 import pytest
 from PySide6.QtWidgets import QInputDialog, QMessageBox
+from view_load_helper import wait_view_loaded
 
 from parquet_analyzer.core.expression import (
     _ALLOWED_FUNCS,
@@ -291,6 +292,7 @@ def test_expression_bar_where_plots_and_survives_view_round_trip(qapp, isolated_
         assert {d.name: d.expression for d in view_io.load_view("v").derived_variables}["pos"] == "where(a > 0, a, 0)"
         fresh = MainWindow()
         fresh.load_view("v")
+        wait_view_loaded(fresh)
         np.testing.assert_array_equal(fresh.variable_values("pos"), np.where(a > 0, a, 0.0))
         assert fresh.plot_grid.plots[0].series_names() == ["pos"]
     finally:

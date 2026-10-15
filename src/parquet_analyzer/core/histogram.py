@@ -42,7 +42,9 @@ HIST_TREND_BAR_MAX = 2000  # more buckets than this: the trend is drawn as a ste
 
 DAY_S = 86400
 
-VIEWS = ("dist", "duration", "trend")  # display kinds (42.11); the computation differs only for "duration"
+VIEWS = ("dist", "duration", "trend", "timeofday")  # display kinds (42.11, 42.13); "duration" / "timeofday" compute differently
+TOD_SLOTS_S = (600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0)  # time-of-day slot lengths (42.13)
+TOD_AGGREGATIONS = ("mean", "integral")
 AGGREGATIONS = ("sum", "integral", "mean", "max", "min")
 STAGE2_AGGREGATIONS = ("max", "min", "mean", "sum")  # 42.8: no integral on the second stage
 INTEGRAL_UNITS = {"s": 1.0, "min": 60.0, "h": 3600.0}
@@ -91,6 +93,11 @@ class HistogramSettings:
     stage1_agg: str = "mean"  # integral uses `integral_unit_s`
     view: str = "dist"  # "dist" | "duration" | "trend" (42.11); "duration" also fills duration_x / duration_v
     time_filter: TimeFilter | None = None  # None / disabled: every row counts (42.10)
+    # Time of day (42.13, view "timeofday"): slot length, value (mean = time-weighted / integral) and
+    # whether an integral is divided by the number of days that had valid time in the slot.
+    slot_s: float = 3600.0
+    tod_agg: str = "mean"
+    tod_per_day: bool = True
 
 
 @dataclass
@@ -119,6 +126,13 @@ class VariableHistogram:
     duration_x: np.ndarray | None = None
     duration_v: np.ndarray | None = None
     vmax: float = math.nan  # the largest value used (legend of the duration curve)
+    # Time of day (42.13): per slot the value (NaN = none), the valid time (s) summed over the days and
+    # the number of days that had valid time in the slot, and how many of those days covered the slot only
+    # partly (range ends, gap edges, DST days; the per-day integral still counts them as whole days).
+    slot_values: np.ndarray | None = None
+    slot_valid_s: np.ndarray | None = None
+    slot_days: np.ndarray | None = None
+    slot_partial_days: np.ndarray | None = None
 
 
 @dataclass
@@ -137,6 +151,7 @@ class HistogramResult:
     bucket_start: np.ndarray | None = None  # epoch seconds of the buckets overlapping the range (42.8)
     bucket_end: np.ndarray | None = None
     target_seconds: float | None = None  # time filter on: target time inside [first, last time] (42.10)
+    slot_start: np.ndarray | None = None  # time of day view: seconds after the origin of each slot (42.13)
 
     @property
     def bins(self) -> int:
@@ -518,7 +533,7 @@ def _merge_fine(fine: np.ndarray, nb: int) -> tuple[np.ndarray, np.ndarray]:
     return ix, merged
 
 
-def _durations(t: np.ndarray, n: int) -> np.ndarray:
+def row_durations(t: np.ndarray, n: int) -> np.ndarray:
     """Row durations w_i = t[i+1] - t[i] for the first `n` rows of a time chunk `t` (which holds
     n or n+1 values); the last row of the range (no next stamp) gets 0; NaN/negative -> 0."""
     w = np.zeros(n, dtype=np.float64)
@@ -585,6 +600,8 @@ def compute_histogram(
     """The histogram of `names` over rows [row_start, row_end) (42.3). Raises HistogramError for
     an uncomputable range/setting and `Cancelled` when `cancelled()` becomes true."""
     reader = _Reader(fetch_value, fetch_time, row_start, row_end, chunk_rows or HIST_CHUNK_ROWS, cancelled)
+    if settings.view == "timeofday":
+        return _compute_timeofday(reader, names, settings, time_name, time_is_datetime)
     if settings.mode == "bucket":
         return _compute_bucket(reader, names, settings, time_name, time_is_datetime)
     return _compute_plain(reader, names, settings, time_name, time_is_datetime)
@@ -627,6 +644,33 @@ def _scan_time(reader: _Reader, settings: HistogramSettings):
     for a, b in reader.chunks():
         scan.feed(a, b, reader.time(a, b))
     return scan.finish(settings)
+
+
+def time_weights(t: np.ndarray, n: int, gap: float) -> tuple[np.ndarray, int]:
+    """(row durations with every interval above `gap` set to 0, number of such gaps) for the first `n`
+    rows of a time chunk `t` (n or n+1 values), 42.3; the XY map's aggregate "time" uses it too (44.14)."""
+    w = row_durations(t, n)
+    big = w > gap
+    n_gaps = int(np.count_nonzero(np.isfinite(t[:n]) & big))
+    if n_gaps or big.any():
+        w = np.where(big, 0.0, w)
+    return w, n_gaps
+
+
+def scan_time_axis(
+    fetch_time: Callable[[int, int], np.ndarray],
+    row_start: int,
+    row_end: int,
+    chunk_rows: int | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> tuple[float, float, float]:
+    """(t_min, t_max, gap_s) of the time axis over rows [row_start, row_end): the order check and the
+    automatic gap (5 x the median adjacent interval, a median of the chunks' medians, so `chunk_rows`
+    matters on uneven data: the map keeps the histogram's default), shared with the XY map's aggregate
+    "time" (analysis 44.14) so the map does not repeat the computation. Raises HistogramError
+    ("time_not_ascending") and `Cancelled`."""
+    reader = _Reader(None, fetch_time, row_start, row_end, chunk_rows or HIST_CHUNK_ROWS, cancelled)
+    return _scan_time(reader, HistogramSettings())
 
 
 # ---------------------------------------------------------------------------
@@ -674,11 +718,11 @@ def _compute_plain_impl(reader: _Reader, names, settings, time_name, time_is_dat
             tt = t[: b - a]
             tok = np.isfinite(tt)
             mask &= tok
-            w = _durations(t, b - a)
+            w = time_weights(t, b - a, gap)[0] if use_time else row_durations(t, b - a)
             if target is not None:
                 inside = tok & target.contains(np.where(tok, tt, 0.0))
                 if use_time:
-                    w = target.weights(tt, np.where(w > gap, 0.0, w), tok)
+                    w = target.weights(tt, w, tok)
                     inside |= w > 0
                 mask &= inside
                 elig = int(np.count_nonzero(inside | ~tok))
@@ -722,8 +766,7 @@ def _compute_plain_impl(reader: _Reader, names, settings, time_name, time_is_dat
     for a, b in reader.chunks():
         if use_time:  # gaps are a property of the time axis: counted once, whatever the values are
             t = reader.time(a, b)
-            wc = _durations(t, b - a)
-            result.gap_count += int(np.count_nonzero(np.isfinite(t[: b - a]) & (wc > gap)))
+            result.gap_count += time_weights(t, b - a, gap)[1]
         for nm in names:
             v, mask, w, _elig = chunk_valid(nm, a, b)
             if not mask.any():
@@ -734,9 +777,7 @@ def _compute_plain_impl(reader: _Reader, names, settings, time_name, time_is_dat
             cm = float(vv.mean())
             _merge_moments(mom_rows[nm], float(len(vv)), cm, float(((vv - cm) ** 2).sum()))
             if use_time:
-                ww = w[mask]
-                gmask = ww > gap
-                ww = np.where(gmask, 0.0, ww)
+                ww = w[mask]  # already zero for gaps (time_weights)
                 fine_time[nm] += np.bincount(idx, weights=ww, minlength=HIST_FINE_BINS)
                 tw = float(ww.sum())
                 if tw > 0:
@@ -936,10 +977,8 @@ def _accumulate_windows(reader: _Reader, names, edges: np.ndarray, gap: float, r
         n = b - a
         tt = t[:n]
         tok = np.isfinite(tt)
-        w = _durations(t, n)
-        gmask = w > gap
-        result.gap_count += int(np.count_nonzero(tok & gmask))
-        w = np.where(gmask, 0.0, w)
+        w, n_gaps = time_weights(t, n, gap)
+        result.gap_count += n_gaps
         if target is not None:
             inside = tok & target.contains(np.where(tok, tt, 0.0))
             wf = target.weights(tt, w, tok)
@@ -1168,4 +1207,106 @@ def _compute_bucket_impl(reader: _Reader, names, settings, time_name, time_is_da
         counts, _ = np.histogram(per_values[nm], bins=result.edges)
         infos[nm].counts = counts.astype(np.float64)
         result.variables.append(infos[nm])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Time of day (42.13)
+# ---------------------------------------------------------------------------
+
+
+def format_clock(seconds: float) -> str:
+    """"HH:MM" of a time of day given in seconds (wraps at 24 h)."""
+    s = int(round(seconds)) % DAY_S
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}"
+
+
+def _wall_seconds(starts: np.ndarray, is_datetime: bool) -> np.ndarray:
+    """Seconds after local midnight (wall clock) of each window start; a numeric axis has axis 0 as the
+    day start and no time zone (42.9)."""
+    if not is_datetime:
+        return np.mod(starts, DAY_S)
+    out = np.empty(len(starts))
+    for i, x in enumerate(starts.tolist()):
+        dt = _to_datetime(x, True)
+        out[i] = dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+    return out
+
+
+def _compute_timeofday(reader: _Reader, names, settings, time_name, time_is_datetime=True) -> HistogramResult:
+    with np.errstate(over="ignore", invalid="ignore"):
+        return _compute_timeofday_impl(reader, names, settings, time_name, time_is_datetime)
+
+
+def _compute_timeofday_impl(reader: _Reader, names, settings, time_name, time_is_datetime=True) -> HistogramResult:
+    """Fold the windows of length `slot_s` (the bucket computation of 42.3, windows tiled per local day
+    from the origin) onto one day: slots numbered by the wall-clock time of the window start, the
+    integral and the valid time of equal slots added (42.13). Windows are never "incomplete" here: the
+    sums are weighted by the valid time."""
+    if settings.tod_agg not in TOD_AGGREGATIONS:
+        raise HistogramError("bad_aggregation")
+    slot_s = float(settings.slot_s)
+    reason = validate_bucket(slot_s) if slot_s <= DAY_S else "bucket_not_divisor"
+    if reason:
+        raise HistogramError(reason)
+    n_slots = int(round(DAY_S / slot_s))
+    result = HistogramResult(settings, reader.row_start, reader.row_end, np.linspace(0.0, 1.0, HIST_MIN_BINS + 1),
+                             y_unit="slots", bins_auto=True, time_name=time_name)
+    result.slot_start = np.arange(n_slots, dtype=np.float64) * slot_s
+    tmin, tmax, gap = _scan_time(reader, settings)
+    result.gap_s = gap
+
+    def empty_var(nm: str, excluded: int = 0) -> VariableHistogram:
+        v = VariableHistogram(nm, np.zeros(HIST_MIN_BINS), excluded=excluded)
+        v.slot_values = np.full(n_slots, np.nan)
+        v.slot_valid_s = np.zeros(n_slots)
+        v.slot_days = np.zeros(n_slots, dtype=np.int64)
+        v.slot_partial_days = np.zeros(n_slots, dtype=np.int64)
+        return v
+
+    if not math.isfinite(tmin):
+        n_rows = max(0, reader.row_end - reader.row_start)
+        result.variables = [empty_var(nm, n_rows) for nm in names]
+        return result
+    edges = bucket_edges(tmin, tmax, slot_s, settings.origin_s, time_is_datetime)
+    tf = active_filter(settings)
+    target = None
+    if tf is not None:
+        target = build_target(tf, float(edges[0]), float(edges[-1]), time_is_datetime)
+        result.target_seconds = float(target.f(tmax) - target.f(tmin))
+    acc = _accumulate_windows(reader, names, edges, gap, result, target)
+    used = np.zeros(len(edges) - 1, dtype=bool)
+    for nm in names:
+        used |= acc[nm]["w"] > 0
+    slot_of = np.zeros(len(edges) - 1, dtype=np.int64)
+    if used.any():
+        wall = _wall_seconds(edges[:-1][used], time_is_datetime)
+        rel = np.mod(wall - settings.origin_s, DAY_S)
+        slot_of[used] = np.minimum(np.floor(rel / slot_s + 1e-9).astype(np.int64), n_slots - 1)
+    # What a window could hold at most: its length, or its target time under a time filter. A window
+    # with less valid time than that is a partial day (shown in the hover; ユーザー判断 2026-10-15, 42.13).
+    span = target.f(edges[1:]) - target.f(edges[:-1]) if target is not None else np.diff(edges)
+    unit = settings.integral_unit_s
+    for nm in names:
+        ac = acc[nm]
+        v = empty_var(nm, ac["ex"])
+        has = ac["w"] > 0
+        sel = np.flatnonzero(has)
+        v.slot_valid_s = np.bincount(slot_of[sel], weights=ac["w"][sel], minlength=n_slots)
+        sum_vw = np.bincount(slot_of[sel], weights=ac["vw"][sel], minlength=n_slots)
+        v.slot_days = np.bincount(slot_of[sel], minlength=n_slots).astype(np.int64)
+        partial = sel[ac["w"][sel] < span[sel] * (1 - 1e-9)]
+        v.slot_partial_days = np.bincount(slot_of[partial], minlength=n_slots).astype(np.int64)
+        got = v.slot_valid_s > 0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            if settings.tod_agg == "mean":
+                val = sum_vw / np.where(got, v.slot_valid_s, 1.0)
+            else:
+                val = sum_vw / unit
+                if settings.tod_per_day:
+                    val = val / np.where(got, v.slot_days, 1)
+        v.slot_values = np.where(got, val, np.nan)
+        v.n = int(v.slot_days.sum())
+        v.buckets_total = int(got.sum())
+        result.variables.append(v)
     return result

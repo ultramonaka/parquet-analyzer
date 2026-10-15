@@ -81,6 +81,7 @@ def log(qapp, isolated_config):
 @pytest.fixture
 def ctx(log, monkeypatch, sample_parquet_path, tmp_path):
     monkeypatch.setitem(features._EFFECTIVE, "histogram", True)
+    monkeypatch.setitem(features._EFFECTIVE, "parquet_export", True)  # export 57 (45.2 table rows)
     # the harness patches dialogs/loads first, so the start state's own opens are not counted
     win = MainWindow()
     harness = SideEffectHarness(win, monkeypatch)

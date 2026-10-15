@@ -211,7 +211,7 @@ recording a 1-minute burst at 10 ms intervals every 16 hours, about 13.15 millio
   `test_load_view_applies_matching_variables_even_when_others_are_missing`,
   `test_load_view_recomputes_derived_variables_from_the_newly_opened_file`
   (`tests/parquet_analyzer/test_load_robustness.py`).
-- **Wording of the grouped warning** (2026-10-09, dev notes item 33; found by the tests of old views in A4): previously, a derived variable that
+- **Wording of the grouped warning**: previously, a derived variable that
   could not be restored appeared **twice**, once as "derived variable" and once as "the series that drew it", and the heading did not fit when
   the cause was a missing function or map. The fixed form: the heading is "View "…": the following items could not be restored (the rest has been
   restored)". Each item appears once (a derived variable that was skipped does not also list its series). Items whose reason is known get it in
@@ -444,7 +444,7 @@ Requirement: 5.27 (external review #10, remaining task 13.3).
   error as before. Which one was used is logged (in the operation log's `details`).
 - The existing `path_type="relative"` branch (where `parquet_path` itself is relative) stays.
 - The remaining-task 13.3 item "the `relative` branch of `path_type` is never reached" is resolved
-  by this chapter and moved to dev notes.
+  by this chapter and moved to the resolved list.
 - Tests: opens from the same place; opens after moving the folder (the `data/` with data and
   views) elsewhere; the absolute path wins; the error when neither exists; when the relative path
   can't be made (`relative_path=None`).
@@ -518,9 +518,7 @@ Requirement: [5.42](#542-overwriting-an-existing-view-by-choosing-it-when-saving
 
 ### 54. Signal aliases (added 2026-10-14, user request)
 
-Requirement: [5.47](#547-signal-aliases-names-that-exist-only-inside-this-app-added-2026-10-14-user-request). Background: dev notes "view", item
-"when a signal is not found, assign a substitute signal" (after the impact was investigated on 2026-10-13, the specification was held, recommending
-option (B), "attach an alias to a file column"). Decision (2026-10-14, user): option (B), one dictionary for the whole app, the list shows only
+Requirement: [5.47](#547-signal-aliases-names-that-exist-only-inside-this-app-added-2026-10-14-user-request). Decision (2026-10-14, user): option (B), one dictionary for the whole app, the list shows only
 aliases, and assignment can be made both from the dedicated editing window and from the view's warning.
 
 **The implementation is split into two stages** (one stage = one branch): **stage 1** = 54.1 to 54.5 and 54.9 (dictionary, resolution, display in the
@@ -718,7 +716,34 @@ and **a global switch "Use signal aliases"** are both added.
   changes (the check box goes back). The "⚙ ▾" check box and the editing-window check box show the same state. "(disabled)" display and the unsaved mark in the editing window.
   Operation log. A view saved with aliases, loaded with the global switch OFF, shows the "not found" warning, and the marks in the view manager match (20.2). English and Japanese translations.
 
+#### 54.10 Decisions made in implementation (stage 2, 2026-10-15)
+
+- **When the button is not shown**: when the global switch "Use signal aliases" (54.9) is OFF, and when the dictionary cannot be read so cannot be saved (54.8), the button is not shown
+  and only the warning appears as before (assigning would have no effect, or could not be saved).
+- **How missing names are collected**: they are gathered in the context of `load_view` (the time-axis column name that is not in the file, and series variable names that are in neither the file nor the
+  derived variables). Of the names referenced (`referenced_names`) by the expressions of skipped derived variables, those that are none of the file's columns (including aliases), the view's
+  derived variables, functions or maps are added. Duplicates are removed and the order of appearance is kept.
+- **When the assignment screen opens**: when the button is pressed, the screen opens after the view's placement has finished and the warning has closed (`QTimer.singleShot(0)`)
+  (a reload cannot be run in the middle of the same view's placement).
+- **Choices**: the names that appear in the current file's list (54.2; including the time-axis column names), followed by the original column names that have aliases. When an alias in the list is chosen,
+  the dictionary gets the original column name that alias points to (aliases do not chain).
+- **When an alias of the same name already exists**: the row says "Add the column to the end of the candidates of alias X". If that alias is **disabled** (54.9), it says
+  "Add to candidates and re-enable the alias", and OK re-enables it (an explicit operation to resolve that name). A column that is already among the candidates is not added again.
+- **Reserved names**: rows are made unselectable by `callable_names()` (functions and maps; the names that cannot be used for aliases in 54.1). `reserved_names()` includes all aliases of the dictionary, so it is not used
+  (it would make even rows with the same name as an existing alias unselectable).
+- **Check on saving**: it goes through `save_signal_aliases` (54.4) as is. Disappearance or reassignment of an alias in use, a new alias with the same name as a current derived variable, and
+  a write failure are rejected, the reason is shown in a warning, and **no reload happens** (the dictionary does not change).
+- **When the alias edit screen (54.4) is open**: after saving, the list and the state are rebuilt. If the screen has **no** unsaved edits, the form of the selected alias is also reloaded from
+  the dictionary. **If it has, those edits are kept** (saving on that screen later overwrites that alias with the screen's contents).
+- **Operation log**: `signal_alias_assign_from_view` (`view`, `assigned` = pairs of [missing name, original column name]) is written, before saving, when OK is pressed on the screen and there is at least one assignment
+  (not written if only the button was pressed, the screen was closed, or everything is "do not assign"). The save itself is recorded separately by
+  `signal_alias_save`.
+- In tests, so that a hand-made `QMessageBox.exec()` does not wait forever, `conftest.py` has an autouse fixture that makes `QMessageBox.exec` return immediately
+  (warnings with a button are checked by replacing `messages.warning_with_button`).
+
 ## Relations to other domains
+
+- **Export** (export 57.7, 2026-10-15): the view manager gets "Export to Parquet...", which exports from a saved view without opening the view. The decision of which items are unusable uses the same function as the `load_view` skip and the "missing" marks.
 
 - **Plots** ([plots.md](./plots.md)): most of a view's content is the plot configuration. When the
   plots gain state, keep the schema, saving and loading in step.

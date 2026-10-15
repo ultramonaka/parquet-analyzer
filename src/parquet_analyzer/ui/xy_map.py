@@ -17,6 +17,7 @@ from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QLineEdit, QWidget
 
+from ..core import histogram as hist
 from ..core import map_grid as mg
 from ..core.map_grid import GridAxisSpec, GridCancelled, GridResult, MapGridError
 from .analysis_common import chunks
@@ -26,6 +27,8 @@ from .image_export import _FIG_DPI, _font_context
 from .plot_widget import _COLOR_CYCLE
 
 AXIS_MODES = ("step", "count")
+TIME_UNITS = ("s", "min", "h")  # units of the aggregate "time" (44.14); `hist.INTEGRAL_UNITS` has the seconds
+_TIME_W = "\0time_weight"  # the virtual column of the row durations in `compute_xy_map` (44.14)
 XY_EXCLUDED_DRAW_LIMIT = 20_000  # excluded points (grey crosses) drawn at most; more are thinned evenly (44.13)
 
 
@@ -66,6 +69,38 @@ class XYMapResult:
     excluded_points: list[tuple[np.ndarray, ...]] = field(default_factory=list)
     excluded_point_rows: list[np.ndarray] = field(default_factory=list)
     excluded_thinned: bool = False  # more excluded points than XY_EXCLUDED_DRAW_LIMIT: some are not drawn
+    # 44.14: agg "time": the unit of the cell values ("s" / "min" / "h"), the number of gaps (intervals above
+    # the gap threshold, counted once) and the code of the reason the time could not be computed
+    # (the time axis is not ascending; then `grids` is empty).
+    time_unit: str = "h"
+    gap_count: int = 0
+    time_refused: str | None = None
+
+    @property
+    def is_time(self) -> bool:
+        return self.agg == "time"
+
+    @property
+    def time_total(self) -> float:
+        """Summed time of the valid points inside the grid, in `time_unit` (agg "time")."""
+        return float(sum(g.total_time for g in self.grids[:1]))
+
+    def unit_text(self) -> str:
+        """The translated unit of the cell values ("" unless agg "time")."""
+        return tr(f"hist.unit_{self.time_unit}") if self.is_time else ""
+
+    @property
+    def value_label(self) -> str:
+        """Name of the shown value: the Z name, or "Time [h]" for agg "time" (colour bar, 3D axis, hover)."""
+        if self.is_time:
+            return tr("xy.map_time_label", unit=self.unit_text())
+        return self.z_name or "Z"
+
+    def value_text(self, v: float) -> str:
+        """A cell value as shown in the hover; with agg "time" followed by the unit ("1.25 h")."""
+        if not np.isfinite(v):
+            return "-"
+        return f"{v:.6g} {self.unit_text()}" if self.is_time else f"{v:.6g}"
 
     @property
     def is_curve(self) -> bool:
@@ -106,9 +141,12 @@ class XYMapResult:
         parts = [axis(self.x_spec, "X")]
         if self.y_spec is not None:
             parts.append(axis(self.y_spec, "Y"))
-        parts.append(tr("xy.map_agg") + ": " + tr(f"xy.agg_{self.agg}"))
-        parts.append(tr("xy.map_min_count") + f": {self.min_count}")
-        parts.append(tr("xy.map_fill") + ": " + tr(f"xy.fill_{self.fill}"))
+        if self.is_time:  # 44.14: the unit belongs in the legend; min. points and fill are not used
+            parts.append(tr("xy.map_agg") + ": " + tr("xy.agg_time") + f" [{self.unit_text()}]")
+        else:
+            parts.append(tr("xy.map_agg") + ": " + tr(f"xy.agg_{self.agg}"))
+            parts.append(tr("xy.map_min_count") + f": {self.min_count}")
+            parts.append(tr("xy.map_fill") + ": " + tr(f"xy.fill_{self.fill}"))
         if self.keep_sparse_empty:
             parts.append(tr("xy.map_keep_sparse"))
         if self.n_user_excluded:
@@ -167,6 +205,9 @@ def compute_xy_map(
     is_3d: bool = False,
     excluded_rows: np.ndarray | None = None,
     keep_sparse_empty: bool = False,
+    fetch_time: Callable[[int, int], np.ndarray] | None = None,
+    time_unit: str = "h",
+    time_scan_chunk_rows: int | None = None,
 ):
     """Aggregate rows [row_start, row_end) into a map (X, Y -> Z) or one curve per Y (X -> Y).
 
@@ -175,14 +216,44 @@ def compute_xy_map(
     (`median_refused` set when the median has too many points), or `CANCELLED`.
 
     `excluded_rows` (44.13): sorted unique file row numbers the user took out of the map; they are removed
-    inside `chunk_iter`, so the bounds scan, the counts and the values never see them."""
+    inside `chunk_iter`, so the bounds scan, the counts and the values never see them.
+
+    agg "time" (44.14): `fetch_time(a, b)` gives the time-axis stamps (seconds); each row weighs
+    `t[i+1] - t[i]` (0 for the last row and above the automatic gap, same functions as the histogram, 42.3)
+    and a cell's value is the summed weight in `time_unit`. Z is not used. The weights of a chunk are made
+    before the excluded rows are removed, so an excluded row's time is not given to its neighbour. A time
+    axis that is not ascending gives `time_refused` set and no grid. The gap scan uses the histogram's chunk
+    size (`time_scan_chunk_rows` overrides it in tests): the automatic gap is a median of per-chunk
+    medians, so it must not depend on the map's chunking. A row with a non-finite time stamp is dropped
+    and counted as non-finite, like the histogram does."""
     ex = np.empty(0, dtype=np.int64) if excluded_rows is None else np.asarray(excluded_rows, dtype=np.int64)
     ex = ex[(ex >= row_start) & (ex < row_end)]  # rows outside the range do not take part
     median_limit = mg.MAP_MEDIAN_MAX_POINTS if median_limit is None else median_limit
     n_rows = max(0, row_end - row_start)
     cache: dict[tuple[str, int, int], np.ndarray] = {}
+    timed = agg == "time"
+    if timed and (fetch_time is None or time_unit not in hist.INTEGRAL_UNITS):
+        raise ValueError("agg 'time' needs the time axis and a unit of s / min / h")
+    gap = [math.inf]  # automatic gap threshold, set by the time scan below
+    gap_seen: set[tuple[int, int]] = set()
+    n_gaps = [0]
+
+    def weights(a: int, b: int) -> np.ndarray:
+        t = np.asarray(fetch_time(a, min(b + 1, row_end)), dtype=np.float64)  # one row ahead (42.3)
+        w, ng = hist.time_weights(t, b - a, gap[0])
+        w = np.where(np.isfinite(t[: b - a]), w, np.nan)  # no time stamp: the row is not a valid point
+        if (a, b) not in gap_seen:  # the gaps are counted once, whichever pass reads the chunk first
+            gap_seen.add((a, b))
+            n_gaps[0] += ng
+        return w
 
     def get(name: str, a: int, b: int) -> np.ndarray:
+        if name == _TIME_W:
+            if n_rows <= chunk_rows:
+                if (name, a, b) not in cache:
+                    cache[(name, a, b)] = weights(a, b)
+                return cache[(name, a, b)]
+            return weights(a, b)
         if n_rows <= chunk_rows:  # one chunk: read once, reuse in every pass
             if (name, a, b) not in cache:
                 cache[(name, a, b)] = np.asarray(fetch(name, a, b), dtype=np.float64)
@@ -190,7 +261,13 @@ def compute_xy_map(
         return np.asarray(fetch(name, a, b), dtype=np.float64)
 
     series: list[tuple[str, list[str]]]
-    if kind == "map":
+    if timed:  # Z and the Y values are not used: the weight column takes the value's place (44.14)
+        if kind == "map":
+            series = [(f"{x_name}_{y_names[0]}_time", [x_name, y_names[0], _TIME_W])]
+        else:
+            series = [(f"{x_name}_time", [x_name, _TIME_W])]
+        z_name = None
+    elif kind == "map":
         series = [(z_name, [x_name, y_names[0], z_name])]
     else:
         series = [(y, [x_name, y]) for y in y_names]
@@ -214,10 +291,21 @@ def compute_xy_map(
 
     result = XYMapResult(kind, x_name, list(y_names), z_name if kind == "map" else None, row_start, row_end,
                          agg, min_count, fill, is_3d=is_3d, time_name=time_name, names=[n for n, _ in series],
-                         keep_sparse_empty=keep_sparse_empty, n_user_excluded=int(len(ex)))
+                         keep_sparse_empty=keep_sparse_empty, n_user_excluded=int(len(ex)), time_unit=time_unit)
     try:
-        if len(ex):  # before the early returns: the crosses are drawn even with no valid point (44.13 (7))
-            _read_excluded_points(result, series, get, ex, row_start, row_end, chunk_rows, cancelled)
+        if len(ex) and not (timed and kind == "curve"):  # before the early returns: the crosses are drawn
+            # even with no valid point (44.13 (7)); a curve of times has no point to draw (44.14)
+            _read_excluded_points(result, [(n, c[:-1] if timed else c) for n, c in series], get, ex,
+                                  row_start, row_end, chunk_rows, cancelled)
+        if timed:  # order check + automatic gap, before anything is drawn (44.14)
+            try:
+                _t0, _t1, gap[0] = hist.scan_time_axis(fetch_time, row_start, row_end, time_scan_chunk_rows,
+                                                       cancelled)
+            except hist.HistogramError as exc:
+                result.time_refused = exc.code
+                return result
+            except hist.Cancelled:
+                return CANCELLED
         # pass 1: counts and bounds (round default ranges, valid-point total for the median)
         scans = [mg.scan_bounds(chunk_iter(cols), cancelled) for _, cols in series]
         # Points are rows, not rows x series (44.10): the series with the most valid rows, with its own
@@ -258,22 +346,28 @@ def compute_xy_map(
                     if len(idx):
                         sel = idx[((counter[0] + np.arange(len(idx))) % stride) == 0]
                         counter[0] += len(idx)
-                        kept.append(tuple(a[sel] for a in arrs))
+                        drawn = arrs[:-1] if timed else arrs  # the weight column is not a coordinate
+                        kept.append(tuple(a[sel] for a in drawn))
                         # file row numbers of the drawn points (44.13): positions in the filtered chunk
                         # map back through the keep mask
                         kept_rows.append(first + (sel if keep is None else np.flatnonzero(keep)[sel]).astype(np.int64))
                     yield chunk
 
             grid = mg.grid_aggregate(sampled(split_chunks(cols)), x_axis, y_axis, agg, min_count, fill,
-                                     cancelled, median_limit, keep_sparse_empty)
+                                     cancelled, median_limit, keep_sparse_empty,
+                                     time_unit_s=hist.INTEGRAL_UNITS[time_unit])
             result.grids.append(grid)
             result.n_outside += grid.n_outside
-            pts = tuple(np.concatenate([k[j] for k in kept]) if kept else np.empty(0) for j in range(len(cols)))
+            n_pts = len(cols) - 1 if timed else len(cols)
+            if timed and kind == "curve":  # a curve of time has no point (x, value) to overlay
+                kept, kept_rows, n_pts = [], [], 2
+            pts = tuple(np.concatenate([k[j] for k in kept]) if kept else np.empty(0) for j in range(n_pts))
             result.points.append(pts)
             result.point_rows.append(np.concatenate(kept_rows) if kept_rows else np.empty(0, dtype=np.int64))
             shown = max(shown, len(pts[0]))  # rows, like n_valid (44.10)
-        if shown < result.n_valid:
+        if shown < result.n_valid and not (timed and kind == "curve"):
             result.thinned = (shown, result.n_valid)
+        result.gap_count = n_gaps[0]
     except GridCancelled:
         return CANCELLED
     return result
@@ -341,8 +435,8 @@ def map_hover_text(r: XYMapResult, x: float, y: float, hidden=frozenset()) -> st
             return ""
         idx = (int(iy[0]), int(ix[0]))
         v = g.value[idx]
-        return tr("xy.map_hover", x=_g(g.x_axis[idx[1]]), y=_g(g.y_axis[idx[0]]), z=r.z_name or "Z",
-                  value="-" if not np.isfinite(v) else _g(v), count=int(g.count[idx]), state=cell_state(g, idx))
+        return tr("xy.map_hover", x=_g(g.x_axis[idx[1]]), y=_g(g.y_axis[idx[0]]), z=r.value_label if not r.is_time else tr("xy.map_time_name"),
+                  value=r.value_text(v), count=int(g.count[idx]), state=cell_state(g, idx))
     parts = []
     for name, g in zip(r.names, r.grids):
         if name in hidden:
@@ -352,7 +446,7 @@ def map_hover_text(r: XYMapResult, x: float, y: float, hidden=frozenset()) -> st
             continue
         i = int(ix[0])
         v = g.value[i]
-        parts.append(tr("xy.curve_hover", name=name, x=_g(g.x_axis[i]), value="-" if not np.isfinite(v) else _g(v),
+        parts.append(tr("xy.curve_hover", name=name, x=_g(g.x_axis[i]), value=r.value_text(v),
                         count=int(g.count[i]), state=cell_state(g, (i,))))
     return "   ".join(parts)
 
@@ -485,7 +579,7 @@ def build_xy_map_figure(r: XYMapResult, stamp_lines, size_px, hidden=frozenset()
                         ex_x, ex_v = r.excluded_points[i]
                         ax.scatter(ex_x, ex_v, s=14, marker="x", color="0.3", linewidths=1.2)
             ax.set_xlabel(r.x_name)
-            ax.set_ylabel(", ".join(n for n in r.names if n not in hidden))
+            ax.set_ylabel(r.value_label if r.is_time else ", ".join(n for n in r.names if n not in hidden))
             if any(n not in hidden for n in r.names):
                 ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
             ax.grid(True, alpha=0.3)
@@ -501,7 +595,7 @@ def build_xy_map_figure(r: XYMapResult, stamp_lines, size_px, hidden=frozenset()
             levels = r.color_range() or (0.0, 1.0)  # same levels as the screen (44.10)
             mesh = ax.pcolormesh(xe, ye, np.ma.masked_invalid(g.value), cmap="viridis", vmin=levels[0],
                                  vmax=levels[1] if levels[1] > levels[0] else levels[0] + 1.0, rasterized=True)
-            fig.colorbar(mesh, ax=ax, label=r.z_name or "Z")
+            fig.colorbar(mesh, ax=ax, label=r.value_label)
             rects = [Rectangle((xe[a], ye[iy]), xe[b + 1] - xe[a], ye[iy + 1] - ye[iy])
                      for iy, a, b in filled_runs(g.filled_mask)]
             if rects:  # hatched cells = values filled in, not measured (44.3)
@@ -527,8 +621,8 @@ def build_xy_map_figure(r: XYMapResult, stamp_lines, size_px, hidden=frozenset()
             ax.view_init(elev=view_angles[0], azim=view_angles[1])
             ax.set_xlabel(r.x_name)
             ax.set_ylabel(r.y_names[0])
-            ax.set_zlabel(r.z_name or "Z")
-            fig.colorbar(surf, ax=ax, shrink=0.7, pad=0.1, label=r.z_name or "Z")
+            ax.set_zlabel(r.value_label)
+            fig.colorbar(surf, ax=ax, shrink=0.7, pad=0.1, label=r.value_label)
         if stamp_lines:
             fig.text(0.995, 0.004, "\n".join(stamp_lines), ha="right", va="bottom", fontsize=7, color="#666666")
     return fig

@@ -24,6 +24,7 @@ def test_defaults_match_spec():
         "big_d_time_index": True,
         "map_from_xy": True,
         "map_exclude_points": False,
+        "parquet_export": True,
     }
 
 

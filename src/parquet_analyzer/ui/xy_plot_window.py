@@ -528,6 +528,8 @@ class XYPlotWindow(XYMapViewMixin, AnalysisWindow):
         self._z_combo.setEnabled(mode3d or (single_y and self._color_mode() == "z"))
 
     def _on_setting_changed(self, *_a) -> None:
+        if self._map_enabled and self._time_agg() and self.sender() is self._z_combo:
+            return  # the aggregate "time" does not use Z: nothing to recompute (44.14)
         self._forget_grids_if_variables_changed()
         self._apply_color_constraints()
         self._apply_map_constraints()
@@ -706,6 +708,10 @@ class XYPlotWindow(XYMapViewMixin, AnalysisWindow):
         else:
             self._show_3d(result)
 
+    def _time_order_parts(self) -> list[str]:
+        """56.1: a short warning next to the range display when the time axis is not ascending."""
+        return [tr("time_order.range_warning_short")] if self._main.time_order_unreliable() else []
+
     def _range_text(self, r) -> str:
         main = self._main
         times = main._time_values
@@ -722,6 +728,7 @@ class XYPlotWindow(XYMapViewMixin, AnalysisWindow):
         else:
             excluded = str(r.excluded)
         parts = [
+            *self._time_order_parts(),
             tr("xy.status_range", range=self._range_text(r), rows=r.row_end - r.row_start),
             tr("xy.status_points", points=r.total_valid, excluded=excluded),
         ]
@@ -771,6 +778,7 @@ class XYPlotWindow(XYMapViewMixin, AnalysisWindow):
 
     def _update_status_3d(self, r: Xyz3DResult) -> None:
         parts = [
+            *self._time_order_parts(),
             tr("xy.status_range", range=self._range_text(r), rows=r.row_end - r.row_start),
             tr("xyz.status_points", points=r.valid, excluded=r.excluded),
         ]

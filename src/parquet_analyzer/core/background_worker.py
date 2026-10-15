@@ -25,15 +25,23 @@ class _Relay(QObject):
     """
 
     done = Signal(object, int, object, str)  # (hub weakref, token, result, error message or "")
+    # (hub weakref, progress key, done, total): a running job's progress (export.ja.md 57.3)
+    progress = Signal(object, int, int, int)
 
     def __init__(self):
         super().__init__()
         self.done.connect(self._deliver)
+        self.progress.connect(self._deliver_progress)
 
     def _deliver(self, hub_ref, token: int, result: object, error: str) -> None:
         hub = hub_ref()
         if hub is not None:
             hub._deliver(token, result, error)
+
+    def _deliver_progress(self, hub_ref, key: int, done: int, total: int) -> None:
+        hub = hub_ref()
+        if hub is not None:
+            hub._deliver_progress(key, done, total)
 
 
 _relay: _Relay | None = None
@@ -94,7 +102,7 @@ class _Task:
 
 class WorkerHub:
     """Runs jobs off the UI thread and hands each result (or failure) back to the UI thread
-    (detailed_specification.md 37.1; 10章/28.1; dev notes 13.6). Replaces `BackgroundWorker`.
+   . Replaces `BackgroundWorker`.
 
     A plain Python object owned by its owner (plot, main window); not a QObject and not a
     signal sender (the module's `_Relay` is). `pending` maps token -> (on_finished, on_failed):
@@ -106,7 +114,26 @@ class WorkerHub:
     def __init__(self, pool: QThreadPool | None = None):
         self._pool = pool if pool is not None else QThreadPool.globalInstance()
         self.pending: dict[int, tuple[Callable[[object], None], Callable[[str], None]]] = {}
+        self._progress: dict[int, Callable[[int, int], None]] = {}
         _get_relay()
+
+    def progress_sink(self, callback: Callable[[int, int], None]) -> tuple[int, Callable[[int, int], None]]:
+        """(key, emit) for a job that reports progress (export.ja.md 57.3): `emit(done, total)` may
+        be called from a pool thread; `callback(done, total)` then runs on the UI thread, through
+        the relay (the worker never touches a widget). Call `drop_progress(key)` when the job is over;
+        a report arriving after that is ignored."""
+        key = next(_tokens)
+        self._progress[key] = callback
+        relay_signal = _get_relay().progress
+        hub_ref = weakref.ref(self)
+
+        def emit(done: int, total: int) -> None:
+            relay_signal.emit(hub_ref, key, int(done), int(total))
+
+        return key, emit
+
+    def drop_progress(self, key: int) -> None:
+        self._progress.pop(key, None)
 
     def submit(
         self,
@@ -128,6 +155,11 @@ class WorkerHub:
     def cancel(self, token: int) -> None:
         """Forget `token`: its result, when it arrives, is ignored (the job itself still runs)."""
         self.pending.pop(token, None)
+
+    def _deliver_progress(self, key: int, done: int, total: int) -> None:
+        callback = self._progress.get(key)
+        if callback is not None:
+            callback(done, total)
 
     def _deliver(self, token: int, result: object, error: str) -> None:
         callbacks = self.pending.pop(token, None)  # pop first: a callback re-submitting is safe

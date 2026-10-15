@@ -23,14 +23,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..core.expression import (
-    ExpressionError,
-    UnknownFunctionError,
-    referenced_functions,
-    referenced_names,
-)
-from ..core.functions import check_expression_calls
-from ..core.variable import dependency_order
+from .. import features
+from ..core.view_check import Problem, classify_derived, effective_available
 from ..io import view as view_io
 from . import messages
 from .i18n import tr
@@ -74,6 +68,9 @@ def _actual_text(kind: str) -> str:
 
 class ViewManagerDialog(QDialog):
     viewDeleted = Signal(str)
+    # `exec()` result when "Export to Parquet..." was pressed (export 57.7.1): not Accepted (= load),
+    # not Rejected; `selected_view_name()` is the view to export from.
+    EXPORT_RESULT = 2
 
     def __init__(
         self,
@@ -111,6 +108,9 @@ class ViewManagerDialog(QDialog):
         self.details.setIndentation(16)
         self.load_button = QPushButton(tr("view.load_button"))
         self.delete_button = QPushButton(tr("view.delete_button"))
+        self.export_button = QPushButton(tr("view.export_button"))
+        self.export_button.setObjectName("view_export_button")
+        self.export_button.setVisible(features.is_enabled("parquet_export"))  # developer feature flag (export 57.1)
         self.close_button = QPushButton(tr("view.close_button"))
 
         body = QHBoxLayout()
@@ -119,6 +119,7 @@ class ViewManagerDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         buttons.addWidget(self.load_button)
+        buttons.addWidget(self.export_button)
         buttons.addWidget(self.delete_button)
         buttons.addWidget(self.close_button)
         layout = QVBoxLayout(self)
@@ -130,6 +131,7 @@ class ViewManagerDialog(QDialog):
         self.view_list.currentItemChanged.connect(lambda *_: self._refresh_details())
         self.view_list.itemDoubleClicked.connect(lambda *_: self.load_selected())
         self.load_button.clicked.connect(self.load_selected)
+        self.export_button.clicked.connect(self.export_selected)
         self.delete_button.clicked.connect(self.delete_selected)
         self.close_button.clicked.connect(self.reject)
         if self.view_list.count():
@@ -144,6 +146,11 @@ class ViewManagerDialog(QDialog):
     def load_selected(self) -> None:
         if self.load_button.isEnabled():
             self.accept()
+
+    def export_selected(self) -> None:
+        """Hand the selected view to the Parquet export (57.7.1); works without an open file."""
+        if self.export_button.isEnabled():
+            self.done(self.EXPORT_RESULT)
 
     def delete_selected(self) -> None:
         name = self.selected_view_name()
@@ -170,6 +177,7 @@ class ViewManagerDialog(QDialog):
         name = self.selected_view_name()
         self.delete_button.setEnabled(name is not None)
         self.load_button.setEnabled(False)
+        self.export_button.setEnabled(False)
         if name is None:
             self.details.addTopLevelItem(QTreeWidgetItem([tr("view.none_saved")]))
             return
@@ -183,6 +191,7 @@ class ViewManagerDialog(QDialog):
             self.details.addTopLevelItem(item)
             return
         self.load_button.setEnabled(True)
+        self.export_button.setEnabled(True)
 
         n_missing = len(missing_series) + len(missing_derived) + (1 if self._time_column_missing(view) else 0)
         if n_missing:
@@ -247,51 +256,37 @@ class ViewManagerDialog(QDialog):
             and self._all_columns is not None
             and view.time_column in self._all_columns
         ):
-            source = self._aliases.get(view.time_column, view.time_column)
-            axis = {view.time_column, source, *(a for a, src in self._aliases.items() if src == source)}
-            return self._all_columns - axis
+            return effective_available(self._all_columns, self._aliases, view.time_column)
         return self._available
 
     def _missing(self, view: view_io.View) -> tuple[set[str], set[str]]:
         """Series variables / derived names that `MainWindow.load_view` would skip,
         cascading the way a load does: a derived variable depending on a missing one
-        is missing too (detailed_specification.md 20.2). Empty when no file is open."""
+        is missing too (detailed_specification.md 20.2). Empty when no file is open.
+        The rule itself is `core.view_check.classify_derived`, shared with load_view and
+        the Parquet export from a saved view (export 57.7.3)."""
         if self._available is None:
             return set(), set()
         available = self._effective_available(view)
         exprs = {d.name: d.expression for d in view.derived_variables}
+        problems = classify_derived(
+            exprs, available, alias_names=self._alias_names, registry=self._registry, functions=self._functions
+        )
         self._missing_function = {}
-        resolvable: set[str] = set()
-        missing_derived: set[str] = set()
-        for name in dependency_order(exprs):
-            if name in self._alias_names:
-                missing_derived.add(name)
-                continue
-            try:
-                refs = referenced_names(exprs[name])  # also the syntax check: plain "missing" if it fails
-                absent = sorted(referenced_functions(exprs[name]) - self._functions) if self._functions is not None else []
-            except ExpressionError:
-                missing_derived.add(name)
-                continue
-            if self._registry is not None:  # unknown function / wrong arity / bad keyword (what evaluation rejects)
-                try:
-                    check_expression_calls(exprs[name], self._registry)
-                except UnknownFunctionError as e:
-                    missing_derived.add(name)
-                    self._missing_function[name] = tr("error.unknown_function", name=e.name)
-                    continue
-                except ExpressionError as e:
-                    missing_derived.add(name)
-                    self._missing_function[name] = str(e)
-                    continue
-            if absent:
-                missing_derived.add(name)
-                self._missing_function[name] = tr("error.unknown_function", name=absent[0])
-                continue
-            if all(r in available or r in resolvable for r in refs):
-                resolvable.add(name)
-            else:
-                missing_derived.add(name)
-        known = available | resolvable
+        for name, problem in problems.items():
+            if problem is not None and problem.kind in ("unknown_function", "call"):
+                self._missing_function[name] = problem_text(problem)
+        missing_derived = {n for n, p in problems.items() if p is not None}
+        known = available | {n for n, p in problems.items() if p is None}
         missing_series = {s.variable for p in view.plots for s in p.series if s.variable not in known}
         return missing_series, missing_derived
+
+
+def problem_text(problem: Problem) -> str:
+    """User-facing reason for an unusable view item (shared by the view manager and the export
+    dialog, 57.7.3)."""
+    if problem.kind == "unknown_function":
+        return tr("error.unknown_function", name=problem.detail)
+    if problem.kind == "call":
+        return problem.detail
+    return tr(f"view.problem_{problem.kind}", name=problem.detail)

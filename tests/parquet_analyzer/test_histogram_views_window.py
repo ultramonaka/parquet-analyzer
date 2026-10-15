@@ -170,7 +170,7 @@ def test_view_combo_is_first_in_the_panel(qapp, mw):
     assert w._view_combo.objectName() == "histogram_view"
     first = w._flow.itemAt(0).widget()
     assert w._view_combo in first.findChildren(type(w._view_combo))
-    assert [w._view_combo.itemData(i) for i in range(w._view_combo.count())] == ["dist", "duration", "trend"]
+    assert [w._view_combo.itemData(i) for i in range(w._view_combo.count())] == ["dist", "duration", "trend", "timeofday"]
     assert w.view() == "dist"  # the default
     assert w._result.settings.view == "dist"
 

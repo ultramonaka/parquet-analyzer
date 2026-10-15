@@ -250,10 +250,12 @@ def test_time_switch_and_fallback(qapp, isolated_config, monkeypatch, big):
     assert win._time_values.column == "time"
     win.set_time_column("dec")  # descending: cannot be indexed -> old resident path + warning
     assert isinstance(win._time_values, np.ndarray)
-    assert not win._time_order_label.isHidden()
+    assert not win._time_order_label.isHidden() and not win._time_order_report.ok
     win.set_time_column("time")
     assert isinstance(win._time_values, TimeIndex)
-    assert win._time_order_label.isHidden()
+    # _times() has duplicate runs: the label shows a note (56.2) but the order is fine
+    assert win._time_order_report.ok and win._time_order_report.duplicate_count > 0
+    assert win._time_order_report.decreasing_count == 0 and win._time_order_label.text().count("\u26a0") == 1
     win.close()
 
 

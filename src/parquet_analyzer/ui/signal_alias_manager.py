@@ -200,6 +200,13 @@ class SignalAliasManagerWindow(QDialog):
         self._rebuild_list()
         self._update_state()
 
+    def reload_from_dictionary(self) -> None:
+        """The dictionary was changed from outside (54.6): show the stored entry again unless the
+        form has unsaved edits, which are kept (saving them later rewrites that one alias)."""
+        if not self._dirty() and not self._is_new and self._shown in self._mw.signal_aliases:
+            self._load_form(self._shown)
+        self.refresh_status()
+
     def _on_row_changed(self, row: int) -> None:
         if self._loading:
             return

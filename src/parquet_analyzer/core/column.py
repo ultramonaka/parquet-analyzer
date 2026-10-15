@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Protocol
 
@@ -9,6 +10,7 @@ import numpy as np
 from .expression import ExpressionError
 from .numeric import NonNumericColumnError, to_numeric
 from .pyramid import DEFAULT_BUCKET_ROWS, ColumnPyramid, build_pyramid, build_pyramid_from_windows
+from .time_index import ANCHOR_ROWS
 
 if TYPE_CHECKING:
     from .data_source import ParquetDataSource
@@ -17,6 +19,18 @@ logger = logging.getLogger(__name__)
 
 MAX_PYRAMID_FAILURES = 3  # detailed_specification.md 28.2: give up on a column's pyramid after this many failed builds
 _UNSET = object()  # sentinel distinguishing "bounds not looked up yet" from "no bounds exist"
+
+
+def _pyramid_misalignment(pyramid: ColumnPyramid) -> str | None:
+    """Why `pyramid` cannot be used, or None if it is fine (data 59.2): bucket starts must be
+    exactly 0, ANCHOR_ROWS, 2*ANCHOR_ROWS, ... (no gap, on the TimeIndex anchor grid), because
+    drawing looks bucket start times up in the time axis via the anchors (O(1), no disk read)."""
+    n = len(pyramid.row_starts)
+    if len(pyramid.mins) != n or len(pyramid.maxs) != n:
+        return f"mins/maxs/row_starts lengths differ ({len(pyramid.mins)}/{len(pyramid.maxs)}/{n})"
+    if n and not np.array_equal(pyramid.row_starts, np.arange(n, dtype=np.int64) * ANCHOR_ROWS):
+        return f"bucket starts are not 0, {ANCHOR_ROWS}, {2 * ANCHOR_ROWS}, ... (first {pyramid.row_starts[:3].tolist()})"
+    return None
 
 
 def _numeric_column(raw: np.ndarray, name: str) -> np.ndarray:
@@ -66,20 +80,39 @@ class LazyColumn:
     over-threshold case, Phase D). A file with 20 columns of which the user only
     ever plots 2 now only ever materializes those 2, instead of all 20 at open
     time.
+
+    `values()` may be called from a worker thread (a DeferredColumn computing, expressions 55.2):
+    the read-and-cache is under a lock so two threads never read the same column twice.
     """
 
-    __slots__ = ("_data_source", "_name", "_array")
+    __slots__ = ("_data_source", "_name", "_array", "_lock")
 
     def __init__(self, data_source: ParquetDataSource, name: str):
         self._data_source = data_source
         self._name = name
         self._array: np.ndarray | None = None
+        self._lock = threading.Lock()
 
     def values(self) -> np.ndarray:
-        if self._array is None:
-            raw = self._data_source.read_columns([self._name])[self._name]
-            self._array = _numeric_column(raw, self._name)
-        return self._array
+        arr = self._array
+        if arr is not None:
+            return arr
+        with self._lock:
+            if self._array is None:
+                raw = self._data_source.read_columns([self._name])[self._name]
+                self._array = _numeric_column(raw, self._name)
+            return self._array
+
+    def peek(self, row_start: int, row_end: int) -> np.ndarray:
+        """Rows [row_start, row_end) without caching the column (expressions 55.2): the
+        probe of a DeferredColumn must not cost a whole-column read. Uses the cache if filled."""
+        arr = self._array
+        if arr is not None:
+            return arr[row_start:row_end]
+        if row_end <= row_start:
+            return np.array([], dtype=np.float64)
+        raw = self._data_source.read_columns([self._name], row_start, row_end)[self._name]
+        return _numeric_column(raw, self._name)
 
     def window(self, row_start: int, row_end: int) -> np.ndarray:
         return self.values()[row_start:row_end]
@@ -197,6 +230,13 @@ class WindowedColumn:
         return self._pyramid_failures >= MAX_PYRAMID_FAILURES
 
     def set_pyramid(self, pyramid: ColumnPyramid) -> None:
+        """Accept the built pyramid. One that is not on the anchor grid (data 59.2) is refused and
+        counted as a failed build (28.2): drawing then falls back to real reads."""
+        reason = _pyramid_misalignment(pyramid)
+        if reason is not None:
+            logger.error("pyramid for column %r rejected: %s", self._name, reason)
+            self.pyramid_failed()
+            return
         self._pyramid = pyramid
         self._pyramid_building = False
 
@@ -340,9 +380,133 @@ class DerivedColumn:
         return self._pyramid_failures >= MAX_PYRAMID_FAILURES
 
     def set_pyramid(self, pyramid: ColumnPyramid) -> None:
+        reason = _pyramid_misalignment(pyramid)  # data 59.2: same guard as WindowedColumn
+        if reason is not None:
+            logger.error("pyramid for derived column %r rejected: %s", self.expression, reason)
+            self.pyramid_failed()  # also tells the listeners (ok=False)
+            return
         self._pyramid = pyramid
         self._pyramid_building = False
         self._notify_pyramid(True)
+
+
+def peek_column(column: Column, row_start: int, row_end: int) -> np.ndarray:
+    """Rows [row_start, row_end) of `column` for a trial computation, without making the column
+    resident when it has a cheaper way (`peek`): LazyColumn reads just the range, a not yet
+    computed DeferredColumn evaluates its expression on the range. Other columns: `window`."""
+    peek = getattr(column, "peek", None)
+    return peek(row_start, row_end) if peek is not None else column.window(row_start, row_end)
+
+
+class _PeekVariables(Mapping[str, np.ndarray]):
+    """The variables of a DeferredColumn's trial computation: the first rows of each input,
+    read with `peek_column` on first lookup. A non-numeric input becomes an ExpressionError,
+    as in LazyVariables."""
+
+    __slots__ = ("_inputs", "_start", "_end", "_cache")
+
+    def __init__(self, inputs: Mapping[str, Column], start: int, end: int):
+        self._inputs = inputs
+        self._start = start
+        self._end = end
+        self._cache: dict[str, np.ndarray] = {}
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        if key not in self._cache:
+            try:
+                self._cache[key] = peek_column(self._inputs[key], self._start, self._end)
+            except NonNumericColumnError as e:
+                raise ExpressionError(str(e)) from e
+        return self._cache[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._inputs
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._inputs)
+
+    def __len__(self) -> int:
+        return len(self._inputs)
+
+
+class DeferredColumn:
+    """A derived variable whose full computation is postponed (expressions 55.2): created with
+    its expression, input columns, row count and an immutable registry snapshot, validated at
+    creation by a trial computation on the first `probe_rows` rows (same all-or-nothing point
+    as the eager path), and computed in full on the first `values()` / `compute()` -- by a
+    background job (MainWindow.load_view) or, if nothing computed it before, by whoever needs
+    it first on the UI thread.
+
+    `values()` is thread-safe: the computation and the cached result are under a lock, so two
+    threads never compute it twice. Inputs are only locked one at a time and form a DAG, so
+    chained DeferredColumns cannot deadlock.
+    """
+
+    def __init__(
+        self, expression: str, inputs: Mapping[str, Column], n_rows: int, registry, probe_rows: int = 1000
+    ):
+        from .expression import evaluate_expression, referenced_names
+
+        self.expression = expression
+        self.n_rows = n_rows
+        self.registry = registry
+        names = referenced_names(expression)  # ExpressionError on bad syntax
+        self.inputs: dict[str, Column] = {n: inputs[n] for n in names if n in inputs}
+        self._array: np.ndarray | None = None
+        self._lock = threading.Lock()
+        # Trial computation: unknown names / functions, a bad shape and so on raise here.
+        probe = max(0, min(n_rows, probe_rows))
+        self._probe = self._shape(
+            evaluate_expression(expression, _PeekVariables(self.inputs, 0, probe), registry), probe
+        )
+
+    @staticmethod
+    def _shape(value, n: int) -> np.ndarray:
+        """1-D float64 of length n (a scalar is broadcast), else ExpressionError (same rule as
+        MainWindow._series_value)."""
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.ndim == 0:
+            return np.full(n, float(arr))
+        if arr.shape != (n,):
+            raise ExpressionError(f"bad result shape {arr.shape} for {n} rows")
+        return arr
+
+    @property
+    def is_ready(self) -> bool:
+        return self._array is not None
+
+    def values(self) -> np.ndarray:
+        arr = self._array
+        if arr is not None:
+            return arr
+        from .expression import evaluate_expression
+
+        with self._lock:
+            if self._array is None:
+                value = evaluate_expression(self.expression, LazyVariables(self.inputs), self.registry)
+                self._array = self._shape(value, self.n_rows)
+            return self._array
+
+    def compute(self) -> np.ndarray:
+        """`values()` under the name background jobs call."""
+        return self.values()
+
+    def peek(self, row_start: int, row_end: int) -> np.ndarray:
+        """For another column's trial computation: the slice of the result if it is computed,
+        else the trial result of the first rows (an approximation, only ever used to validate)."""
+        if self._array is not None:
+            return self._array[row_start:row_end]
+        if row_start == 0 and row_end <= len(self._probe):
+            return self._probe[:row_end]
+        from .expression import evaluate_expression
+
+        value = evaluate_expression(
+            self.expression, _PeekVariables(self.inputs, row_start, row_end), self.registry
+        )
+        return self._shape(value, max(0, row_end - row_start))
+
+    def window(self, row_start: int, row_end: int) -> np.ndarray:
+        return self.values()[row_start:row_end]
 
 
 def make_derived_column(
@@ -363,6 +527,8 @@ def make_derived_column(
         return None
     if n_rows <= 0 or not names or any(n not in columns for n in names):
         return None
+    if any(isinstance(columns[n], DeferredColumn) and not columns[n].is_ready for n in names):
+        return None  # its probe would compute the whole input; the caller defers this one too (55.2)
     if not any(isinstance(columns[n], (WindowedColumn, DerivedColumn)) for n in names):
         return None
     name_margins = {n: (columns[n].margin if isinstance(columns[n], DerivedColumn) else (0, 0)) for n in names}

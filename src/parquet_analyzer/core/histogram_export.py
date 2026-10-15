@@ -22,7 +22,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .histogram import HistogramResult
+from .histogram import HistogramResult, format_clock
 
 METADATA_KEY = "parquet_analyzer"
 HOUR_S = 3600.0
@@ -75,7 +75,12 @@ def local_datetime_ms(x: np.ndarray) -> np.ndarray:
 
 def build_columns(result: HistogramResult, time_is_datetime: bool) -> tuple[dict[str, np.ndarray], dict]:
     """(ordered columns, name map {window_start, window_end, variables: {variable: value column}}). Values are numpy arrays: float64 / bool / datetime64[ms]
-    (a datetime axis; NaT = null). Raises ExportError when the result has no bucket table."""
+    (a datetime axis; NaT = null). Raises ExportError when the result has no bucket table.
+    The time-of-day view (42.13) writes one row per slot instead: `slot_start` ("HH:MM" text), then per
+    variable `<name>` (the slot value, null = none), `<name>_valid_s` (valid time summed over the days) and
+    `<name>_days`."""
+    if result.settings.view == "timeofday":
+        return _build_slot_columns(result)
     if result.bucket_start is None or not len(result.bucket_start):
         raise ExportError("no_buckets")
     conv = local_datetime_ms if time_is_datetime else (lambda a: np.asarray(a, dtype=np.float64))
@@ -106,10 +111,39 @@ def build_columns(result: HistogramResult, time_is_datetime: bool) -> tuple[dict
     return cols, mapping
 
 
+def _build_slot_columns(result: HistogramResult) -> tuple[dict[str, np.ndarray], dict]:
+    if result.slot_start is None or not len(result.slot_start):
+        raise ExportError("no_buckets")
+    origin = result.settings.origin_s
+    cols: dict[str, np.ndarray] = {"slot_start": np.array([format_clock(origin + float(x)) for x in result.slot_start])}
+    used = ["slot_start"]
+    var_cols: dict[str, str] = {}
+    valid_cols: dict[str, str] = {}
+    days_cols: dict[str, str] = {}
+    for v in result.variables:
+        got = []
+        for nm in (v.name, v.name + "_valid_s", v.name + "_days"):
+            cand, k = nm, 1
+            while cand in used:
+                k += 1
+                cand = f"{nm}_{k}"
+            used.append(cand)
+            got.append(cand)
+        cols[got[0]] = np.asarray(v.slot_values, dtype=np.float64)
+        cols[got[1]] = np.asarray(v.slot_valid_s, dtype=np.float64)
+        cols[got[2]] = np.asarray(v.slot_days, dtype=np.int64)
+        var_cols[v.name], valid_cols[v.name], days_cols[v.name] = got
+    return cols, {"slot_start": "slot_start", "variables": var_cols, "valid_s": valid_cols, "days": days_cols}
+
+
 def build_table(cols: dict[str, np.ndarray]) -> pa.Table:
     arrays, names = [], []
     for name, arr in cols.items():
-        if arr.dtype.kind == "M":
+        if arr.dtype.kind == "U":
+            arrays.append(pa.array(arr.tolist(), type=pa.string()))
+        elif arr.dtype.kind == "i":
+            arrays.append(pa.array(arr, type=pa.int64()))
+        elif arr.dtype.kind == "M":
             arrays.append(pa.array(arr, type=pa.timestamp("ms"), mask=np.isnat(arr)))
         elif arr.dtype.kind == "f":
             arrays.append(pa.array(arr, type=pa.float64(), mask=np.isnan(arr)))
@@ -152,7 +186,13 @@ def build_metadata(
             "end": f"{tf.end_s // 3600}:{tf.end_s % 3600 // 60:02d}", "weekdays": list(tf.weekdays),
             "target_seconds": result.target_seconds,
         }
-    return {
+    tod = None
+    if s.view == "timeofday":  # 42.13: the slot settings behind the table
+        tod = {"slot_s": s.slot_s, "origin_s": s.origin_s, "aggregation": s.tod_agg,
+               "per_day": bool(s.tod_per_day)}
+        if s.tod_agg == "integral":
+            tod["integral_unit_s"] = s.integral_unit_s
+    meta = {
         "app": "ParquetAnalyzer",
         "app_version": app_version,
         "source_path": source_path,
@@ -161,13 +201,18 @@ def build_metadata(
         "time_zone_note": "window times are local wall-clock time (no time zone)" if time_is_datetime else "seconds",
         "range": rng,
         "variables": [v.name for v in result.variables],
-        "buckets": buckets,
+        "buckets": None if s.view == "timeofday" else buckets,
         "gap": {"mode": "auto" if s.gap_s is None else "fixed", "seconds_used": result.gap_s if result.gap_s is not None and math.isfinite(result.gap_s) else None},
         "view": s.view,
         "time_filter": time_filter,
-        "bucket_count": int(len(result.bucket_start)) if result.bucket_start is not None else 0,
+        "time_of_day": tod,
         "columns": columns or {},
     }
+    if s.view == "timeofday":
+        meta["slot_count"] = int(len(result.slot_start)) if result.slot_start is not None else 0
+    else:
+        meta["bucket_count"] = int(len(result.bucket_start)) if result.bucket_start is not None else 0
+    return meta
 
 
 def _fmt_local(x: float) -> str:
@@ -189,6 +234,8 @@ def write_parquet(path: str | Path, cols: dict[str, np.ndarray], metadata: dict)
 
 
 def _csv_column(arr: np.ndarray) -> list[str]:
+    if arr.dtype.kind in "Ui":
+        return [str(x) for x in arr.tolist()]
     if arr.dtype.kind == "M":
         text = np.datetime_as_string(arr, unit="ms")  # 2026-03-02T12:00:00.000 ('NaT' for null)
         return ["" if t == "NaT" else t.replace("T", " ") for t in text.tolist()]
@@ -233,5 +280,7 @@ def default_file_stem(result: HistogramResult) -> str:
     s = result.settings
     first = result.variables[0].name if result.variables else "histogram"
     first = re.sub(r"[^\w.\-]+", "_", first).strip("_") or "histogram"
+    if s.view == "timeofday":
+        return f"{first}_tod_{length_token(s.slot_s)}_{s.tod_agg}"
     agg = f"{length_token(s.stage1_s)}-{s.stage1_agg}-{s.agg}" if s.two_stage else s.agg
     return f"{first}_{length_token(s.bucket_s)}_{agg}"

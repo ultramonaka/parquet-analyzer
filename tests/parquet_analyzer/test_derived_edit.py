@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from PySide6.QtCore import Qt
+from view_load_helper import wait_view_loaded
 
 from parquet_analyzer.core.expression import ExpressionError, referenced_names
 from parquet_analyzer.core.variable import dependency_order, dependents_of
@@ -150,6 +151,7 @@ def test_view_saves_edited_variables_in_dependency_order_and_reloads(win, monkey
 
     fresh = MainWindow()
     fresh.load_view("v")
+    wait_view_loaded(fresh)
     np.testing.assert_allclose(fresh.variable_values("d1"), fresh.variable_values("b") * 2 + 1)
     assert fresh.plot_grid.plots[0].series_names() == ["d1"]
     fresh.close()
@@ -168,6 +170,7 @@ def test_load_view_tolerates_a_file_saved_out_of_dependency_order(win, sample_pa
         )
     )
     win.load_view("old")
+    wait_view_loaded(win)
     assert set(win._derived) == {"d1", "d2"}
 
 

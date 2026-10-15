@@ -198,8 +198,14 @@ class XYExcludeController:
             self.mode_button.blockSignals(True)
             self.mode_button.setChecked(False)
             self.mode_button.blockSignals(False)
-        self.mode_button.setEnabled(not three)
-        self.mode_button.setToolTip(tr("xy.exclude_mode_3d") if three else tr("xy.exclude_mode_tooltip"))
+        no_curve = self.time_curve()
+        if no_curve and self.mode_button.isChecked():
+            self.mode_button.blockSignals(True)
+            self.mode_button.setChecked(False)
+            self.mode_button.blockSignals(False)
+        self.mode_button.setEnabled(not three and not no_curve)
+        self.mode_button.setToolTip(tr("xy.exclude_mode_3d") if three else
+                                    tr("xy.exclude_mode_time_curve") if no_curve else tr("xy.exclude_mode_tooltip"))
         self.reset_button.setEnabled(len(self.rows) > 0)
 
     def active(self) -> bool:
@@ -208,7 +214,7 @@ class XYExcludeController:
         return bool(
             self.mode_button is not None and self.mode_button.isChecked() and w._mode == "2d"
             and w._map_enabled and w._map_selected() and isinstance(w._result, xm.XYMapResult)
-            and not w._result.is_3d
+            and not w._result.is_3d and not (w._result.is_time and w._result.is_curve)
         )
 
     def _on_mode_toggled(self, on: bool) -> None:
@@ -225,7 +231,15 @@ class XYExcludeController:
 
     def _signature(self) -> tuple:
         w = self._w
-        return (w._x_combo.currentText(), tuple(w.selected_y()), w._z_combo.currentText())
+        z = w._z_combo.currentText()
+        if self._vars is not None and w._map_enabled and w._time_agg():
+            z = self._vars[2]  # "time" does not use Z: changing it neither clears the rows nor counts (44.14)
+        return (w._x_combo.currentText(), tuple(w.selected_y()), z)
+
+    def time_curve(self) -> bool:
+        """A curve of times (aggregate "time", several Y or no Z colour): it has no point to pick (44.14)."""
+        w = self._w
+        return w._map_enabled and w._mode == "2d" and w._time_agg() and w._map_kind() == "curve"
 
     def remember_variables(self) -> None:
         self._vars = self._signature()
@@ -255,8 +269,10 @@ class XYExcludeController:
         r = w._result
         if not isinstance(r, xm.XYMapResult):
             return False
+        if r.agg != w._agg_combo.currentData():
+            return False
         return (r.x_name == w._x_combo.currentText() and list(r.y_names) == list(w.selected_y())
-                and (r.kind != "map" or r.z_name == w._z_combo.currentText()))
+                and (r.kind != "map" or r.is_time or r.z_name == w._z_combo.currentText()))
 
     # -- changes of the set ----------------------------------------------------------
 

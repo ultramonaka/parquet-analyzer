@@ -20,8 +20,6 @@ docs/
     persistence.ja.md
     export.ja.md
     app.ja.md
-  開発メモ           開発メモの項目（タスクの管理）と未解決の課題・残タスク
-  開発メモ           解決済みの調査・判断の記録（旧13.5.1の大容量ファイル対策の経緯など）
 ```
 
 （各ファイルに同じ内容の英語版`*.md`がある。）
@@ -36,7 +34,7 @@ docs/
   一意になり、コード中の参照がどの分野か迷わないため。設計の章には「テスト計画」の小節を置く。
   分野をまたぐ変更は、主になる分野に書き、関係する分野の「他の分野との関係」と該当箇所に
   参照を足す。
-- 解決済みになった課題は開発メモから開発メモへ移す（消さない）。
+- 解決済みになった課題は未解決の課題から解決済みへ移す（消さない）。
 - 本書には変わりにくい内容だけを置く。分野固有の決定は本書に書かない（ずれの原因になるため）。
 - **図**: 分野の関係（1.1）・モジュール構成（5.1）は本書の中に` ```plantuml `ブロックで直接
   書く（他のプロジェクト・`project-template`と同じ書き方）。VS CodeのMarkdown Preview Enhanced
@@ -53,7 +51,7 @@ docs/
 | 演算式 | [domains/expressions.ja.md](./domains/expressions.ja.md) | 変数間演算・仮想変数とその編集、Δ解析、ユーザー関数、マップ、条件分岐（43章） | `core/expression.py`, `core/variable.py`, `core/analysis.py`（delta/rolling_mean）, `ui/expression_bar.py`, `ui/variable_panel.py` |
 | 解析 | [domains/analysis.ja.md](./domains/analysis.ja.md) | 統計、FFT、XY/XYZプロット、ヒストグラム（42章） | `core/analysis.py`, `core/histogram.py`, `ui/stats_dialog.py`, `ui/analysis_window.py`, `ui/xy_plot_window.py`, `ui/xy_map_view.py`, `ui/xy_overlay_controller.py`, `ui/histogram_window.py` |
 | 保存 | [domains/persistence.ja.md](./domains/persistence.ja.md) | ビュー（JSON・管理画面）、設定ファイル・設定メニュー、レイアウトの永続化 | `io/view.py`, `io/settings.py`, `ui/view_manager.py`, `ui/settings_dialog.py`, `ui/folder_picker.py` |
-| 画像保存 | [domains/export.ja.md](./domains/export.ja.md) | プロットの画像保存（matplotlibでの再描画、記載・メタデータ） | `ui/image_export.py` |
+| 画像保存・書き出し | [domains/export.ja.md](./domains/export.ja.md) | プロットの画像保存（matplotlibでの再描画、記載・メタデータ）、ビューの信号のParquetへの書き出し（57章） | `ui/image_export.py`, `core/parquet_export.py`, `ui/parquet_export_dialog.py` |
 | アプリ基盤 | [domains/app.ja.md](./domains/app.ja.md) | ディレクトリ構成・パス、起動、ログ・操作ログ、エラー処理、バージョン、機能フラグ、操作の副作用のテスト（45章） | `config.py`, `core/oplog.py`, `ui/main_window.py`（全体の配線）, `ui/i18n.py` |
 
 ### 1.1 分野の関係図
@@ -275,6 +273,7 @@ src/parquet_analyzer/
 │   ├── settings_dialog.py    # SettingsDialog: 設定メニューのダイアログ
 │   ├── view_manager.py       # ViewManagerDialog: 保存済みビューの一覧・詳細・読込・削除（20・35章）
 │   ├── image_export.py       # matplotlibによるプロットの画像保存（19.2章）
+│   ├── parquet_export_dialog.py # ParquetExportDialog（範囲・信号の選択）とステータスバーの進捗部品（export 57.1・57.3）
 │   ├── messages.py           # 利用者へのメッセージ（記録してから出す、30章）
 │   ├── i18n.py               # tr(): UI文字列をen/jaで一元管理（Settings.language）
 │   └── folder_picker.py      # pick_parquet_file(): ファイル選択ダイアログ + 最近のフォルダ
@@ -286,7 +285,8 @@ src/parquet_analyzer/
 │   ├── time_index.py         # TimeIndex: 大きな昇順の時間軸を全件持たない索引（data 36.8 D）
 │   ├── pyramid.py            # build_pyramid(): 粗いmin/max包絡、thin_column(): ナビゲータ用の間引き（40章）
 │   ├── downsample.py         # lttb(x, y, n_out)
-│   ├── background_worker.py  # WorkerHub: UIスレッド外で実行し結果を1回だけ返す（37章）
+│   ├── background_worker.py  # WorkerHub: UIスレッド外で実行し結果を1回だけ返す、進捗の経路（37章）
+│   ├── parquet_export.py     # ビューの信号のParquet書き出し（計画・区切り計算・書き込み、Qtなし。export 57.2）
 │   ├── expression.py         # evaluate_expression(): AST許可リスト方式の評価、referenced_names()
 │   ├── functions.py          # ユーザー関数・マップを式から呼ぶためのレジストリ（26・27章）
 │   ├── maps.py               # LookupTable: カーブ/マップの補間・範囲外の扱い（27章）
@@ -339,6 +339,7 @@ package "ui" as ui {
   rectangle "navigator" as nav
   rectangle "navigator_sync" as navsync
   rectangle "image_export" as ie
+  rectangle "parquet_export_dialog" as pqd
   rectangle "view_manager" as vm
   rectangle "settings_dialog" as sd
   rectangle "stats_dialog" as stats
@@ -380,6 +381,7 @@ package "core" as core {
   rectangle "variable" as var
   rectangle "analysis" as ana
   rectangle "histogram" as chist
+  rectangle "parquet_export" as pqe
   rectangle "oplog / oplog_view" as oplog
   rectangle "convert" as conv
 }
@@ -388,6 +390,8 @@ mw --> grid
 mw --> nav
 mw --> navsync
 mw --> ie
+mw --> pqd
+mw --> pqe
 mw --> vm
 mw --> sd
 mw --> stats
@@ -434,6 +438,10 @@ hist --> chist
 hist --> acom
 hist --> ie
 chist --> num
+pqe --> expr
+pqe --> fn
+pqe --> num
+pqe --> var
 xy --> pw
 aw --> bw
 aw --> ie
@@ -493,7 +501,6 @@ end note
 | 3 | ディレクトリ構成 | [domains/app.ja.md](./domains/app.ja.md) |
 | 3.1 | 他プロジェクトとのパス共有 | [domains/app.ja.md](./domains/app.ja.md) |
 | 4 | 起動方法 | [domains/app.ja.md](./domains/app.ja.md) |
-| 5 | 画面構成・主要機能 | 開発メモ |
 | 5.1 | メイン画面 | [domains/plots.ja.md](./domains/plots.ja.md) |
 | 5.2 | ナビゲータ | [domains/plots.ja.md](./domains/plots.ja.md) |
 | 5.3 | 操作（v2、実使用フィードバックにより確定） | [domains/plots.ja.md](./domains/plots.ja.md) |
@@ -520,14 +527,6 @@ end note
 | 8 | ログ（log/parquet_analyzer） | [domains/app.ja.md](./domains/app.ja.md) |
 | 9 | 非機能要件 | [overview.ja.md](./overview.ja.md) |
 | 10 | 対象外（スコープ外） | [overview.ja.md](./overview.ja.md) |
-| 11 | 未確定事項 | 開発メモ |
-| 11.1 | 「Pygraph」の解釈（解決済み） | 開発メモ |
-| 11.2 | 他プロジェクトとのパス共有方式（解決済み） | 開発メモ |
-| 11.3 | ズーム操作の軸割当（解決済み・v2） | 開発メモ |
-| 11.4 | 演算式の入力UI（解決済み） | 開発メモ |
-| 11.5 | exeの方式（解決済み） | 開発メモ |
-| 11.6 | Parquet読み込みライブラリ（解決済み） | 開発メモ |
-| 11.7 | マルチプロット/重ね合わせのUI操作（解決済み） | 開発メモ |
 
 旧`detailed_specification.ja.md`（詳細仕様）の章（章単位。小節は原則として親の章と同じファイル——例外は下の表の後に記載）:
 
@@ -545,12 +544,6 @@ end note
 | 10 | ダウンサンプリング再計算の非同期化（確定） | [domains/data.ja.md](./domains/data.ja.md) |
 | 11 | ログ仕様 | [domains/app.ja.md](./domains/app.ja.md) |
 | 12 | エラーハンドリング方針 | [domains/app.ja.md](./domains/app.ja.md) |
-| 13 | 本書時点での未確定事項・残タスク | 開発メモ |
-| 13.1 | 調査中の不具合 | 開発メモ |
-| 13.2 | 効率面（未対応） | 開発メモ |
-| 13.3 | 未使用・未配線のコード（要判断: 実装して活かすか、削除するか） | 開発メモ |
-| 13.4 | 演算式の既知の制限 | 開発メモ |
-| 13.5 | その他 | 開発メモ |
 | 14 | 統計表示 | [domains/analysis.ja.md](./domains/analysis.ja.md) |
 | 15 | MDF/MATLAB → Parquet 変換ツール | [domains/data.ja.md](./domains/data.ja.md) |
 | 16 | カーソル | [domains/plots.ja.md](./domains/plots.ja.md) |
@@ -572,6 +565,4 @@ end note
 |---|---|---|
 | 4.2 | 時間軸（X軸）に使う列の選択 | [domains/data.ja.md](./domains/data.ja.md) |
 | 9.2 | 描画中インジケータ | [domains/data.ja.md](./domains/data.ja.md) |
-| 13.2 | 効率面（すべて対応済み） | 開発メモ |
-| 13.5.1 | 大容量ファイル（~4GB）でのメモリ急増問題（調査と段階的対策の全記録） | 開発メモ |
 

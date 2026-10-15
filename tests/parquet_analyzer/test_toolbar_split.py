@@ -48,7 +48,7 @@ def test_two_toolbars_in_order_and_no_main_toolbar(win):
     assert fv is not None and an is not None
     assert win.toolBarArea(fv) == win.toolBarArea(an) == Qt.ToolBarArea.TopToolBarArea
     assert _layout(fv, win) == [
-        "open_parquet", "|", "label", "combo", "|", "[view_button]", "export_image", "|",
+        "open_parquet", "|", "label", "combo", "|", "[view_button]", "export_image", "export_parquet", "|",
         "home", "redraw", "|", "add_plot", "|", "cursor", "hover_values",
     ]
     layout_an = _layout(an, win)

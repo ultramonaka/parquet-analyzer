@@ -110,7 +110,7 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   settings.
 - Development feature flag `histogram` (ON by default since 2026-10-06). Candidates for later versions (distribution by time
   of day, load duration curve, narrowing by time of day, 2-variable 2D/3D, comparison of periods, CSV of the bin table, etc.)
-  are in dev notes. The two-stage aggregation and the export of values per group are in 5.37.
+  are not specified yet. The two-stage aggregation and the export of values per group are in 5.37.
 - Details in [ch. 42](#42-histogram-added-2026-10-04-user-request).
 
 #### 5.37 Two-stage aggregation of the histogram and export of values per group (added 2026-10-06, user request)
@@ -123,8 +123,7 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   min, also the time of the extreme). It is used, for example, to subtract "consumption − regeneration = net" per day in
   another application. (2026-10-06, user's decision: net is not made in this app; consumption and regeneration are each
   output separately as derived variables with conditional branches: `where(P > 0, P, 0)` and `where(P < 0, -P, 0)`.)
-- A chart of the values per group over time (a bar chart with dates on the horizontal axis) is not included this time
-  (dev notes).
+- A chart of the values per group over time (a bar chart with dates on the horizontal axis) is not included this time.
 - Details in [42.8](#428-two-stage-aggregation-and-export-of-values-per-group-added-2026-10-06-user-request).
 
 #### 5.35 Making a map from measurements (map display and export in XY) (added 2026-10-06, user request, high priority)
@@ -147,7 +146,6 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   other maps (e.g. two maps that were made, or the original design map against the measurements).
 - Even for large files, computed without holding all data in memory (split and added up while reading, as with the XY density).
 - Development feature flag `map_from_xy`. Candidates for later versions (saving the XY window settings into a view, etc.) are
-  in dev notes.
 - Details in [ch. 44](#44-making-a-map-from-measurements-map-display-and-export-in-xy-added-2026-10-06-user-request).
 
 #### 5.39 Excluding outlying points of a map by clicking them, and leaving missing cells empty (added 2026-10-08, user request)
@@ -161,13 +159,13 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   window discards it).
 - In addition, a choice is added to leave cells with fewer than the minimum point count N (44.2) **empty**, instead of filling
   them with the fill method.
-- Details in [44.13](#4413-excluding-outlying-points-and-leaving-missing-cells-empty-added-2026-10-08-dev-notes-item-22).
+- Details in [44.13].
 - 2026-10-13: because the operation was hard to understand, the UI entry is hidden behind the feature flag
   `map_exclude_points` (default OFF) (44.13 (8), user's decision).
-- The decisions above are from 2026-10-07 (agreed by the user; decisions recorded under "map" in dev notes).
+- The decisions above are from 2026-10-07.
 
 #### 5.48 Display kinds of the histogram (duration curve, trend, by time of day), narrowing by time window, and two-variable frequency (added 2026-10-14, user request)
-- The purpose is the analysis of electric power usage (same as 5.33). From the "next version" items of dev notes
+- The purpose is the analysis of electric power usage (same as 5.33). From the "next version" items
   "Histogram (candidates for later versions)", the user chose five (2026-10-14): distribution by time of day, load duration
   curve, narrowing by time of day, trend of values per group, and frequency of a two-variable combination.
 - **Narrowing by time of day**: in the histogram window, the target can be narrowed to a **range of times of day** (e.g.
@@ -190,7 +188,7 @@ feature flag), XY/XYZ plots, histogram (5.33 and ch. 42) and the "analysis windo
   and can be saved as CSV or registered as a map.
 - Implemented in three stages (stage 1 = narrowing by time window, duration curve, trend; stage 2 = by time of day; stage 3 =
   two-variable frequency). Comparison across periods, two-variable frequency after aggregation per group, and narrowing of the
-  XY by time window are not included this time (dev notes).
+  XY by time window are not included this time.
 - Details in [42.10–42.13](#4210-narrowing-by-time-window-added-2026-10-14-stage-1) and
   [44.14](#4414-frequency-of-two-variables-time-as-a-map-aggregate-added-2026-10-14-stage-3).
 
@@ -534,7 +532,7 @@ framework, the failure paths of statistics, FFT, XY and 3D).
 
 ### 42. Histogram (added 2026-10-04, user request)
 
-Requirement: 5.33. For the use cases (e.g. distribution of electric power usage), see dev notes. Uses the analysis window
+Requirement: 5.33. For the use cases (e.g. distribution of electric power usage). Uses the analysis window
 framework (25.1), the "Graphs ▾" menu (25.5) and `WorkerHub` (data ch. 37) as they are.
 
 #### 42.1 Structure
@@ -613,8 +611,7 @@ No grouping:
 - Statistics: count, mean, standard deviation and median are computed with the same approach as `chunked_stats` (data 36.8; the median is
   exact). When collecting the values of the fine bin that contains the median, if that bin's min and max are equal, that value is the median
   (nothing is collected). If the number collected would exceed `HIST_MEDIAN_COLLECT_MAX` (1,000,000), a further pass rebuilds a fine histogram
-  within that bin's range to narrow it down (because for a column such as electric power that is almost always 0, one bin can hold almost
-  the whole column and be loaded into memory; found in review. The same problem in `chunked_stats` is in the dev notes).
+  within that bin's range to narrow it down.
   With frequency = time, the mean is the **time-weighted mean**, and the median is an approximation from the fine histogram weighted by time
   (marked "≈" in the legend).
 
@@ -975,6 +972,27 @@ as in 42.8).
 - "Save group values…" (42.8) becomes "**Save slot values…**" for by time of day: one row per slot (`slot_start` as an `HH:MM` string, per variable the value, valid time in seconds
   and number of days), written as Parquet/CSV with the same format rules and metadata as 42.8.
 
+**Decisions made in implementation (2026-10-15)**:
+- The settings gain `slot_s`, `tod_agg` (`mean`/`integral`) and `tod_per_day` in `HistogramSettings`, and with `view="timeofday"` `compute_histogram` branches to
+  `_compute_timeofday` (it uses `bucket_edges` and `_accumulate_windows` of 42.3 as they are; no new window-accumulation code). The integral unit
+  `integral_unit_s` and the origin `origin_s` are shared (no dedicated fields). The slot number for folding a window into one day is decided by taking the window start's
+  wall clock (`datetime.fromtimestamp`), the "seconds from the origin", and rounding down by the slot length. On days where, after a daylight-saving change, a window does not
+  line up exactly with a slot boundary (this happens with 2-hour and 3-hour slots), the window is added to the slot that contains its start.
+- The result is `HistogramResult.slot_start` (slot start, seconds from the origin) and `VariableHistogram.slot_values`/`slot_valid_s`/`slot_days`.
+  `y_unit="slots"`. Number of days = the number of windows that had valid time (`∫dt` > 0) in that slot (0 for those outside the filter; a 25-hour autumn day is counted twice).
+- "Save group values…" changes its label to "Save slot values…" for by time of day (the same `QAction`; the operation log adds `view` to `histogram_export_windows`).
+  The columns are `slot_start` (`HH:MM` string), `<name>` (value; null when there is no value), `<name>_valid_s` and `<name>_days`. The metadata gains `time_of_day`
+  (`slot_s`, `origin_s`, `aggregation`, `per_day`, and `integral_unit_s` for the integral).
+- Display uses a dedicated `PlotWidget` (the third page of the `QStackedWidget`, a clock-tick axis `_ClockAxis`, no mouse zoom). To break the line at slots with no value,
+  a separate `PlotDataItem(stepMode="center")` is made for each run of consecutive slots with values (NaN is not passed to pyqtgraph, data 29.4). The X axis of the exported image has ticks every 2 hours.
+- For by time of day, aggregation, counts, bins, the vertical axis and the two-row group are disabled (not hidden). "Per day" is enabled only for the integral, and the integral unit only for the integral.
+  The interval treated as a gap stays enabled (it is used to decide valid time).
+- **"Partial days" in the integral / per day** (2026-10-15, found in review; user decision A): a day with data in only part of a slot (the edge of the displayed range, around gaps,
+  the missing window on a daylight-saving day) is also **counted as one day** in the per-day division (counting days by fraction would equal "mean x slot length" and duplicate the mean display).
+  So values at slots cut off at the edge of the range come out slightly smaller (e.g. a constant 1 kW gives 0.98 kWh/day). When a slot is cut off at the edge of the range, use "mean".
+  To show how much is included, `VariableHistogram.slot_partial_days` (the number of windows whose valid time is shorter than the window length, or, with a filter, than the
+  target time inside the window) is held, and the hover shows "N days, of which M partial days" (not shown when M = 0).
+
 #### 42.14 Test plan (42.10–42.13)
 
 - Narrowing by time window (`core/histogram.py`, synthetic data; `TZ` fixed):
@@ -1163,7 +1181,7 @@ entry points of the "map" display mode, the export and the overlay.
   machine); hatching for filled cells; that the range is not changed automatically once touched, and "Auto" restores it; name validation in the export dialog and the overwrite
   confirmation for the same name (dialogs monkeypatched); register only / CSV only / both; overwrite recomputes virtual variables and restores on failure; the JSON `origin`
   and `filled`; filled cells can be told apart in the map manager.
-- **44.5**: clicking a legend item hides a series, it stays hidden after recompute, and it is absent from image export (using real Qt clicks, as dev rules's testing rules require).
+- **44.5**: clicking a legend item hides a series, it stays hidden after recompute, and it is absent from image export.
   Search and multiple selection in the Y list. Clicking the name text. A hidden Y is drawn in density display and stays hidden when back in scatter.
 - **Additions from the review (2026-10-07)**: grid errors appear in English and Japanese (`tr`); export is disabled when the grid is invalid; no floating-point residue remains in
   grid points (`-1` to `1` with interval 0.1 gives `-0.4`); the CSV headers (`<Y>\<X>`, `<X>,<Y>` for a curve, names containing commas, and omitted for numeric names) read back
@@ -1266,7 +1284,7 @@ Found in the review after merging (2026-10-07).
   (3) `[1e15, 1e15+1]` with 400 points → `MapGridError("too_fine")`, an error appears in the settings panel and export is disabled; (4) "leave empty" with empty cells → the note and proportion appear, and do not appear without empty cells;
   (5) the point count on a curve with two Y series equals the row count; (6) curve overlay → 3D → 2D restores the overlay. (1)–(3), (5) and (6) must fail before the fix.
 
-#### 44.11 Remainder of 44.10 (added 2026-10-08, the rest of dev notes item 19)
+#### 44.11 Remainder of 44.10
 
 Two items remained after the merge of the fixes of 44.10.
 
@@ -1280,7 +1298,7 @@ Two items remained after the merge of the fixes of 44.10.
   is not left behind, and a warning appears; (4) "Save as CSV only" with `os.replace` failing → the warning as before, and no temporary file. (1) and (3) must fail before the fix.
 - Size: small to medium (Sonnet; the main session checks the review).
 
-#### 44.12 Tidying `xy_plot_window.py` (added 2026-10-08, dev notes item 21)
+#### 44.12 Tidying `xy_plot_window.py`
 
 Purpose: split `ui/xy_plot_window.py` (1,771 lines) into pieces that are easier to change for the later versions of 44 (such as 22, "exclude outlying points by clicking"). **The screen appearance, operations, operation log and image export results do not change** (refactoring only). As a guide, make `xy_plot_window.py` about 1,000 lines or fewer.
 
@@ -1306,7 +1324,7 @@ Current structure (lines as of `main` on 2026-10-08): calculation of scatter and
 - The class docstring of the mixin lists the attributes and methods of `XYPlotWindow` that the mixin uses (so that the dependencies are visible).
 - The pure calculation and range functions (`xy_map.py`) stay as they are.
 
-**(4) How to split the commits** (dev rules rule 7)
+**(4) How to split the commits**
 
 1. The rename (1) only.
 2. The move to the mixin (3) only. No changes to content.
@@ -1330,7 +1348,7 @@ Size: medium (Sonnet and reviewer). Start after 20 is merged (it does not touch 
 - For `OverlayHost`, the window gained read-only properties `result`, `plot`, `legend`, `view3d`, `closed` and `status_core`, plus `x_name()`, `registry_tables()`, `add_legend_entry()`, `redraw_scene_3d()`, `map_bounds_3d()` and `dialog_parent()`. The controller is created before the window's `super().__init__` (because the "Overlay ▾" button is created inside the settings panel).
 - "Does not depend on Qt" means "can be unit-tested without creating widgets" (`xy_overlay.py` itself imports pyqtgraph and `tr()`).
 
-#### 44.13 Excluding outlying points and leaving missing cells empty (added 2026-10-08, dev notes item 22)
+#### 44.13 Excluding outlying points and leaving missing cells empty
 
 Requirement: 5.39. Mainly touches `ui/xy_map_view.py` (`XYMapViewMixin`, 44.12), `ui/xy_map.py` (`compute_xy_map`) and `core/map_grid.py`. The overlay display (`XYOverlayController`), scatter and density displays are not changed.
 
@@ -1418,6 +1436,32 @@ Requirement: 5.48. Adds "**time**" to the aggregations of the XY map display (44
 - Display: colour and surface height = time. The colour bar, legend and hover show the unit (e.g. "time: 1.25 h"). The status display shows the total valid time and the number of gaps.
 - Export (44.4): the values are in the selected unit of time. The `agg` in `origin` is `"time"`, and `time_unit` is added. The default name is `<X>_<Y>_time` (for a curve, `<X>_time`).
 - Operation log: `agg="time"` and `time_unit` in `xy_plot_compute`.
+- **Decisions in implementation** (2026-10-15):
+  - The shared functions are `row_durations` (the public name of the old `_durations`), `time_weights` (zeroes gaps and returns the count) and
+    `scan_time_axis` (order check and automatic gap), all in `core/histogram.py`. For the map, `compute_xy_map` in `ui/xy_map.py` feeds a virtual column (row durations) into
+    `chunk_iter`, and `grid_aggregate` treats the last array as the weight and sums it with `bincount` (divided by `time_unit_s` for the unit).
+  - Excluded rows (44.13): row durations are **computed first over the whole chunk**, and then the excluded rows are dropped together with their weights. The time of an excluded row
+    goes into no cell, and neighboring rows' durations are not extended (tested). The number of gaps is counted over all rows before exclusion. The same applies when rows with non-finite values
+    are dropped.
+  - Aggregation "time" does not use Z (the value column is not read), so a map can be built even if Z is empty. For a curve `Y` values are not used either, and
+    there is one series `<X>_time` (even if several Y are chosen). A curve has no measured points to overlay (the overlay points are empty).
+  - All cells are valid (measured), `GridResult.min_count` is 1, and the `min_count` input and "empty-cell handling" are shown disabled.
+  - When the time axis is not ascending, no exception is raised; `XYMapResult.time_refused="time_not_ascending"` (no grid) is returned and
+    the reason is shown in the status display.
+  - Image export: the colorbar title is `Time [unit]`, and "Aggregation" in the notes is `Time [unit]` (minimum count and empty-cell handling are not written).
+- **Changes decided in review** (2026-10-15):
+  - Points cannot be excluded on a "time" curve ("Exclude points" is disabled, with the reason in the tooltip). A curve has no points to overlay, and
+    the series name `<X>_time` is not a column either (drawing the × of excluded points, clicking and rectangle selection do not work). Excluded rows
+    still do not go into the time, and "restore all" can be used. The × of excluded rows is not read for a time curve.
+  - "Time" does not use Z: the Z combo is shown disabled (reason in the tooltip), and `_map_kind` does not need Z (a 2D map = one Y with
+    the color being the "Z variable"). Changing Z while in "time" does not recompute or clear the excluded rows. The judgment of excluded rows (`result_is_current` and
+    the variable signature) does not compare Z, and compares the kind of aggregation instead.
+  - The automatic gap value is decided by scanning the time axis with the histogram's chunking (`HIST_CHUNK_ROWS`), not the map's chunking (`XY_CHUNK_ROWS`)
+    (it is the median of per-chunk medians, so depending on the chunking would disagree with the histogram). Only the override argument for tests, `time_scan_chunk_rows`,
+    remains. The `gap_s` argument of `scan_time_axis` was unused and was removed.
+  - The histogram side also uses `time_weights` (the computation that zeroes gaps and the counting are consolidated in one function; behavior is the same).
+  - Rows with non-finite time are not counted as valid points and are counted as non-finite exclusions (as in 42.3).
+  - Even when the time axis is not ascending, the × of excluded rows is read and drawn (44.13 (7)).
 - Tests: synthetic data where (x, y) is known to stay in each cell for a known time → the cell values match in seconds, minutes and hours; gap time is not included; the last row is 0; chunk boundaries (small `XY_CHUNK_ROWS`) give the same result as one pass; the same for a curve; no computation if the time axis is not ascending; CSV values and `origin`. Screen: with aggregation "time" the unit combo appears; 2D and 3D display; the unit appears in the notes of image export.
 
 

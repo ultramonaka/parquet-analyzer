@@ -32,6 +32,28 @@ class ColumnPyramid:
         return len(self.row_starts)
 
 
+def _bucket_minmax(arr: np.ndarray, bucket_rows: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-bucket (min, max) of the finite values of `arr`, split into consecutive buckets of
+    `bucket_rows` rows (the last one may be shorter). A bucket without a finite value gives NaN.
+    Shared by build_pyramid() and build_pyramid_from_windows() (data 59.2)."""
+    n = len(arr)
+    n_buckets = -(-n // bucket_rows)
+    padded = np.full(n_buckets * bucket_rows, np.nan)
+    padded[:n] = arr
+    b = padded.reshape(n_buckets, bucket_rows)
+    fin = np.isfinite(b)
+    mn = np.where(fin, b, np.inf).min(axis=1)
+    mx = np.where(fin, b, -np.inf).max(axis=1)
+    empty = ~fin.any(axis=1)
+    mn[empty] = np.nan
+    mx[empty] = np.nan
+    return mn, mx
+
+
+#: Buckets per read batch in build_pyramid() (fewer calls into pyarrow; memory stays small).
+_BUCKETS_PER_BATCH = 64
+
+
 def build_pyramid(
     path: str | Path,
     columns: list[str],
@@ -40,6 +62,11 @@ def build_pyramid(
     """Stream `path` once (pyarrow's iter_batches — no full-column
     materialization) and compute a per-column, per-bucket min/max envelope.
 
+    The rows are re-packed into buckets of exactly `bucket_rows` rows (the remainder of one batch
+    is joined with the start of the next), so bucket starts are always `k * bucket_rows`
+    whatever batch sizes pyarrow returns -- TimeIndex anchors rely on this (detailed_specification.md
+    59.2, 36.6 D). Only the last bucket may be shorter.
+
     Wired into the UI as of detailed_specification.md 13.5.1 Phase D:
     `core.column.WindowedColumn.request_pyramid()` returns this as a zero-arg
     job, which `TimePlotWidget._maybe_start_pyramid_build` runs on a background
@@ -47,36 +74,46 @@ def build_pyramid(
     downsampling/FFT/stats already do — this function itself has no threading of
     its own, by design, so it stays trivially testable.
     """
+    if bucket_rows <= 0:
+        raise ValueError(f"bucket_rows must be positive, got {bucket_rows}")
     pf = pq.ParquetFile(path)
-    starts: dict[str, list[int]] = {c: [] for c in columns}
-    mins: dict[str, list[float]] = {c: [] for c in columns}
-    maxs: dict[str, list[float]] = {c: [] for c in columns}
+    mins: dict[str, list[np.ndarray]] = {c: [] for c in columns}
+    maxs: dict[str, list[np.ndarray]] = {c: [] for c in columns}
+    carry: dict[str, np.ndarray] = {c: np.empty(0, dtype=np.float64) for c in columns}
+    total = 0
 
-    row_offset = 0
-    for batch in pf.iter_batches(columns=columns, batch_size=bucket_rows):
+    for batch in pf.iter_batches(columns=columns, batch_size=bucket_rows * _BUCKETS_PER_BATCH):
         n = batch.num_rows
         if n == 0:
             continue
+        total += n
         for c in columns:
             arr = to_numeric(batch.column(c).to_numpy(zero_copy_only=False))
-            finite = arr[np.isfinite(arr)]
-            starts[c].append(row_offset)
-            if len(finite) == 0:
-                mins[c].append(np.nan)
-                maxs[c].append(np.nan)
-            else:
-                mins[c].append(float(finite.min()))
-                maxs[c].append(float(finite.max()))
-        row_offset += n
+            if len(carry[c]):
+                arr = np.concatenate([carry[c], arr])
+            n_full = (len(arr) // bucket_rows) * bucket_rows
+            if n_full:
+                mn, mx = _bucket_minmax(arr[:n_full], bucket_rows)
+                mins[c].append(mn)
+                maxs[c].append(mx)
+            carry[c] = arr[n_full:]
 
-    return {
-        c: ColumnPyramid(
-            row_starts=np.array(starts[c], dtype=np.int64),
-            mins=np.array(mins[c], dtype=np.float64),
-            maxs=np.array(maxs[c], dtype=np.float64),
+    for c in columns:
+        if len(carry[c]):  # the last, shorter bucket
+            mn, mx = _bucket_minmax(carry[c], bucket_rows)
+            mins[c].append(mn)
+            maxs[c].append(mx)
+
+    def cat(parts: list[np.ndarray]) -> np.ndarray:
+        return np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
+
+    result: dict[str, ColumnPyramid] = {}
+    for c in columns:
+        mn, mx = cat(mins[c]), cat(maxs[c])
+        result[c] = ColumnPyramid(
+            row_starts=np.arange(len(mn), dtype=np.int64) * bucket_rows, mins=mn, maxs=mx
         )
-        for c in columns
-    }
+    return result
 
 
 def pyramid_bounds(pyramid: ColumnPyramid) -> tuple[float, float] | None:
@@ -147,17 +184,8 @@ def build_pyramid_from_windows(
     for lo in range(0, n_rows, chunk_rows):
         hi = min(n_rows, lo + chunk_rows)
         arr = np.asarray(window(lo, hi), dtype=np.float64)
-        n = len(arr)
-        n_buckets = -(-n // bucket_rows)
-        padded = np.full(n_buckets * bucket_rows, np.nan)
-        padded[:n] = arr
-        b = padded.reshape(n_buckets, bucket_rows)
-        fin = np.isfinite(b)
-        mn = np.where(fin, b, np.inf).min(axis=1)
-        mx = np.where(fin, b, -np.inf).max(axis=1)
-        empty = ~fin.any(axis=1)
-        mn[empty] = np.nan
-        mx[empty] = np.nan
+        n_buckets = -(-len(arr) // bucket_rows)
+        mn, mx = _bucket_minmax(arr, bucket_rows)
         starts.append(lo + np.arange(n_buckets, dtype=np.int64) * bucket_rows)
         mins.append(mn)
         maxs.append(mx)

@@ -33,6 +33,7 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "cursor": "",
     "hover_values": "",  # hover value readout toggle (plots 39.3)
     "export_image": "",
+    "export_parquet": "",  # gated by features "parquet_export" (export 57.1)
     "user_functions": "",  # toolbar entries gated by feature flags (21)
     "maps": "",
     "signal_aliases": "",  # the alias editor (persistence 54.4); always shown

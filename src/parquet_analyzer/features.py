@@ -26,6 +26,7 @@ DEFAULT_FEATURES: dict[str, bool] = {
     "big_c_windowed_derived": True,  # on 2026-10-04: adopted after 36.7 (C: derived variables computed per window)
     "big_d_time_index": True,  # on 2026-10-04: adopted after 36.7 (D: TimeIndex keeps a big ascending time axis on disk)
     "map_from_xy": True,  # on 2026-10-07 after review + user check of stages 1-2 and 44.9 (ch.44)
+    "parquet_export": True,  # on 2026-10-16 after review + user check (export 57, stages 1-2)
     "map_exclude_points": False,  # analysis 44.13 (8): hidden 2026-10-13 (user found it unclear in the real-machine check)
 }
 

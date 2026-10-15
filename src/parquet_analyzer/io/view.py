@@ -181,7 +181,7 @@ def _valid_y_range(v) -> tuple[float | None, float | None]:
     """A plot's saved Y range with every non-finite / non-numeric end turned into None
     (= "no saved range"): hand-edited JSON can hold NaN/Infinity (Python's json accepts
     them) and pyqtgraph's setYRange raises on them, which aborted the rest of the view
-    load (persistence 35.1, dev rules "never hand pyqtgraph a non-finite range")."""
+    load."""
     if not isinstance(v, (list, tuple)) or len(v) != 2:
         return (None, None)
     return tuple(float(x) if _is_num(x) and math.isfinite(x) else None for x in v)  # type: ignore[return-value]

@@ -4,6 +4,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from view_load_helper import wait_view_loaded
 
 from parquet_analyzer.io import view as view_io
 from parquet_analyzer.ui import messages
@@ -130,6 +131,7 @@ def test_load_view_applies_layout_only_when_a_different_file_is_already_open(qap
     win = MainWindow()
     win.load_parquet(str(path_b))
     win.load_view("reusable_layout")
+    wait_view_loaded(win)
 
     assert win._data_source.path == path_b  # did not switch to a.parquet
     plot = win.plot_grid.plots[0]
@@ -165,6 +167,7 @@ def test_load_view_does_not_reopen_a_file_already_open(qapp, isolated_config, tm
         win, "load_parquet", lambda *a, **k: pytest.fail("load_view should not re-open a file already open")
     )
     win.load_view("same_file_view")
+    wait_view_loaded(win)
 
     assert win._data_source is data_source_before  # not replaced by a fresh reopen
     assert win.plot_grid.plots[0].series_names() == ["x"]
@@ -228,6 +231,7 @@ def test_load_view_applies_matching_variables_even_when_others_are_missing(qapp,
     win = MainWindow()
     win.load_parquet(str(path_b))
     win.load_view("mixed_view")  # must not raise
+    wait_view_loaded(win)
 
     assert "z" not in win._derived  # its source "x" doesn't exist in b -> correctly skipped
     all_series = [name for plot in win.plot_grid.plots for name in plot.series_names()]
@@ -257,6 +261,7 @@ def test_load_view_recomputes_derived_variables_from_the_newly_opened_file(qapp,
     win = MainWindow()
     win.load_parquet(str(path_b))
     win.load_view("derived_reuse")
+    wait_view_loaded(win)
 
     assert "z" in win._derived
     _x, y, _color = win.plot_grid.plots[0].series_data("z")
@@ -424,6 +429,7 @@ def test_save_view_preserves_the_current_zoom_range(qapp, isolated_config, monke
 
     win2 = MainWindow()
     win2.load_view("myview")
+    wait_view_loaded(win2)
     plot2 = win2.plot_grid.plots[0]
     x_range, y_range = plot2.getViewBox().viewRange()
     assert x_range == pytest.approx([100.0, 500.0])
@@ -432,12 +438,14 @@ def test_save_view_preserves_the_current_zoom_range(qapp, isolated_config, monke
 
 
 def test_load_view_warning_lists_each_skipped_item_once_with_its_reason(qapp, isolated_config, tmp_path, monkeypatch):
-    """Dev notes 33 (found by the A4 old-view test): a derived variable that couldn't be restored
+    """Task 33 (found by the A4 old-view test): a derived variable that couldn't be restored
     was listed twice in the consolidated warning (once as the variable, once as the series
     plotting it), and the heading blamed "the currently open file" even when the cause was a
     missing function. Each item is now listed once; a plain column missing from the file says so."""
     warnings: list[str] = []
     monkeypatch.setattr(messages, "warning", lambda _parent, _title, text, *a, **k: warnings.append(text))
+    # "x" is missing from file b, so the warning carries the assign button (persistence 54.6): same text
+    monkeypatch.setattr(messages, "warning_with_button", lambda _p, _t, text, _b: warnings.append(text) or False)
     path_a = tmp_path / "a.parquet"
     _write_parquet(path_a, {"x": np.arange(200, dtype=float), "y": np.arange(200, dtype=float)})
     view = view_io.View(
@@ -463,6 +471,7 @@ def test_load_view_warning_lists_each_skipped_item_once_with_its_reason(qapp, is
     win = MainWindow()
     win.load_parquet(str(path_b))
     win.load_view("skips")
+    wait_view_loaded(win)
 
     assert len(warnings) == 1
     text = warnings[0]

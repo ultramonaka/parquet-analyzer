@@ -1,7 +1,7 @@
 # Parquet Analyzer — Overview Specification
 
 - Revision: v1.0 (2026-10-02: the specification was reorganized into "overview + per-domain
-  specifications". The revision history before that is at the top of history)
+  specifications")
 - Role: the map of the whole application. The purpose, scope, overall structure, rules shared
   across domains and the glossary live here; each feature's requirements and design live in the
   per-domain specifications.
@@ -22,9 +22,6 @@ docs/
     persistence.md
     export.md
     app.md
-  dev notes              task list (where work is tracked), open issues and remaining tasks
-  dev notes              record of resolved investigations and decisions (e.g. the old 13.5.1
-                          large-file memory work)
 ```
 
 (Each file has a Japanese counterpart `*.ja.md` with the same content.)
@@ -43,7 +40,7 @@ docs/
   design chapter has a "Test plan" subsection. A change spanning domains is written in the main
   domain, and references are added to the "Relations to other domains" and the relevant places of
   the other domains.
-- Issues that become resolved are moved from `dev notes` to `history` (not deleted).
+- Issues that become resolved are moved out of the open-issue list (not deleted).
 - Only stable content goes in this document. Domain-specific decisions are not written here (it
   would cause drift).
 - **Diagrams**: the domain relations (1.1) and the module structure (5.1) are written directly in
@@ -62,7 +59,7 @@ docs/
 | Expressions | [domains/expressions.md](./domains/expressions.md) | Inter-variable expressions, derived variables and their editing, Δ analysis, user functions, maps, conditional branches (ch. 43) | `core/expression.py`, `core/variable.py`, `core/analysis.py` (delta/rolling_mean), `ui/expression_bar.py`, `ui/variable_panel.py` |
 | Analysis | [domains/analysis.md](./domains/analysis.md) | Statistics, FFT, XY/XYZ plots, histogram (ch. 42) | `core/analysis.py`, `core/histogram.py`, `ui/stats_dialog.py`, `ui/analysis_window.py`, `ui/xy_plot_window.py`, `ui/xy_map_view.py`, `ui/xy_overlay_controller.py`, `ui/histogram_window.py` |
 | Persistence | [domains/persistence.md](./domains/persistence.md) | Views (JSON, manager window), the settings file and settings menu, layout persistence | `io/view.py`, `io/settings.py`, `ui/view_manager.py`, `ui/settings_dialog.py`, `ui/folder_picker.py` |
-| Export | [domains/export.md](./domains/export.md) | Saving the plots as an image (re-drawn with matplotlib, annotation and metadata) | `ui/image_export.py` |
+| Image export and Parquet export | [domains/export.md](./domains/export.md) | Saving the plots as an image (re-drawn with matplotlib, annotation and metadata); exporting the view's signals to Parquet (ch. 57) | `ui/image_export.py`, `core/parquet_export.py`, `ui/parquet_export_dialog.py` |
 | App foundation | [domains/app.md](./domains/app.md) | Directory layout and paths, startup, logs and the operation log, error handling, version, feature flags, tests for side effects of operations (ch. 45) | `config.py`, `core/oplog.py`, `ui/main_window.py` (overall wiring), `ui/i18n.py` |
 
 ### 1.1 Domain relation diagram
@@ -215,7 +212,7 @@ analysis, difference analysis and so on, all in a GUI.
 | Package management | uv |
 | GUI framework | PySide6 |
 | Plot library | pyqtgraph (interactive plots), matplotlib (image export only, 5.14) |
-| Distribution | exe (built for Windows with PyInstaller or similar; see 11.5) |
+| Distribution | exe (built for Windows with PyInstaller or similar) |
 
 ### 9. Non-functional requirements
 
@@ -295,6 +292,7 @@ src/parquet_analyzer/
 │   ├── settings_dialog.py    # SettingsDialog: the settings menu dialog
 │   ├── view_manager.py       # ViewManagerDialog: list, details, load, delete of saved views (ch. 20, 35)
 │   ├── image_export.py       # saving the plots as an image with matplotlib (19.2)
+│   ├── parquet_export_dialog.py # ParquetExportDialog (choosing range and signals) and the status-bar progress widget (export 57.1, 57.3)
 │   ├── messages.py           # messages to the user (recorded, then shown; ch. 30)
 │   ├── i18n.py               # tr(): all UI strings in en/ja in one place (Settings.language)
 │   └── folder_picker.py      # pick_parquet_file(): file dialog + recent folders
@@ -306,7 +304,8 @@ src/parquet_analyzer/
 │   ├── time_index.py         # TimeIndex: an index for a big ascending time axis that is never held whole (data 36.8 D)
 │   ├── pyramid.py            # build_pyramid(): coarse min/max envelope; thin_column(): thinning for the navigator (ch. 40)
 │   ├── downsample.py         # lttb(x, y, n_out)
-│   ├── background_worker.py  # WorkerHub: runs off the UI thread and returns the result exactly once (ch. 37)
+│   ├── background_worker.py  # WorkerHub: runs off the UI thread and returns the result exactly once; progress channel (ch. 37)
+│   ├── parquet_export.py     # exporting the view's signals to Parquet (planning, chunked computation, writing; no Qt. export 57.2)
 │   ├── expression.py         # evaluate_expression(): AST-whitelist evaluation, referenced_names()
 │   ├── functions.py          # registry for calling user functions and maps from expressions (ch. 26, 27)
 │   ├── maps.py               # LookupTable: curve/map interpolation and out-of-range handling (ch. 27)
@@ -354,6 +353,7 @@ package "ui" as ui {
   rectangle "navigator" as nav
   rectangle "navigator_sync" as navsync
   rectangle "image_export" as ie
+  rectangle "parquet_export_dialog" as pqd
   rectangle "view_manager" as vm
   rectangle "settings_dialog" as sd
   rectangle "stats_dialog" as stats
@@ -396,6 +396,7 @@ package "core" as core {
   rectangle "analysis" as ana
   rectangle "oplog / oplog_view" as oplog
   rectangle "histogram" as chist
+  rectangle "parquet_export" as pqe
   rectangle "convert" as conv
 }
 
@@ -403,6 +404,8 @@ mw --> grid
 mw --> nav
 mw --> navsync
 mw --> ie
+mw --> pqd
+mw --> pqe
 mw --> vm
 mw --> sd
 mw --> stats
@@ -449,6 +452,10 @@ hist --> chist
 hist --> acom
 hist --> ie
 chist --> num
+pqe --> expr
+pqe --> fn
+pqe --> num
+pqe --> var
 xy --> pw
 aw --> bw
 aw --> ie
@@ -508,7 +515,6 @@ Sections of the old `specification.ja.md` (requirements):
 | 3 | Directory layout | [domains/app.md](./domains/app.md) |
 | 3.1 | Sharing paths with other projects | [domains/app.md](./domains/app.md) |
 | 4 | How to start | [domains/app.md](./domains/app.md) |
-| 5 | Screen layout and main features | dev notes |
 | 5.1 | Main window | [domains/plots.md](./domains/plots.md) |
 | 5.2 | Navigator | [domains/plots.md](./domains/plots.md) |
 | 5.3 | Interaction (v2, settled after real-use feedback) | [domains/plots.md](./domains/plots.md) |
@@ -535,14 +541,6 @@ Sections of the old `specification.ja.md` (requirements):
 | 8 | Logs (log/parquet_analyzer) | [domains/app.md](./domains/app.md) |
 | 9 | Non-functional requirements | [overview.md](./overview.md) |
 | 10 | Out of scope | [overview.md](./overview.md) |
-| 11 | Open questions | dev notes |
-| 11.1 | Interpreting "Pygraph" (resolved) | dev notes |
-| 11.2 | How to share paths with other projects (resolved) | dev notes |
-| 11.3 | Axis assignment of zoom operations (resolved, v2) | dev notes |
-| 11.4 | Expression input UI (resolved) | dev notes |
-| 11.5 | exe format (resolved) | dev notes |
-| 11.6 | Parquet reading library (resolved) | dev notes |
-| 11.7 | Multi-plot / overlay UI interaction (resolved) | dev notes |
 
 Chapters of the old `detailed_specification.ja.md` (detailed design) (per chapter; subsections are
 in the same file as their parent chapter unless listed after the table):
@@ -561,12 +559,6 @@ in the same file as their parent chapter unless listed after the table):
 | 10 | Asynchronous downsampling recompute (settled) | [domains/data.md](./domains/data.md) |
 | 11 | Logging | [domains/app.md](./domains/app.md) |
 | 12 | Error-handling policy | [domains/app.md](./domains/app.md) |
-| 13 | Open questions and remaining tasks at this point | dev notes |
-| 13.1 | Bugs under investigation | dev notes |
-| 13.2 | Efficiency (not addressed) | dev notes |
-| 13.3 | Unused / unwired code (decide: put it to use or delete it) | dev notes |
-| 13.4 | Known limitations of expressions | dev notes |
-| 13.5 | Other | dev notes |
 | 14 | Statistics display | [domains/analysis.md](./domains/analysis.md) |
 | 15 | MDF/MATLAB → Parquet conversion tool | [domains/data.md](./domains/data.md) |
 | 16 | Cursors | [domains/plots.md](./domains/plots.md) |
@@ -588,5 +580,3 @@ Subsections in a different file from their parent chapter:
 |---|---|---|
 | 4.2 | Choosing the column used as the time (X) axis | [domains/data.md](./domains/data.md) |
 | 9.2 | Drawing indicator | [domains/data.md](./domains/data.md) |
-| 13.2 | Efficiency (all addressed) | dev notes |
-| 13.5.1 | Memory blow-up with large files (~4 GB) (full record of the investigation and staged fixes) | dev notes |
