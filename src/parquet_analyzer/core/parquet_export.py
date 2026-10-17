@@ -11,6 +11,10 @@ over all rows first (`ExportResult.full_computed`).
 The output is written to `<path>.part` and moved over `<path>` at the end; a cancel or a failure
 removes the `.part` and leaves any file that was at `<path>` untouched.
 
+Writing (57.9.3): the chunks are streamed through polars' `sink_parquet` (multi-core encoding) when
+every column keeps its Arrow type, else through pyarrow's `ParquetWriter`. Between chunks a guard
+(57.9.6a, `export_resources`) checks free disk and memory. Progress reports are throttled (57.9.7).
+
 The plan is built from the chunk loop's point of view: a later `source_row` column (data 56.4,
 sorted display) is one more entry of `_chunk_table`'s column list; it is not implemented yet.
 """
@@ -34,6 +38,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from . import export_resources as res
 from .data_source import ParquetDataSource
 from .expression import (
     ExpressionError,
@@ -52,7 +57,18 @@ if TYPE_CHECKING:  # the view's JSON model lives in io/; core only reads its att
     from ..io.view import View
 
 DEFAULT_CHUNK_ROWS = 1_000_000
+# 57.9.3: the automatic chunk size keeps one chunk's Arrow table near this many bytes, within these rows
+CHUNK_TARGET_BYTES = 256 * 1024**2
+MIN_AUTO_CHUNK_ROWS = 65_536
+MAX_AUTO_CHUNK_ROWS = 1_000_000
+# 57.9.7: the worker reports progress at most this often (seconds); phase changes and the last chunk always
+PROGRESS_INTERVAL = 0.1
+# 57.9.6a: the available memory is read at most this often (seconds; reading it can cost a process call)
+MEMORY_PROBE_INTERVAL = 0.5
+_clock = time.monotonic  # replaced by tests
+_sleep = time.sleep
 METADATA_KEY = b"parquet_analyzer"
+DERIVED_DTYPES = ("float64", "float32")  # 57.9.6b
 # progress(0, total) markers with total < 0 (no percentage): the phase computing variables over
 # all rows (57.3) and the phase searching the saved time range (57.7.4)
 PROGRESS_FULL = -1
@@ -68,6 +84,30 @@ class NoRowsInRange(ExportError):
 
     def __init__(self) -> None:
         super().__init__("no rows in the range")
+
+
+class RangeAxisMissing(ExportError):
+    """The view's saved range cannot be used for this file: the range is in the units of the view's own time
+    axis, and that column does not exist here (57.8.3). `name` is that column."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"the view's time axis for the saved range is not in the file: {name}")
+        self.name = name
+
+
+class DiskFull(ExportError):
+    """The free space of the output volume fell below the bytes still to be written plus
+    `DISK_MARGIN` (57.9.6a): this file fails and its `.part` goes, so the disk is not filled to the brim."""
+
+    def __init__(self) -> None:
+        super().__init__("disk full")
+
+
+class MemoryLow(ExportError):
+    """The available memory stayed below the pause limit for `MEMORY_WAIT_LIMIT` seconds (57.9.6a)."""
+
+    def __init__(self) -> None:
+        super().__init__("not enough free memory")
 
 
 class ExportCancelled(Exception):
@@ -101,6 +141,13 @@ class ExportPlan:
     # A time range in the screen's numbers (to_numeric) instead of known rows (57.7.4): the run's
     # first phase turns it into row_start / row_end; until then those are the whole file.
     time_range: tuple[float, float] | None = None
+    # The type the derived variables are written in (57.9.6b): "float64" or "float32". Time axis and raw
+    # columns always keep the file's own types.
+    derived_dtype: str = "float64"
+    # The file column the saved time range is searched on (57.8.3): the view's own time axis, which is what
+    # the range's numbers belong to, even when another column is chosen as the output's first column.
+    # None: the output's time column (`time.source`).
+    time_range_column: str | None = None
 
     @property
     def rows(self) -> int:
@@ -115,6 +162,10 @@ class ExportResult:
     columns: int
     full_computed: tuple[str, ...]
     elapsed: float
+    writer: str = "pyarrow"  # "polars" (streaming sink) or "pyarrow" (57.9.3)
+    chunk_halvings: int = 0  # times the memory guard halved the chunk (57.9.6a)
+    memory_wait: float = 0.0  # seconds spent paused for free memory (57.9.6a)
+    float32_overflow: tuple[str, ...] = ()  # derived variables with values too large for float32 (now inf, 57.9.6b)
 
 
 def build_plan(
@@ -128,15 +179,19 @@ def build_plan(
     file_columns: Mapping[str, str],
     registry: FunctionRegistry,
     metadata: Mapping[str, object] | None = None,
-    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    chunk_rows: int | None = None,
+    derived_dtype: str = "float64",
 ) -> ExportPlan:
     """The plan for `signals` (raw columns have a `source`, derived variables have none).
 
     `derived_expressions`: every derived variable of the session; only the selected ones and
-    their transitive derived dependencies enter the plan. `file_columns`: variable name -> file
+    their transitive derived dependencies enter the plan. `chunk_rows` None: sized from the output row
+    width (`auto_chunk_rows`, 57.9.3). `file_columns`: variable name -> file
     column for every raw name an expression may use (aliases map to their source). Duplicates and
     the time column among `signals` are dropped. Raises ExportError for a name nothing defines.
     """
+    if derived_dtype not in DERIVED_DTYPES:
+        raise ExportError(f"unknown type for derived variables: {derived_dtype}")
     seen = {time.name}
     columns: list[ExportColumn] = []
     for col in signals:
@@ -167,7 +222,7 @@ def build_plan(
             if ref not in file_columns:
                 raise ExportError(f"unknown variable: {ref}")
             inputs[ref] = file_columns[ref]
-    return ExportPlan(
+    plan = ExportPlan(
         source_path=str(source_path),
         row_start=max(0, row_range[0]),
         row_end=min(total_rows, row_range[1]),
@@ -178,8 +233,80 @@ def build_plan(
         inputs=tuple(inputs.items()),
         registry=registry,
         metadata=dict(metadata or {}),
-        chunk_rows=max(1, int(chunk_rows)),
+        chunk_rows=max(1, int(chunk_rows)) if chunk_rows is not None else DEFAULT_CHUNK_ROWS,
+        derived_dtype=derived_dtype,
     )
+    if chunk_rows is None:
+        plan = dataclasses.replace(plan, chunk_rows=auto_chunk_rows(plan))
+    return plan
+
+
+# -- sizes and memory (57.9.3, 57.9.5) ----------------------------------------------------------------
+
+
+def _type_bytes(t: pa.DataType) -> int:
+    try:
+        return max(1, t.bit_width // 8)
+    except ValueError:  # strings, binary, nested: a rough width
+        return 32
+
+
+def output_row_bytes(plan: ExportPlan) -> int:
+    """Uncompressed bytes of one output row: the raw columns in their file types, 8 for each derived
+    variable (float64). Without a readable footer every column counts 8."""
+    try:
+        schema = pq.read_schema(plan.source_path)
+    except (OSError, pa.ArrowException):
+        schema = None
+    total = 0
+    derived_bytes = 4 if plan.derived_dtype == "float32" else 8
+    for c in (plan.time, *plan.columns):
+        if c.source is None:
+            total += derived_bytes
+        elif schema is not None and c.source in schema.names:
+            total += _type_bytes(schema.field(c.source).type)
+        else:
+            total += 8
+    return max(1, total)
+
+
+def _calc_columns(plan: ExportPlan) -> tuple[int, int]:
+    """(float64 arrays alive while a chunk is computed, arrays alive over all rows): the raw columns
+    the expressions use plus the chunk-wise derived variables / the full-row variables and their inputs."""
+    chunked, full, _margin = split_by_margin(plan)
+    expressions = dict(plan.derived)
+    files = dict(plan.inputs)
+    full_inputs = {files[r] for name in full for r in referenced_names(expressions[name]) if r in files}
+    return len(plan.inputs) + len(chunked), len(full) + len(full_inputs)
+
+
+def auto_chunk_rows(plan: ExportPlan) -> int:
+    """Rows per chunk so that one chunk's tables stay near `CHUNK_TARGET_BYTES` (57.9.3): wide outputs
+    get smaller chunks, so the memory does not grow with the column count."""
+    try:
+        per_chunk, _full = _calc_columns(plan)
+        width = output_row_bytes(plan) + 8 * per_chunk
+    except Exception:  # noqa: BLE001 (an odd expression is reported by the run, not by sizing)
+        return DEFAULT_CHUNK_ROWS
+    return int(min(MAX_AUTO_CHUNK_ROWS, max(MIN_AUTO_CHUNK_ROWS, CHUNK_TARGET_BYTES // width)))
+
+
+def estimate_export_memory(plan: ExportPlan) -> int:
+    """Bytes one export is expected to use (57.9.5): per chunk the output row (x3: Arrow table, polars
+    copy, write buffer) plus the float64 working arrays, plus the arrays held over all rows, plus 200 MB."""
+    per_chunk, full_cols = _calc_columns(plan)
+    # a chunk is never larger than the export itself (a 1,000-row export is not charged 1M rows)
+    chunk = min(plan.chunk_rows, max(plan.rows, 1)) * (output_row_bytes(plan) * 3 + 8 * per_chunk)
+    return chunk + plan.total_rows * 8 * full_cols + 200 * res.MB
+
+
+def estimate_output_bytes(plan: ExportPlan) -> int:
+    """An upper bound of the output size (57.9.6a): rows x uncompressed row width, no credit for compression."""
+    return plan.rows * output_row_bytes(plan)
+
+
+def preflight_item(plan: ExportPlan, path: str | os.PathLike) -> res.PreflightItem:
+    return res.PreflightItem(str(path), estimate_output_bytes(plan), estimate_export_memory(plan))
 
 
 def _shape(value, n: int) -> np.ndarray:
@@ -261,6 +388,7 @@ def _metadata_json(plan: ExportPlan, start_text: str, end_text: str, created: st
         "time_column": plan.time.name,
         "range": {"rows": [plan.row_start, plan.row_end], "start": start_text, "end": end_text},
         "derived": dict(plan.derived),
+        "derived_dtype": plan.derived_dtype,
         "functions": functions,
         "maps": maps,
         "created": created,
@@ -271,9 +399,17 @@ def _metadata_json(plan: ExportPlan, start_text: str, end_text: str, created: st
 class _Run:
     """The state of one `export_parquet` call."""
 
-    def __init__(self, plan: ExportPlan, cancelled: Callable[[], bool]):
+    def __init__(
+        self,
+        plan: ExportPlan,
+        cancelled: Callable[[], bool],
+        arbiter: res.DiskArbiter | None = None,
+        arbiter_key: object = None,
+    ):
         self.plan = plan
         self.cancelled = cancelled
+        self.arbiter = arbiter
+        self.arbiter_key = arbiter_key
         self.lazy = pl.scan_parquet(plan.source_path)
         self.file_schema = pq.read_schema(plan.source_path)
         self.chunked, self.full_names, (self.m_before, self.m_after) = split_by_margin(plan)
@@ -282,10 +418,98 @@ class _Run:
         self.full_values: dict[str, np.ndarray] = {}
         self.raw_exports = [c for c in (plan.time, *plan.columns) if c.source is not None]
         self.schema: pa.Schema | None = None
+        # the chunk size of the write loop; the memory guard may shrink it (57.9.6a)
+        self.chunk_rows = plan.chunk_rows
+        self.halvings = 0
+        self.memory_wait = 0.0
+        self._memory_next = 0.0
+        self._memory_low = False  # halved once per drop below the line; re-armed above it (57.9.6a)
+        self._row_bytes: int | None = None
+        self.f32_overflow: set[str] = set()  # derived variables that overflowed float32 (57.9.6b)
 
     def check(self) -> None:
         if self.cancelled():
             raise ExportCancelled()
+
+    def gate(self, part: Path, done_rows: int = 0) -> None:
+        """The guard between two chunks (57.9.6a): fail this file when the free space is below the
+        bytes still to be written plus `res.disk_margin()`, shrink the chunk once per drop of the available
+        memory (and grow it back when memory is fine again), wait (the screen keeps running) when it
+        is very short. `done_rows`: rows of this export already handed to the writer."""
+        if self.arbiter is not None:
+            if self.arbiter.stop_requested(self.arbiter_key):  # a more advanced file needs the room (57.9.6a (c))
+                raise DiskFull()
+            if self.plan.rows > 0:
+                self.arbiter.update(self.arbiter_key, done_rows / self.plan.rows)
+        free = res.disk_free_bytes(part.parent)
+        if free is not None and free < self._disk_still_needed(part, done_rows) + res.disk_margin():
+            self._disk_short(part, done_rows)
+        now = _clock()
+        if now < self._memory_next:
+            return
+        self._memory_next = now + MEMORY_PROBE_INTERVAL
+        avail = res.available_memory_bytes()
+        if avail is None:
+            return
+        if avail >= res.MEMORY_SLOW_BELOW:
+            self._memory_low = False
+            if self.chunk_rows < self.plan.chunk_rows:  # memory is back: grow toward the planned size
+                self.chunk_rows = min(self.plan.chunk_rows, self.chunk_rows * 2)
+            return
+        if not self._memory_low:  # one halving per drop below the line, not one per probe
+            self._memory_low = True
+            smaller = max(res.MIN_CHUNK_ROWS, self.chunk_rows // 2)
+            if smaller < self.chunk_rows:
+                self.chunk_rows = smaller
+                self.halvings += 1
+        if avail >= res.MEMORY_PAUSE_BELOW:
+            return
+        started = _clock()
+        while True:  # paused at the chunk boundary until memory comes back, or fail after the limit
+            self.check()
+            if _clock() - started >= res.MEMORY_WAIT_LIMIT:
+                self.memory_wait += _clock() - started
+                raise MemoryLow()
+            _sleep(0.1)
+            avail = res.available_memory_bytes()
+            if avail is None or avail >= res.MEMORY_PAUSE_BELOW:
+                break
+        self.memory_wait += _clock() - started
+        self._memory_next = 0.0
+
+    def _disk_short(self, part: Path, done_rows: int) -> None:
+        """The disk is short for this file (57.9.6a (c)). Alone, or the least advanced of the running files:
+        fail it. Otherwise a less advanced file stops first, so this one waits (the screen keeps running)
+        until the space comes back, it became the least advanced itself, or `DISK_YIELD_WAIT` ran out; the
+        least advanced file on the same volume is told to stop (it raises `DiskFull` at its next gate)."""
+        if self.arbiter is None or self.arbiter.is_least_advanced(self.arbiter_key):
+            raise DiskFull()
+        self.arbiter.request_stop_least(self.arbiter_key)
+        started = _clock()
+        while _clock() - started < res.DISK_YIELD_WAIT:
+            self.check()
+            _sleep(0.1)
+            free = res.disk_free_bytes(part.parent)
+            if free is None or free >= self._disk_still_needed(part, done_rows) + res.disk_margin():
+                return
+            if self.arbiter.is_least_advanced(self.arbiter_key) or self.arbiter.stop_requested(self.arbiter_key):
+                break
+            self.arbiter.request_stop_least(self.arbiter_key)  # the marked one may have finished; mark the next
+        raise DiskFull()
+
+    def _disk_still_needed(self, part: Path, done_rows: int) -> int:
+        """Bytes the rest of this file is expected to take: the rows left x the bytes per row seen so
+        far in the `.part` (compression included). 0 until something is on disk: the first chunks are
+        covered by the margin, so a file the user confirmed in the preflight (57.9.6a) is not stopped
+        by the uncompressed upper bound."""
+        if done_rows <= 0:
+            return 0
+        try:
+            written = part.stat().st_size
+        except OSError:
+            return 0
+        left = max(0, self.plan.rows - done_rows)
+        return int(left * written / done_rows)
 
     # -- reading ----------------------------------------------------------------------------
 
@@ -383,6 +607,17 @@ class _Run:
             out[name] = variables[name][lo - ws : hi - ws]
         return out
 
+    def _derived_array(self, name: str, values: np.ndarray) -> pa.Array:
+        """A derived variable's chunk in the chosen type. float32: NaN / Inf stay; a finite value too large
+        for float32 becomes Inf and is remembered for the final warning (57.9.6b)."""
+        if self.plan.derived_dtype != "float32":
+            return pa.array(values, type=pa.float64())
+        with np.errstate(over="ignore"):
+            small = values.astype(np.float32)
+        if np.any(np.isinf(small) & np.isfinite(values)):
+            self.f32_overflow.add(name)
+        return pa.array(small, type=pa.float32())
+
     def chunk_table(self, lo: int, hi: int) -> pa.Table:
         """The output rows [lo, hi): time axis, then the signals in the plan's order. A
         `source_row` column (data 56.4) would be added here."""
@@ -391,11 +626,38 @@ class _Run:
         arrays, names = [], []
         for c in (self.plan.time, *self.plan.columns):
             names.append(c.name)
-            arrays.append(raw.column(c.name) if c.source is not None else pa.array(derived[c.name], type=pa.float64()))
+            arrays.append(raw.column(c.name) if c.source is not None else self._derived_array(c.name, derived[c.name]))
         table = pa.table(arrays, names=names)
         if self.schema is not None:
             table = table.cast(self.schema)
         return table
+
+
+class _Throttle:
+    """Progress reports at most every `PROGRESS_INTERVAL` seconds (57.9.7). Phase markers
+    (`total < 0`) and reports with `force` always pass."""
+
+    def __init__(self, sink: Callable[[int, int], None]):
+        self.sink = sink
+        self.last = -1e9
+
+    def __call__(self, done: int, total: int, force: bool = False) -> None:
+        now = _clock()
+        if force or total < 0 or now - self.last >= PROGRESS_INTERVAL:
+            self.last = now
+            self.sink(done, total)
+
+
+def _polars_writer_usable(schema: pa.Schema) -> bool:
+    """True when the streaming polars writer keeps every column's Arrow type (57.9.3): strings come
+    back as large_string, so a file with one is written by pyarrow."""
+    try:
+        from polars.io.plugins import register_io_source  # noqa: F401
+
+        back = pl.from_arrow(schema.empty_table()).to_arrow().schema
+    except Exception:  # noqa: BLE001 (any trouble: use the pyarrow writer)
+        return False
+    return len(back) == len(schema) and all(back.field(i).type == schema.field(i).type for i in range(len(schema)))
 
 
 def export_parquet(
@@ -403,14 +665,21 @@ def export_parquet(
     path: str | os.PathLike,
     progress: Callable[[int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    overwrite: bool = False,
+    writer: str | None = None,
+    arbiter: res.DiskArbiter | None = None,
+    arbiter_key: object = None,
 ) -> ExportResult:
-    """Run `plan`, writing `path` (57.2). `progress(done_rows, total_rows)` is called before the
-    first chunk and after each one; `cancelled()` is polled between chunks (-> ExportCancelled).
+    """Run `plan`, writing `path` (57.2, 57.8.1). An existing `path` is refused (ExportError, nothing
+    written) unless `overwrite` is true; the source file is refused either way. `progress(done_rows, total_rows)` is called before the
+    first chunk and after each one (at most every 100 ms, 57.9.7); `cancelled()` is polled between
+    chunks (-> ExportCancelled). `writer`: None picks polars' streaming sink when it keeps the column
+    types, else pyarrow; "pyarrow" forces the latter (57.9.3).
     Whatever happens, no `.part` file is left behind and an existing `path` is only replaced by a
     complete new file."""
     t0 = time.perf_counter()
     path = Path(path)
-    progress = progress or (lambda done, total: None)
+    throttled = _Throttle(progress or (lambda done, total: None))
     cancelled = cancelled or (lambda: False)
     try:
         if path.resolve() == Path(plan.source_path).resolve() or (
@@ -419,30 +688,35 @@ def export_parquet(
             raise ExportError("the output file is the source file")
     except OSError:
         pass
+    if not overwrite and path.exists():  # 57.8.1: only the UI's confirmed path may replace a file
+        raise ExportError(f"the output file already exists: {path}")
     if plan.time_range is not None:  # 57.7.4: the first phase, before anything is written
-        progress(0, PROGRESS_RANGE)
+        throttled(0, PROGRESS_RANGE)
         if cancelled():
             raise ExportCancelled()
         start, end = find_row_range(
-            plan.source_path, plan.time.source, *plan.time_range, chunk_rows=plan.chunk_rows, cancelled=cancelled
+            plan.source_path, plan.time_range_column or plan.time.source, *plan.time_range,
+            chunk_rows=plan.chunk_rows, cancelled=cancelled,
         )
         if end <= start:
             raise NoRowsInRange()
         plan = dataclasses.replace(plan, row_start=start, row_end=end, time_range=None)
-    run = _Run(plan, cancelled)
+    run = _Run(plan, cancelled, arbiter, arbiter_key)
+    if arbiter is not None:
+        arbiter.register(arbiter_key, res._volume_key(path.resolve().parent))
     total = plan.rows
     part = path.with_name(path.name + ".part")
-    writer: pq.ParquetWriter | None = None
     row_groups = 0
+    used = "pyarrow"
     try:
         run.check()
         if run.full_names:
-            progress(0, PROGRESS_FULL)  # total < 0: the full-row phase, no percentage (57.3)
+            throttled(0, PROGRESS_FULL)  # total < 0: the full-row phase, no percentage (57.3)
         run.compute_full()
         run.check()
         # The first chunk (or an empty slice) fixes the schema; the range's edge times are
         # read before the writer exists because the metadata is part of the schema.
-        first_hi = min(plan.row_end, plan.row_start + plan.chunk_rows)
+        first_hi = min(plan.row_end, plan.row_start + run.chunk_rows)
         first = run.chunk_table(plan.row_start, first_hi)
         start_text = run.time_text(plan.row_start) if total else ""
         end_text = run.time_text(plan.row_end - 1) if total else ""
@@ -450,36 +724,20 @@ def export_parquet(
         meta = {METADATA_KEY: _metadata_json(plan, start_text, end_text, created)}
         run.schema = first.schema.with_metadata(meta)
         first = first.cast(run.schema)
-        writer = pq.ParquetWriter(str(part), run.schema, compression="zstd")
-        progress(0, total)
-        done = plan.row_start
-        table = first
-        while True:
-            if table.num_rows or total == 0:
-                writer.write_table(table, row_group_size=max(1, table.num_rows))
-                row_groups += 1 if table.num_rows else 0
-            done += table.num_rows
-            run.check()  # before reporting: a cancel must not be followed by a progress report
-            progress(done - plan.row_start, total)
-            if done >= plan.row_end:
-                break
-            run.check()
-            table = run.chunk_table(done, min(plan.row_end, done + plan.chunk_rows))
+        throttled(0, total, force=True)
+        if total and writer != "pyarrow" and _polars_writer_usable(run.schema):
+            used = "polars"
+            row_groups = _write_polars(run, plan, part, first, total, throttled)
+        else:
+            row_groups = _write_pyarrow(run, plan, part, first, total, throttled)
         run.check()  # a cancel during the last chunk must not publish the file
-        writer.close()
-        writer = None
         os.replace(part, path)
     except BaseException:
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception:  # noqa: BLE001 (the original error matters more)
-                pass
-        try:
-            part.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _remove_part(part)
         raise
+    finally:
+        if arbiter is not None:
+            arbiter.unregister(arbiter_key)
     return ExportResult(
         path=str(path),
         rows=total,
@@ -487,7 +745,93 @@ def export_parquet(
         columns=1 + len(plan.columns),
         full_computed=tuple(run.full_names),
         elapsed=time.perf_counter() - t0,
+        writer=used,
+        chunk_halvings=run.halvings,
+        memory_wait=run.memory_wait,
+        float32_overflow=tuple(n for n in (c.name for c in plan.columns) if n in run.f32_overflow),
     )
+
+
+def _remove_part(part: Path) -> None:
+    """Delete the `.part` once. A polars sink is always allowed to end by itself (see `_write_polars`),
+    so its writer thread has closed the file by now and nothing can recreate it later."""
+    try:
+        part.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _chunks(run: _Run, plan: ExportPlan, part: Path, first: pa.Table, total: int, progress: _Throttle):
+    """The output chunks in order, as Arrow tables; checks cancel and the resource guard between
+    chunks and reports progress as it hands each one over (57.9.3)."""
+    done = plan.row_start
+    table = first
+    while True:
+        done += table.num_rows
+        run.check()  # before reporting: a cancel must not be followed by a progress report
+        progress(done - plan.row_start, total, force=done >= plan.row_end)
+        yield table
+        if done >= plan.row_end:
+            return
+        run.check()
+        run.gate(part, done - plan.row_start)
+        table = run.chunk_table(done, min(plan.row_end, done + run.chunk_rows))
+
+
+def _write_pyarrow(run: _Run, plan: ExportPlan, part: Path, first: pa.Table, total: int, progress: _Throttle) -> int:
+    """The chunks through `ParquetWriter` (one row group per chunk). Dictionary encoding only for
+    columns that are not floating point: it costs time and saves nothing there (57.9.1)."""
+    schema = run.schema
+    assert schema is not None
+    dictionary = [f.name for f in schema if not pa.types.is_floating(f.type)]
+    w = pq.ParquetWriter(str(part), schema, compression="zstd", use_dictionary=dictionary)
+    groups = 0
+    try:
+        if total:  # nothing to write for 0 rows: the guard must not fail an empty file
+            run.gate(part)
+        for table in _chunks(run, plan, part, first, total, progress):
+            if table.num_rows or total == 0:
+                w.write_table(table, row_group_size=max(1, table.num_rows))
+                groups += 1 if table.num_rows else 0
+    finally:
+        try:
+            w.close()
+        except Exception:  # noqa: BLE001 (the original error matters more)
+            pass
+    return groups
+
+
+def _write_polars(run: _Run, plan: ExportPlan, part: Path, first: pa.Table, total: int, progress: _Throttle) -> int:
+    """The chunks through polars' streaming `sink_parquet` (57.9.3): encoding and compression of the
+    columns run on several cores. The generator runs on a polars thread and never touches the
+    screen. On a cancel / failure inside it the generator stores the exception and ends normally, so
+    polars closes its own file; the stored exception is raised afterwards (the caller removes the
+    `.part` once). Raising inside the generator instead lets polars' writer thread create the `.part`
+    up to ~34 ms after the error came back, which no fixed wait can cover."""
+    from polars.io.plugins import register_io_source
+
+    schema = run.schema
+    assert schema is not None
+    failure: list[BaseException] = []
+
+    def io_source(with_columns, predicate, n_rows, batch_size):  # noqa: ARG001 (polars' call signature)
+        try:
+            for table in _chunks(run, plan, part, first, total, progress):
+                df = pl.from_arrow(table)
+                yield df if with_columns is None else df.select(with_columns)
+        except Exception as e:  # noqa: BLE001 (kept to be raised as itself)
+            failure.append(e)  # and end normally: the sink finishes and closes its file
+
+    # a failure before the first chunk must not start a polars writer at all
+    run.check()
+    run.gate(part)
+    lazy = register_io_source(io_source=io_source, schema=pl.from_arrow(first).schema)
+    lazy.sink_parquet(
+        str(part), compression="zstd", row_group_size=plan.chunk_rows, statistics=True, arrow_schema=schema
+    )
+    if failure:
+        raise failure[0]
+    return pq.read_metadata(str(part)).num_row_groups
 
 
 # -- a saved view as the source (export 57.7) ---------------------------------------------------
@@ -637,6 +981,8 @@ class ViewExport:
     expressions: Mapping[str, str]  # the usable derived variables of the view
     saved_range: tuple[float, float] | None
     available: frozenset[str]  # names a formula may use: file columns and aliases minus the time axis
+    range_name: str | None = None  # the view's own time axis (the saved range's units), whatever column is output first
+    range_source: str | None = None  # its file column; None when this file lacks it
 
 
 def view_export_info(
@@ -646,6 +992,7 @@ def view_export_info(
     registry: FunctionRegistry,
     *,
     alias_names: Collection[str] | None = None,
+    time_column: str | None = None,
 ) -> ViewExport:
     """Judge a saved view against a file's columns (57.7.2, 57.7.3) with the one rule shared with
     `load_view` and the view manager (`view_check.classify_derived`). `aliases`: the aliases that
@@ -653,7 +1000,8 @@ def view_export_info(
     dictionary (a derived variable named like one is skipped by load_view); default = `aliases`."""
     alias_sources = resolve_aliases(file_columns, aliases)
     names = set(file_columns) | set(alias_sources)
-    time_name = view.time_column or (file_columns[0] if file_columns else None)
+    # 57.8.3: a column chosen in the dialog replaces the view's time axis (it is looked up like any other name)
+    time_name = time_column or view.time_column or (file_columns[0] if file_columns else None)
     time_problem = None
     time_source = None
     if time_name is not None and time_name in names:
@@ -688,9 +1036,11 @@ def view_export_info(
             listed.add(d.name)
             items.append(ViewItem(d.name, "derived", None, problems.get(d.name), False))
     usable_exprs = {n: e for n, e in exprs.items() if problems.get(n) is None}
+    range_name = view.time_column or (file_columns[0] if file_columns else None)
+    range_source = alias_sources.get(range_name, range_name) if range_name is not None and range_name in names else None
     return ViewExport(
         time_name, time_source, time_problem, alias_sources, tuple(items), usable_exprs, view.x_axis_range,
-        frozenset(available),
+        frozenset(available), range_name, range_source,
     )
 
 
@@ -705,7 +1055,8 @@ def plan_from_view(
     view_file: str,
     software: str,
     registry: FunctionRegistry,
-    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    chunk_rows: int | None = None,
+    derived_dtype: str = "float64",
 ) -> ExportPlan:
     """The plan for exporting `selected` items of a saved view without opening it (57.7.5). Pure:
     nothing of the app's open file or window is used. Output names stay the view's names (aliases
@@ -721,6 +1072,8 @@ def plan_from_view(
         signals.append(ExportColumn(name, item.source))
     if use_saved_range and info.saved_range is None:
         raise ExportError("the view has no saved range")
+    if use_saved_range and info.range_source is None:  # 57.8.3: the range's units belong to the view's own axis
+        raise RangeAxisMissing(info.range_name or "")
     file_columns = {n: info.alias_sources.get(n, n) for n in info.available}
     plan = build_plan(
         source_path=source_path,
@@ -733,13 +1086,33 @@ def plan_from_view(
         registry=registry,
         metadata={"view": view.view_name, "view_file": view_file, "software": software},
         chunk_rows=chunk_rows,
+        derived_dtype=derived_dtype,
     )
     used = {info.time_name, *(c.name for c in plan.columns), *(n for n, _ in plan.inputs)}
     aliases = {n: info.alias_sources[n] for n in sorted(used) if n in info.alias_sources}
     metadata = dict(plan.metadata)
     if aliases:
         metadata["aliases"] = aliases
-    return dataclasses.replace(plan, metadata=metadata, time_range=info.saved_range if use_saved_range else None)
+    return dataclasses.replace(
+        plan, metadata=metadata, time_range=info.saved_range if use_saved_range else None,
+        time_range_column=info.range_source if use_saved_range else None,
+    )
+
+
+def time_candidates(schema: pa.Schema) -> list[str]:
+    """The columns that can serve as the output's time axis (57.8.3): numeric or temporal types, in file
+    order. Booleans, strings and nested types cannot."""
+    out = []
+    for field_ in schema:
+        t = field_.type
+        if pa.types.is_boolean(t):
+            continue
+        if (
+            pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_timestamp(t) or pa.types.is_date(t)
+            or pa.types.is_time(t) or pa.types.is_duration(t) or pa.types.is_decimal(t)
+        ):
+            out.append(field_.name)
+    return out
 
 
 def format_time_value(x: float, arrow_type: pa.DataType | None) -> str:

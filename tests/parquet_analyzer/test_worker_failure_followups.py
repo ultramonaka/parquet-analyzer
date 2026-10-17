@@ -61,10 +61,13 @@ def test_check_time_order_chunked_equals_unchunked(monkeypatch):
     v[rng.integers(0, 5000, 200)] -= 50.0  # decreases, some across boundaries
     v[rng.integers(0, 5000, 100)] = np.nan
     v[[0, 99, 100, 101, 4999]] = np.nan  # NaN on/around chunk edges
+    def order_fields(r):  # dt_median depends on the chunking by design (data 60.1); the rest must not
+        return (r.nan_count, r.decreasing_count, r.first_decreasing_index, r.duplicate_count, r.first_duplicate_index)
+
     full = check_time_order(v)
     for chunk in (1, 2, 7, 100, 333):
         monkeypatch.setattr(numeric_module, "_TIME_ORDER_CHUNK_ROWS", chunk)
-        assert check_time_order(v) == full, chunk
+        assert order_fields(check_time_order(v)) == order_fields(full), chunk
     monkeypatch.setattr(numeric_module, "_TIME_ORDER_CHUNK_ROWS", 3)
     r = check_time_order(np.array([1.0, 2.0, 3.0, 2.5, 4.0, 5.0]))  # decrease across a boundary
     assert (r.decreasing_count, r.first_decreasing_index) == (1, 3)

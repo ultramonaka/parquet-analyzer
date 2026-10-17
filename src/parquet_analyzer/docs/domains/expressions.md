@@ -1245,7 +1245,7 @@ Reading:
 - During computation, it is included in the "drawing/computing" `_busy_sources`, and the recording of the operation log result waits for the end.
 - Add `view_compute_cancel` to the list of the side-effect tests (app ch. 45).
 
-#### 55.7.1 What was decided in implementation and differences from the spec (2026-10-15, implementer)
+#### 55.7.1 What was decided in implementation and differences from the spec (2026-10-15)
 
 - **Upper limit of 4 on the default parallelism** (55.3). The reason is the measurements in 55.6 (memory grows without getting faster).
 - **A derived variable whose computation fails is removed together with its definition, like one that could not be registered** (removed from `_derived` and the variable panel. Dependents are removed too,

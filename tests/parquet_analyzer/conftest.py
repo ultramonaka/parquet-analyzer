@@ -101,3 +101,24 @@ def sample_parquet_path(tmp_path):
     path = tmp_path / "sample.parquet"
     pq.write_table(table, path)
     return path
+
+
+_REAL_PROBES: dict[str, object] = {}
+
+
+@pytest.fixture(autouse=True)
+def _quiet_export_guards(monkeypatch):
+    """The export's disk / memory guards (export 57.9.6a) must not read the real machine: plenty of
+    room, so a nearly full disk or busy Mac cannot change what a test sees. Tests about the guards
+    replace the probes again; `real_export_probes` gives the originals."""
+    from parquet_analyzer.core import export_resources as res
+
+    _REAL_PROBES.setdefault("disk_free_bytes", res.disk_free_bytes)
+    _REAL_PROBES.setdefault("available_memory_bytes", res.available_memory_bytes)
+    monkeypatch.setattr(res, "disk_free_bytes", lambda p: 500 * res.GB)
+    monkeypatch.setattr(res, "available_memory_bytes", lambda: 64 * res.GB)
+
+
+@pytest.fixture
+def real_export_probes():
+    return dict(_REAL_PROBES)

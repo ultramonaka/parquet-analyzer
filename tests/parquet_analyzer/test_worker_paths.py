@@ -65,6 +65,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import shiboken6
 from PySide6.QtCore import QEvent, Qt, QThreadPool
 from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidget
 from waiting import wait_until
@@ -526,6 +527,62 @@ def test_downsample_remove_plot_with_job_in_flight(d_world):
     assert plot2 not in win.plot_grid._panes
     # (the orphan plot's own entry may still receive its result: invisible, deleted with the pane)
     assert not w.render_failed
+    assert_clean_log()
+
+
+def test_removed_plot_starts_no_job_when_its_range_moves(d_world):
+    """D-4 (plot variant, CI flake): a removed plot stays X-linked until it is deleted, so its
+    range still moves (re-layout outside the splitter, the group being panned). That must not
+    schedule a redraw that submits a new job: the grid deletes the pane as soon as the plot's
+    pending count reaches 0, and a job started after that check would be delivered to a deleted
+    widget (RuntimeError) with its busy marker never cleared."""
+    w = d_world("lttb")
+    win, gate = w.win, w.gate
+    plot2 = win.plot_grid.add_plot()
+    w.owned.append(plot2)
+    w.fresh["on"] = True
+    win._on_variable_dropped(plot2, "a")
+    wait_held(win, gate)
+    started = []
+    plot2.downsampleStarted.connect(lambda: started.append(1))
+    win.plot_grid.remove_plot(plot2)
+    lo, hi = win.plot_grid.plots[0].getViewBox().viewRange()[0]
+    win.plot_grid.plots[0].getViewBox().setXRange(lo + (hi - lo) * 0.25, hi - (hi - lo) * 0.25, padding=0)
+    deadline = time.monotonic() + 4 * plot_widget_module._REDRAW_DEBOUNCE_MS / 1000
+    while time.monotonic() < deadline:  # real time: well past the redraw debounce
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert started == [], "the removed plot started a new background job"
+    gate.release_all()
+    settle(win, extra=lambda: not plot2._hub.pending)
+    assert_clean_log()
+
+
+def test_removed_plot_redraw_after_delete_later_is_ignored(d_world):
+    """D-4 (plot variant, CI flake, the exact interleaving): the last held result is delivered,
+    the grid calls deleteLater() on the pane (nothing pending), and the plot's redraw debounce
+    fires before the deferred delete runs. No job may start then; otherwise its result reaches
+    the deleted plot (`Signal source has been deleted`) and the grid's busy stays on."""
+    w = d_world("lttb")
+    win, gate = w.win, w.gate
+    plot2 = win.plot_grid.add_plot()
+    w.owned.append(plot2)
+    w.fresh["on"] = True
+    win._on_variable_dropped(plot2, "a")
+    wait_held(win, gate)
+    win.plot_grid.remove_plot(plot2)
+    fired = []
+
+    def debounce_fires_now():  # connected after the grid's own slot: runs right after deleteLater()
+        if not fired and not plot2._hub.pending:
+            fired.append(1)
+            plot2._redraw_all_series()  # what the debounce timer's timeout runs
+
+    plot2.downsampleFinished.connect(debounce_fires_now)
+    gate.release_all()
+    settle(win, extra=lambda: bool(fired) and not plot2._hub.pending)
+    assert wait_until(lambda: plot2 not in win.plot_grid._panes and not shiboken6.isValid(plot2), SETTLE_TIMEOUT)
+    settle(win)
     assert_clean_log()
 
 

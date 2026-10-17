@@ -67,7 +67,7 @@ the MDF/MATLAB→Parquet conversion tool.
   by memory size, and make background work that is no longer needed stoppable midway.
 - 2026-10-04: the time-axis index, windowed computation of derived variables and the thinned first draw
   were adopted and implemented (cache memory management and cancellation were not adopted). The design is
-  in [36.8](#368-the-adopted-design-2026-10-04-from-the-367-decision-and-the-reviewers-review).
+  in [36.8](#368-the-adopted-design-2026-10-04-from-the-367-decision-and-the-review).
 
 #### 5.46 Aggregating statistics over a whole column window by window
 - When "Statistics" is pressed on a large file (a windowed column), the rows of the displayed range are not read all
@@ -121,6 +121,15 @@ the MDF/MATLAB→Parquet conversion tool.
 - Verify with random data the cases where NaN, Inf, duplicate times or float32 lie at bucket, anchor and row-group boundaries.
 - Background work that never stops, memory limits and fallback to full computation are handled in stage 2 of ch. 58 (not in ch. 59).
 - Details in [ch. 59](#59-correctness-and-boundary-conditions-on-large-data-added-2026-10-15).
+
+#### 5.54 Showing the sampling rate (added 2026-10-16, user request)
+- Show the sampling interval and rate of the open file's time axis (e.g. 100 Hz (10 ms)) in the status bar. One per file (the time axis is
+  common to all signals).
+- For an unevenly spaced axis, add the marks "approx." and "irregular". Whether to show it can be switched in the settings dialog (default:
+  shown).
+- Add a column "effective sample rate" (the effective rate excluding missing values) per signal to the statistics table.
+- Details in [ch. 60](#60-showing-the-sampling-rate-added-2026-10-16).
+- **Status: implemented** (2026-10-16. Branch `feat/60-sampling-rate`, before merge).
 
 ## Design
 
@@ -761,7 +770,7 @@ Findings:
   reduction. Time gets a little slower for the first draw (1.03 → 1.13 s) and a derived variable's first draw
   (0.2 → 1.7 s), but is the same or faster elsewhere (three columns 3.9 → 2.9 s, time axis back 0.7 → 0.2 s).
 - Before merging: D touches visible ranges, statistics, cursors, hover, the navigator and views widely, so it
-  goes through the `reviewer`'s review and a real-machine check. Also the full suite with the flags on, and
+  goes through the review and a real-machine check. Also the full suite with the flags on, and
   checks with 10 million rows and a non-ascending time axis.
 - Add E to `exp/36-combined` and measure A+C+D+E; adopt it together if nothing gets worse.
 - The slowness of a derived variable's first draw (C) can be reduced later, e.g. by keeping the visible range's
@@ -797,10 +806,10 @@ measurement where cancellation pays off (e.g. changing the visible range in the 
 **Decision (2026-10-04, user's decision "go ahead with those steps")**: E is not adopted (reverted from
 `feat/36-large-data`; `big_e_cancel` and `CancelToken` removed). The A, C and D flags were turned on by default
 (the flags themselves to be removed later). A test of the C×D combination (`test_big_c_d_combo.py`) was added.
-Before merging: the `reviewer`'s review, checks with 10 million rows and a non-ascending time axis, and a
+Before merging: the review, checks with 10 million rows and a non-ascending time axis, and a
 real-machine check.
 
-#### 36.8 The adopted design (2026-10-04, from the 36.7 decision and the reviewer's review)
+#### 36.8 The adopted design (2026-10-04, from the 36.7 decision and the review)
 
 A, C and D are adopted (the flags `big_a_thin_first_draw`, `big_c_windowed_derived`, `big_d_time_index` are on
 by default; after the real-machine check and the merge, the flags themselves are removed). B was not pursued
@@ -1011,7 +1020,7 @@ Requirement: 5.46.
      block size (100k rows) (`chunked_stats`'s default of 4 million rows), so there are fewer calls.
    - Rows outside the range must not be read (before `row_start` or at/after `row_end`). The range clamping of `read_columns` (data 29.5) still applies.
    - If the measurements (53.4) show it is slower or uses more memory than the cached path, the reason is written down and the
-     cached path may be restored (report to the main session).
+     cached path may be restored (report to the developer).
 3. **Failures.** A read failure used to be caught on the UI thread and put into `errors` (28.2). For windowed columns it now
    arrives as a failure of background work (`{"error": msg}` in `_on_stats_finished`). The error text for that variable in the
    dialog keeps the same form as now, and the other variables are shown normally. Every path still satisfies "report success or
@@ -1052,11 +1061,11 @@ Requirement: 5.46.
   peak memory (MB) in this section, in the form of the 36.7 table.
 - Target: the peak memory of `stats_full` stays within the resident memory after drawing (about 1.4 GB) plus a few hundred MB. Time is
   within 1.5× the time before (reads may go from 1 pass to up to 3, so it may be slower). If it falls outside this, write down the reason and
-  a proposal (e.g. change the chunk size) and report to the main session.
+  a proposal (e.g. change the chunk size) and report to the developer.
 - `stats_zoom` (the displayed range is 1/1000) is the same or faster.
 - When several variables are selected (added in review, 2026-10-13): each variable becomes one background job, running at the same time in
   the analysis pool. Per variable, a chunk (4 million rows) of temporary arrays is about 150 MB. With 4 variables at once on 100 million rows,
-  +515 MB (measured by the `reviewer`). With more than 12 it could be +1.5–2 GB, but that is still well below before (where 800 MB per variable
+  +515 MB (measured in review). With more than 12 it could be +1.5–2 GB, but that is still well below before (where 800 MB per variable
   was read in one go on the UI thread). If it becomes a problem, make `chunk_rows` smaller.
 
 **Measurement results (2026-10-13)**: `bench_100m.parquet` (100 million rows, 4.62 GB), Apple M4 Pro / 24 GB, median of 2 runs each,
@@ -1151,6 +1160,16 @@ because the impact is wide).
   and once the memory-limit setting of ch. 58 exists, it refuses based on that.
 - Turning it off returns to the original columns and recomputes virtual variables. Plots and ranges return to the whole view (because the
   row correspondence changes).
+- **The range calculation for a time axis with missing values (NaN / ±Inf) in the middle is also fixed here** (2026-10-16, a point to confirm from
+  an external review, P1. The user agreed: chose a fundamental fix rather than extending the light warning): at present `np.searchsorted` in
+  `_visible_row_range()` has its ascending-order premise broken by a NaN in the middle, and the rows of the range shift (e.g. with
+  `[0,1,NaN,2,3]` the range (1.5, 3) becomes `(2, 2)`; measured). For a column with missing values only, `time_order_unreliable()` is `False`
+  (56.1), so no warning appears either (only the missing-count label, 29.2). With sorted display (non-finite values at the end), `searchsorted`
+  treats NaN as the maximum and works correctly. Therefore the sort button should be pressable even for a time axis with missing values only (it
+  is enabled when there are missing values even if the axis is otherwise ascending), and the wording of the warning before sorting should say
+  that "missing values make ranges and statistics inaccurate" and point to sorting. For files with windowed columns it cannot be used because of
+  the restriction in 56.4, so how to handle that case (using a `TimeIndex` of finite values only, data 36.6 D, etc.) is decided in stage 2 of
+  ch. 58. Not urgent (work starts at stage 2).
 
 #### 56.5 Display time-zone-aware times in UTC (stage 2)
 
@@ -1362,7 +1381,7 @@ are unknown. So proceed in this order.
   - Trial measurement (2 million rows x 25 columns float64): `full` is about 185 bytes/row (compression about 10%), `quantised` about 15
     bytes/row. Extrapolated to 500 million rows, `full` is about 93 GB and generation about 5 minutes (assuming generation speed is
     proportional to the row count).
-- **Make the shape of `view_load` configurable** (2026-10-15, continuation of stage 2-0. `feat/58-bench-view-shape`. Medium -> `implementer`):
+- **Make the shape of `view_load` configurable** (2026-10-15, continuation of stage 2-0. `feat/58-bench-view-shape`. Medium):
   - Add to `bench_large_file.py` `--view-raw N` (number of original columns the view uses, default 4), `--view-derived M` (number of virtual
     variables, default 10) and `--view-plotted K` (how many of those are plotted, default 3). With the defaults, the view (list of formulas,
     names and colors) is **the same** as now (to compare with the stage 1 results). For measuring actual usage, use `--view-raw 10
@@ -1421,7 +1440,7 @@ are unknown. So proceed in this order.
 
 Requirement: 5.53. Background: the confirmation results of external review 3, and the response to the review's "verify boundary
 conditions, and measure performance and numerical correctness at 500M rows" (user's decision, 2026-10-15). Order: 59.2 and 59.3 (one branch,
-`fix/59-pyramid-alignment`, medium -> `implementer`) can start right away. 59.1 (`feat/59-bench-verify`, medium -> `implementer`) touches the
+`fix/59-pyramid-alignment`, medium) can start right away. 59.1 (`feat/59-bench-verify`, medium) touches the
 measurement script, so create it from `main` after `feat/58-bench-view-shape` of 58.5.1 is merged, and **merge it before the stage 2-0
 measurement of ch. 58** (so correctness is also checked in that measurement).
 
@@ -1532,6 +1551,66 @@ measurement of ch. 58** (so correctness is also checked in that measurement).
 - The regression test of 59.2 fails before the fix (confirm with the replaced batches).
 - Confirmation at merge for 59.1: run a measurement with `--verify` on a small file (100,000 rows) and on something like
   `daily_cycle_500mb.parquet`; everything is `ok` or `skipped`.
+
+### 60. Showing the sampling rate (added 2026-10-16)
+
+**Status: implemented** (2026-10-16. Branch `feat/60-sampling-rate`, before merge).
+
+Requirement: 5.54. Decisions (2026-10-16, user): one value for the whole file, in the status bar, a switch in the settings dialog, and a row
+(column) added to the statistics.
+
+#### 60.1 How it is computed (`core/numeric.py`)
+
+- It is computed in **the same single pass** as the time-axis order check (`TimeOrderScanner`, ch. 29) (no separate pass; no extra reading even
+  at 500 million rows). For each chunk, `feed` records the **median** and the **minimum / maximum** of the finite differences `d = diff(v)` with
+  `d > 0` (including differences across chunk boundaries), and `report()` adds `dt_median` (the median of the chunk medians), `dt_min` and
+  `dt_max` (the overall minimum and maximum) to `TimeOrderReport` (default `nan`). The exact overall median would need sorting and is heavy, so
+  the median of the chunk medians is used instead (exact for evenly spaced data, and a gap confined to some chunks hardly affects the median).
+- The time axis is floating-point seconds (the result of `to_numeric`, overview "time-axis premise"), so `rate_hz = 1 / dt_median`. When the
+  time axis is switched to a column that is not a time (such as rotation speed) the same formula is used, but no unit is attached and the
+  "interval" and "points per unit" are shown (whether the column is a time is decided by `is_datetime`, held by the caller of
+  `TimeOrderReport`; if unknown, it is shown as seconds).
+- **Irregularity test**: `(dt_max - dt_median) / dt_median > FFT_JITTER_TOLERANCE` or `(dt_median - dt_min) / dt_median > FFT_JITTER_TOLERANCE`
+  (the constant of ch. 32 is shared). An axis with no valid difference (fewer than 2 points), not ascending, or only non-finite values has
+  `dt_median = nan`, and the display is "-".
+
+#### 60.2 Status bar (`MainWindow`)
+
+- The label `_sampling_label` is placed next to `_time_order_label` (right of the file name, `addWidget`). Wording: even `100 Hz (10 ms)`,
+  uneven `approx. 100 Hz (10 ms) - irregular` (`sampling.label`, `sampling.label_irregular`, en + ja). The tooltip gives the minimum and
+  maximum intervals and an explanation of how the range used by the statistics is taken.
+- Digits: 3 significant figures; units Hz / kHz / MHz and ns / µs / ms / s / min (a small function like `format_si` placed in `ui/`).
+- It is set again every time a file is opened or closed or the time axis is switched, at the same place as the time-axis order check (29.2).
+  Hidden while no file is open.
+- The setting `Settings.show_sampling_rate: bool = True` (persistence). In the settings dialog's "Display" group, a checkbox "Show the sampling
+  rate in the status bar". The switch is **reflected immediately** in open windows (no restart needed). Even when hidden, the computed value is
+  kept (the statistics use it).
+- When the order warning (29.2) is shown, the value computed from the finite differences is still shown (next to the warning).
+
+#### 60.3 Statistics (analysis ch. 14)
+
+- Add a column "effective sample rate" to the statistics table: `valid count / length of the statistics range` (the effective number of points
+  per second excluding missing and non-finite values). The range length is the width of the time range passed to the statistics. Without
+  missing values it nearly equals the file's rate, and it becomes smaller for signals with more missing values. If the range length is 0 or
+  less, "-".
+- The status-bar value (whole file) and this column (per range and per signal) are different things, so the tooltip explains the difference. It
+  does not depend on the `show_sampling_rate` setting (the statistics column is always shown).
+- The column is also included in the statistics CSV export / copy (if any).
+
+#### 60.4 Test plan
+
+- Core: even spacing (median, minimum and maximum agree) / differences across chunk boundaries / jitter of 0.5% is even, 5% is uneven /
+  NaN and Inf are skipped / duplicates (difference 0) are not counted / not ascending or fewer than 2 points gives `nan` / the existing results
+  of `check_time_order` do not change (regression) / it is obtained in a single pass (no double scan).
+- Screen: opening a file shows a value in `_sampling_label` / "approx." and "irregular" for uneven spacing / switching the time axis updates it /
+  turning the setting OFF hides it immediately and ON brings it back / hidden when closed / the statistics column is smaller for a signal with
+  missing values.
+- Saving and loading the setting (`show_sampling_rate`; unknown keys are ignored).
+
+#### 60.5 How to proceed
+
+- Small to medium. One branch `feat/60-sampling-rate`. Extending `TimeOrderScanner` touches the large-data path, so
+  confirm with the existing measurement (`bench_large_file.py`) that the scan time has not increased. A separate review is not needed.
 
 ## Relations to other domains
 

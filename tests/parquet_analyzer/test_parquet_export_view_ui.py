@@ -118,7 +118,8 @@ class Driver:
                 dlg.source_combo.setCurrentIndex(dlg.source_combo.findData(self.pick))
                 self.seen["picked"] = self.snapshot(dlg)
             if self.other_file is not None:
-                monkeypatch.setattr(main_window_module, "pick_parquet_file", lambda *a, **k: self.other_file)
+                picked = [self.other_file] if isinstance(self.other_file, str) else list(self.other_file)
+                monkeypatch.setattr(main_window_module, "pick_parquet_files", lambda *a, **k: picked)
                 QTest.mouseClick(dlg.other_file_button, Qt.MouseButton.LeftButton)
                 self.seen["other"] = self.snapshot(dlg)
             if self.names is not None:
@@ -133,8 +134,9 @@ class Driver:
             QTest.mouseClick(dlg.buttons.button(QDialogButtonBox.StandardButton.Ok), Qt.MouseButton.LeftButton)
             return QDialog.DialogCode.Accepted if dlg.result() == QDialog.DialogCode.Accepted else QDialog.DialogCode.Rejected
 
-        def get_save(parent, caption, directory, filter_):
+        def get_save(parent, caption, directory, filter_, **kw):
             self.save_args = (caption, directory, filter_)
+            self.save_kw = kw
             return str(self.out), ""
 
         monkeypatch.setattr(ParquetExportDialog, "exec", exec_)
@@ -410,9 +412,10 @@ def test_output_equal_to_the_source_is_refused(empty_win, sample_parquet_path, d
     assert empty_win._parquet_export is None and sample_parquet_path.stat().st_size == before
 
 
-def test_only_one_export_at_a_time(win, sample_parquet_path, driver, boxes, monkeypatch):
+def test_an_export_started_while_one_runs_joins_the_queue(win, sample_parquet_path, driver, boxes, monkeypatch):
     import threading
 
+    win.settings.export_parallel_files = 1
     save_view("v1", sample_parquet_path, [["a", "dd"]], derived=[("dd", "a * 2")])
     entered, release = threading.Event(), threading.Event()
     real = pe.evaluate_expression
@@ -427,13 +430,14 @@ def test_only_one_export_at_a_time(win, sample_parquet_path, driver, boxes, monk
     win._actions["export_parquet"].trigger()
     assert wait_until(entered.is_set, 30)
     try:
-        assert not win.export_parquet_from_view(str(driver.out.with_name("two.parquet")), "v1", ["a"])
-        win._actions["export_parquet"].trigger()  # the toolbar says so too, without opening the dialog
-        assert boxes.info == [tr("export_parquet.busy")] * 2 and driver.opened == 1
+        two = driver.out.with_name("two.parquet")
+        assert win.export_parquet_from_view(str(two), "v1", ["a"])  # queued, not refused
+        assert boxes.info == []
+        assert [i.state.value for i in win._export.queue.items] == ["running", "waiting"]
     finally:
         release.set()
-    finish(win)
-    assert driver.out.exists() and not driver.out.with_name("two.parquet").exists()
+    assert wait_until(lambda: win._export.queue.is_idle(), 30)
+    assert driver.out.exists() and two.exists()
 
 
 def test_view_export_with_aliases_names_and_metadata(empty_win, tmp_path, driver):
@@ -623,3 +627,77 @@ def test_derived_named_like_the_time_column_is_greyed_in_the_dialog(empty_win, s
     items = {n: (ok, text) for n, ok, _c, text in driver.seen["first"]["items"]}
     assert items["time"][0] is False and tr("view.problem_time_name") in items["time"][1]
     assert items["a"][0] is True
+
+
+# -- overwrite protection (export 57.8.1) ------------------------------------------------------------
+
+
+@pytest.fixture
+def choice(monkeypatch):
+    from parquet_analyzer.ui import messages
+
+    class Choice:
+        answer = None
+
+    c = Choice()
+    c.asked = []
+
+    def fake(parent, title, text, *texts):
+        c.asked.append(text)
+        return c.answer
+
+    monkeypatch.setattr(messages, "choose_export_overwrite", fake)
+    return c
+
+
+def test_view_export_to_an_existing_file_asks(win, sample_parquet_path, driver, choice):
+    save_view("v1", sample_parquet_path, [["a"]])
+    driver.pick = "v1"
+    driver.out.write_bytes(b"precious")
+    choice.answer = None
+    win._actions["export_parquet"].trigger()
+    assert len(choice.asked) == 1 and win._parquet_export is None
+    assert driver.out.read_bytes() == b"precious"
+
+
+def test_view_export_without_extension_asks_and_timestamp_keeps_the_original(
+    win, sample_parquet_path, driver, choice, tmp_path, log
+):
+    save_view("v1", sample_parquet_path, [["a"]])
+    driver.pick = "v1"
+    driver.out = tmp_path / "noext"
+    (tmp_path / "noext.parquet").write_bytes(b"precious")
+    choice.answer = "timestamp"
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert len(choice.asked) == 1
+    assert (tmp_path / "noext.parquet").read_bytes() == b"precious"
+    assert len(list(tmp_path.glob("noext_*.parquet"))) == 1
+    assert op_records("export_parquet")[-1]["details"]["renamed"] is True
+
+
+def test_view_export_overwrite_replaces(win, sample_parquet_path, driver, choice):
+    save_view("v1", sample_parquet_path, [["a"]])
+    driver.pick = "v1"
+    driver.out.write_bytes(b"precious")
+    choice.answer = "overwrite"
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert pq.read_table(driver.out).num_rows == 50_000
+
+
+def test_view_export_source_file_is_refused_without_the_question(win, sample_parquet_path, driver, choice, boxes):
+    save_view("v1", sample_parquet_path, [["a"]])
+    driver.pick = "v1"
+    driver.out = sample_parquet_path
+    win._actions["export_parquet"].trigger()
+    assert choice.asked == [] and boxes.warn == [tr("export_parquet.same_as_source")]
+
+
+def test_view_export_direct_call_to_an_existing_file_is_refused(win, sample_parquet_path, boxes, tmp_path):
+    save_view("v1", sample_parquet_path, [["a"]])
+    out = tmp_path / "x.parquet"
+    out.write_bytes(b"precious")
+    assert win.export_parquet_from_view(str(out), "v1", ["a"])  # starts; the core refuses
+    finish(win)
+    assert out.read_bytes() == b"precious" and boxes.warn

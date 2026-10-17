@@ -249,7 +249,7 @@ PySide6/pyqtgraph/polarsを引き込むものではないため。
   | `parquet_export` | `True`（2026-10-16にON。レビューと実機確認の後） | export 57 |
   | `map_exclude_points` | `False`（2026-10-13、実機確認で分かりにくかったため隠す。ユーザー判断） | analysis 44.13 |
   | `big_a_thin_first_draw`・`big_c_windowed_derived`・`big_d_time_index` | `True`（2026-10-04 採用、data 36.8。普段使いで問題がなければフラグ自体を消す） | data 36章 A・C・D |
-  各章の実装・レビューが済んだ時点で`True`にする（その変更自体はメインセッションが行う）。
+  各章の実装・レビューが済んだ時点で`True`にする（その変更自体は開発者が行う）。
 - 環境変数`PARQUET_ANALYZER_FEATURES`で一時的に上書きできる: `名前=値`をカンマ区切り
   （例: `fft=on,xy_plot=on`）。値は`on/off/1/0/true/false/yes/no`（大文字小文字無視）。
   未知の名前・不正な値はその項目だけ無視して`logger.warning`。
@@ -780,6 +780,7 @@ PySide6/pyqtgraph/polarsを引き込むものではないため。
   `gh workflow run test-macos.yml --ref <ブランチ>`（ブランチはpush済みであること）。結果は`gh run watch`。
 - `.github/workflows/test.yml`（Ubuntu）の`on:`に`workflow_dispatch:`を足す（ブランチでも
   `gh workflow run test.yml --ref <ブランチ>`で試せる）。pushごと・PRの動きは今どおり。
+  **→ 2026-10-16にユーザー判断でpush・PRのトリガーを外し、手動実行のみにした**（マージ前はローカルでフルテスト）。
 - 目安: マージ前にプロット・ワーカーのタイミングに関わる変更をしたとき、またはUbuntuだけで落ちたときの切り分けに使う。
 
 #### 51.2 Ubuntuで落ちるテストを直す
@@ -838,7 +839,7 @@ PySide6/pyqtgraph/polarsを引き込むものではないため。
   - F841（未使用の変数）: テストでは消す。`src/parquet_analyzer/core/functions.py`の`consts`は**消す前に意図を確かめる**
     （使い忘れなら不具合なので、消さずに報告して止める）。
   - UP031（`%`書式）: f-stringに直す。ただし`logging`の遅延書式（`log.debug("%s", x)`）は対象外のはずなので、もし出たら報告。
-- 挙動が変わりうる指摘（上以外のもの、unsafe fixが要るもの）は直さずに報告に挙げ、main sessionが1件ずつ判断する。
+- 挙動が変わりうる指摘（上以外のもの、unsafe fixが要るもの）は直さずに報告に挙げ、1件ずつ判断する。
 - コミットは2つに分ける: (1) 設定・CI・ドキュメント、(2) 一括修正（`ruff check --fix`で機械的に変わったもの＋手直し）。
   (2)のメッセージに件数を書く。
 

@@ -12,10 +12,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+
+from ..core.histogram_export import local_offset_s
 
 logger = logging.getLogger(__name__)
 
@@ -80,14 +81,6 @@ def _to_local_datetime64(x: np.ndarray, offset_s: float) -> np.ndarray:
     return out
 
 
-def _local_offset_s(x0: float) -> float:
-    """Local UTC offset (seconds) at epoch second `x0`."""
-    try:
-        return (datetime.fromtimestamp(x0) - datetime.fromtimestamp(x0, UTC).replace(tzinfo=None)).total_seconds()
-    except (OverflowError, OSError, ValueError):
-        return 0.0
-
-
 def _cjk_fonts() -> list[str]:
     """Installed CJK family to fall back to for missing glyphs ([] if none); detected once."""
     global _cjk_font_cache
@@ -149,7 +142,7 @@ def _build_figure(snapshots, stamp_lines, size_px):
             linked_axes.append(ax)
 
     for ax, snap in zip(axes, snapshots):
-        offset = _local_offset_s(snap.x_range[0]) if snap.x_axis_datetime else 0.0
+        offset = local_offset_s(snap.x_range[0]) if snap.x_axis_datetime else 0.0
         for s in snap.series:
             x = _to_local_datetime64(s.x, offset) if snap.x_axis_datetime else np.asarray(s.x, dtype=float)
             ax.plot(x, np.asarray(s.y, dtype=float), color=s.color, linewidth=0.8, label=s.name)

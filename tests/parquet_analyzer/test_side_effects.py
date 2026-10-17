@@ -486,7 +486,7 @@ CASES = {
     "view_compute_cancel": case_view_compute_cancel,
 }
 
-# Rows whose real behaviour differs from the table (45.2: judged by the main session); a bug
+# Rows whose real behaviour differs from the table (45.2: judged by the developer); a bug
 # found this way is marked xfail(strict=True) with its own task. Never loosen the allowed set instead.
 XFAIL: dict[str, str] = {}
 

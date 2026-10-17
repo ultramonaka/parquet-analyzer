@@ -30,3 +30,22 @@ def pick_parquet_file(parent: QWidget, start_dir: str | None, recent_folders: li
         files = dialog.selectedFiles()
         return files[0] if files else None
     return None
+
+
+def pick_parquet_files(parent: QWidget, start_dir: str | None, recent_folders: list[str]) -> list[str]:
+    """Like `pick_parquet_file` but several files may be selected (export 57.8.2)."""
+    dialog = QFileDialog(parent, tr("folder.open_dialog_title"))
+    dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+    dialog.setNameFilter("Parquet files (*.parquet)")
+    if start_dir and Path(start_dir).is_dir():
+        dialog.setDirectory(start_dir)
+
+    from PySide6.QtCore import QUrl
+
+    sidebar_urls = [QUrl.fromLocalFile(f) for f in recent_folders if Path(f).is_dir()]
+    if sidebar_urls:
+        dialog.setSidebarUrls(dialog.sidebarUrls() + sidebar_urls)
+
+    if dialog.exec() == QFileDialog.DialogCode.Accepted:
+        return list(dialog.selectedFiles())
+    return []

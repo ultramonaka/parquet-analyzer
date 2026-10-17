@@ -3,7 +3,7 @@
 **[English](#english)** | **[日本語](#japanese)**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-0.5.0-informational.svg)
+![Version](https://img.shields.io/badge/version-0.6.0-informational.svg)
 ![Author](https://img.shields.io/badge/author-ultramonaka-lightgrey.svg)
 
 ---
@@ -13,8 +13,9 @@
 
 A viewer and time-series analysis tool for Parquet files. Handles files of around 100 million
 rows (reads only the visible range and decimates automatically), multiple plots, inter-variable
-expressions, user functions and maps (lookup tables), summary statistics, XY and 3D plots,
-cursors, a hover readout, saved views, image export, and an operation log.
+expressions, user functions and maps (lookup tables), summary statistics, histograms, XY and 3D plots
+(including making a map from measurements), cursors, a hover readout, saved views, signal aliases,
+image export, Parquet export, and an operation log.
 
 For the specification, start at
 [`src/parquet_analyzer/docs/overview.md`](src/parquet_analyzer/docs/overview.md) (overview), which
@@ -86,13 +87,20 @@ environment variable. The window title gets a `[DEBUG]` suffix while this is act
 1. Choose "Open" on the toolbar to select a Parquet file. The dialog starts in
    the last folder you opened, with the 5 most recent folders available in a sidebar.
    The currently open file's name is shown in the window title and in the status bar
-   at the bottom left (hover it for the full path).
+   at the bottom left (hover it for the full path). Next to it the status bar shows the sampling
+   rate of the time axis (e.g. `100 Hz (10 ms)`; "approx." and "irregular" are added when the
+   spacing is uneven). It can be hidden in Settings.
 2. The loaded columns are listed in the "Variables" panel (on the left by default).
    Drag one onto a plot to overlay it there (the legend updates automatically).
 3. "+ Add plot" on the toolbar adds a new plot pane (see "Working with plots" below).
 4. The navigator at the top of the window lets you quickly move the visible time
    range. It shows an overview of **whichever variable is overlaid first on the topmost
    plot** (falling back to another column if nothing has been plotted yet).
+
+The toolbar is split in two: "File & view" (open, time axis, "View ▾", save image, export
+Parquet, show all, redraw, add plot, cursor, values) and "Analysis" (statistics, "Graphs ▾",
+user functions, maps, signal aliases, "⚙ ▾"). Rarely used items (coarse preview, settings,
+reset layout) are grouped under "⚙ ▾".
 
 #### Working with plots
 
@@ -136,7 +144,8 @@ that go up and down relate to each other, use the XY plot rather than changing t
 Which action each of plain/Ctrl+/Shift+scroll performs is configurable in the
 "Settings" dialog's "Scroll controls" section — reassigning
 an action already used by another modifier swaps the two, so every action always
-stays reachable by exactly one modifier. The table above is just the default.
+stays reachable by exactly one modifier. The table above is just the default. The
+histogram windows follow the same assignment (H or a double-click resets their view).
 
 The time (X) axis tick granularity adapts automatically to the zoom level — date/month
 when zoomed out, down to hour:minute:second.millisecond when zoomed into a few
@@ -217,7 +226,8 @@ isn't included in exported images.
   now). Over a range whose sample spacing is uneven or has gaps, FFT isn't run and the reason
   is shown in the status bar (narrow the range to an evenly spaced part first).
 - Clicking "Stats" computes count, missing-value count, min, max, mean,
-  standard deviation, and median over every raw sample in the currently visible time
+  standard deviation, median and the effective sample rate (valid samples per second,
+  i.e. excluding missing values) over every raw sample in the currently visible time
   range (not the downsampled curve actually drawn on screen) and shows the results in
   a separate window, for one row per variable. Targets whichever variable(s) are
   selected in the panel; if nothing is selected there, it falls back to whatever's
@@ -260,6 +270,36 @@ Switching the display to "3D" draws a 3-D scatter plot of X, Y and Z (the chosen
 carry over). Rotate and zoom with the mouse; the buttons above it (Home, XY, YZ, ZX) switch
 the viewpoint. Where OpenGL isn't available 3D can't be selected (the tooltip says why).
 
+**Making a map from measurements**: the display can also be switched to "Map". The measured
+points are aggregated per grid cell (X and Y grid by interval or number of divisions;
+mean, median, max, min, point count or time spent in each cell; a minimum number of points per
+cell) and shown as a heat map (2D) or a surface (3D). Empty cells can be filled by smooth
+interpolation, filled with the nearest value, or left empty. The result can be registered in
+the map manager (and then used in expressions as `name(x, y)`) and/or saved as CSV. Registered
+maps and curves can also be overlaid to compare them with the measurements.
+
+#### Histogram
+
+"Graphs ▾" > "Histogram" opens a separate window with the distribution of one or more variables
+over the visible time range (overlaid, auto or fixed number of bins, frequency or percentage,
+with the mean and median marked). The frequency can count rows or time. With "By time buckets" the
+range is cut into buckets of a fixed length (1 minute to days, with a bucket origin such as 6:00),
+each bucket is summarized (total, integral, mean, max, min, or two-stage), and the distribution of
+those values is drawn — e.g. the distribution of daily usage. Buckets with gaps can be excluded.
+The view can be switched between the distribution, a duration curve (how long the value was at or
+above each level), a trend (value per bucket as bars), and by time of day. The target can be
+narrowed to a time-of-day range and days of the week. The values per bucket can be saved as
+Parquet or CSV ("Save bucket values..."), and the window can save an image.
+
+#### Signal aliases
+
+"Signal aliases" on the toolbar edits one app-wide dictionary of names: an alias with candidate
+original column names in priority order (e.g. `EngSpd`, `NE_rpm`). When a file is opened, the first
+candidate that exists in it provides the alias, so a view saved with the alias also works on files
+whose column names differ. The variable panel shows the alias (the original name is in the
+tooltip). When loading a view cannot find a signal, the warning offers "Assign substitute
+signals...". Saved in `cfg/parquet_analyzer/signal_aliases.json`; it can be switched off.
+
 #### Saving and loading views
 
 "View ▾" > "Save..." on the toolbar saves the current plot layout, overlaid variables, and expressions as a
@@ -297,6 +337,27 @@ plots are re-drawn (not screen-captured) with aligned time axes and a legend per
 and the bottom-right corner records the source file (and view name), the displayed
 time range, the export date/time, and the app version.
 
+#### Exporting signals to Parquet
+
+"Export Parquet..." on the toolbar computes the signals shown in the plots (original columns
+and derived variables; the time axis is always written first) and writes them to a new Parquet
+file. Choose all rows or the visible range, and which signals to write; derived variables that
+aren't needed are not computed. The source can also be a saved view, which is exported without
+opening it. Writing runs in the background in chunks (memory does not grow with the row count),
+with a progress bar and a cancel button, and the source file name, view name and derived-variable
+formulas are stored in the file's metadata.
+
+One saved view can also be applied to several files at once: choose several source files and a
+destination folder, and the view's signals are taken from each file and written to a separate
+output file (`<file>_<view>_<date-time>.parquet`; files are never mixed, and an existing file is
+never overwritten). A file that lacks some of the view's signals (after signal aliases) is written
+without them and reported; one failure does not stop the others. The time-axis column of the output
+can be chosen, and derived variables can be written as float32 instead of float64 to halve their
+size. Up to 2 files are written at the same time (1 to 4 in Settings, "Parquet export: files at once"),
+each file using several cores, with free disk space and memory checked before and during the
+export. Progress of every file (state, %, rows/s, remaining) is listed in "Parquet export list..."
+in the View menu, with cancel per file or for all.
+
 #### Settings menu
 
 "⚙ ▾" > "Settings..." on the toolbar lets you change the following (saved to
@@ -309,10 +370,12 @@ time range, the export date/time, and the app version.
   range only) instead of being fully loaded once and kept resident — only affects
   files opened after the change
 - Which action (X zoom / Y zoom / pan) each of plain/Ctrl+/Shift+scroll performs
+- Whether the status bar shows the sampling rate (default: shown)
 - Keyboard shortcuts for each toolbar action (show all, redraw, open, add plot, statistics,
-  XY / 3D plot, save view, view manager, save image, coarse-preview toggle, cursor, values,
-  functions, maps) and for removing the selected series (Delete by default) — frequency
-  analysis is omitted here while it is hidden from the menu, see above
+  histogram, XY / 3D plot, save view, view manager, save image, export Parquet, coarse-preview
+  toggle, cursor, values, functions, maps, signal aliases) and for removing the selected series
+  (Delete by default) — frequency analysis is omitted here while it is hidden from the menu,
+  see above
 - UI language (English / 日本語; takes effect after a restart)
 - Log retention in days (default 7) and "Open log folder"
 
@@ -353,13 +416,15 @@ runtime state and excluded from version control:
 | Log (normal) | `log/parquet_analyzer/parquet_analyzer_<date>.log` |
 | Log (operation log, always written, JSON Lines) | `log/parquet_analyzer/parquet_analyzer_ops_<date>.log` |
 | User functions | `cfg/parquet_analyzer/user_functions.json` |
+| Signal aliases | `cfg/parquet_analyzer/signal_aliases.json` |
 | Maps (copies of the imported CSVs) | `data/parquet_analyzer/maps/` |
 
 ### For developers
 
 ```sh
 uv sync --group dev   # install dev-only dependencies (pytest, etc.)
-uv run pytest         # run the test suite
+uv run pytest -q -n auto   # run the test suite (in parallel)
+uv run ruff check          # lint
 ```
 
 Exercising the app headlessly (no real display):
@@ -390,7 +455,8 @@ For information about third-party software and libraries used by this applicatio
 
 Parquetファイルのビューワー・時系列解析ツール。1億行規模の大きなファイルの表示（表示範囲だけを
 読み、自動で間引く）、マルチプロット、変数間演算、ユーザー関数・マップ（参照テーブル）、統計表示、
-XY・3Dプロット、カーソル、ホバー表示、ビュー保存、画像保存、操作ログなどに対応する。
+ヒストグラム、XY・3Dプロット（実測からのマップ作成を含む）、カーソル、ホバー表示、ビュー保存、
+信号の別名、画像保存、Parquet書き出し、操作ログなどに対応する。
 
 仕様の詳細は [`src/parquet_analyzer/docs/overview.ja.md`](src/parquet_analyzer/docs/overview.ja.md)
 （総括仕様）から、分野ごとの仕様（`src/parquet_analyzer/docs/domains/`）へ辿れる。
@@ -455,12 +521,19 @@ tools\run_debug.bat     # Windows
 1. ツールバーの「開く」からParquetファイルを選択する。ダイアログは最後に開いたフォルダを
    初期表示し、直近5件のフォルダをサイドバーから選べる。現在開いているファイル名は
    ウィンドウタイトルと画面左下のステータスバーに表示される（ホバーするとフルパスを確認できる）。
+   その隣に、時間軸のサンプリングレート（例: `100 Hz（10 ms）`）も出る。間隔が不等間隔のときは
+   「約」と「不等間隔」が付く。設定で非表示にできる。
 2. 「変数」パネル（既定では画面左側）に読み込んだ列が一覧表示される。プロットへドラッグ&ドロップすると
    その変数が重ね合わせ表示される（凡例が自動更新される）。
 3. ツールバーの「＋ プロット追加」で新しいプロットを追加できる（下の「プロットの操作」参照）。
 4. 画面上部のナビゲータで表示範囲（時間軸）を素早く移動できる。ナビゲータには
    **最上段のプロットに最初に重ねられた変数**の概要波形が表示される（何も重ねられていない
    場合は暫定的に別の列が表示される）。
+
+ツールバーは2本に分かれている。「ファイル・表示」（開く、時間軸、「ビュー ▾」、画像を保存、Parquetに
+書き出す、全体表示、再描画、プロット追加、カーソル、値の表示）と「解析」（統計、「グラフ ▾」、ユーザー関数、
+マップ、信号の別名、「⚙ ▾」）。あまり使わない項目（簡易表示、設定、レイアウトのリセット）は
+「⚙ ▾」にまとめてある。
 
 #### プロットの操作
 
@@ -503,6 +576,7 @@ XYプロットを使う。
 無印/Ctrl+/Shift+スクロールそれぞれの動作は、「設定」ダイアログの「スクロール操作」欄で
 変更できる。既に他の修飾キーに割り当て済みの動作を選ぶと、その2つが自動的に入れ替わる
 ため、常にどの動作も何らかの修飾キーで実行可能な状態が保たれる。上表はあくまで既定値。
+ヒストグラムの窓も同じ割り当てに従う（Hキーまたはダブルクリックで表示を元に戻す）。
 
 時刻軸（X軸）の目盛は、ズームレベルに応じて自動的に粒度が変わる。広い範囲を表示しているときは
 日付/月単位、数秒〜数分まで拡大すると時:分:秒（ミリ秒）単位まで自動的に詳細化される
@@ -566,8 +640,8 @@ XYプロットを使う。
   「グラフ ▾」メニューから隠している（現時点ではGUIから実行できない）。時刻の間隔がばらばら・途切れのある範囲では
   FFTを実行せず、理由をステータスバーに出す（等間隔の範囲に絞ってから実行する）。
 - 「統計」ボタンを押すと、現在表示中の時間範囲の生データ全件（画面に描画されている
-  間引き後の点ではない）について件数・欠損値・最小・最大・平均・標準偏差・中央値を
-  変数ごとに1行ずつ計算し、別ウィンドウに表として表示する。対象は変数パネルで選択中の
+  間引き後の点ではない）について件数・欠損値・最小・最大・平均・標準偏差・中央値・有効サンプルレート
+  （欠損を除いた1秒あたりの有効な点数）を変数ごとに1行ずつ計算し、別ウィンドウに表として表示する。対象は変数パネルで選択中の
   変数。パネルで何も選択していない場合は、現在プロットに表示中（重ねて表示中）の変数が
   自動的に対象になる——既にプロット済みの変数の統計を見るのに、パネルで改めて選び直す
   必要はない。パネルで明示的に選択している場合は、プロット中の変数より常にそちらが優先される。
@@ -601,6 +675,30 @@ XYプロットを使う。
 回転・拡大でき、上のボタン（ホーム・XY・YZ・ZX）で視点を切り替えられる。OpenGLが使えない環境では
 3Dは選べない（理由をツールチップに出す）。
 
+**実測からのマップ作成**: 表示を「マップ」に切り替えることもできる。実測の点をます目ごとに集計し
+（XとYのます目は間隔または分割数で指定。平均・中央値・最大・最小・点数・ます目ごとの滞在時間、
+ます目ごとの最少点数）、2Dではヒートマップ、3Dでは曲面で表示する。点のないます目は、滑らかな補間で
+埋める・最寄りの値で埋める・空のままにする、から選べる。結果はマップ管理に登録（式で`名前(x, y)`として
+使える）したり、CSVに保存したりできる。登録済みのマップ・カーブを重ねて、実測と見比べることもできる。
+
+#### ヒストグラム
+
+「グラフ ▾」→「ヒストグラム」で別ウィンドウを開き、表示中の時間範囲について1つ以上の変数の分布を描く
+（重ね表示、区切りの数は自動または指定、度数または割合(%)、平均と中央値の線つき）。度数は行数または時間を
+数えられる。「区切りあり」では範囲を一定の長さ（1分〜日単位、起点は6:00などに指定可）の区切りに分け、区切りごとに
+集計（合計・積算・平均・最大・最小、または2段の集計）した値の分布を描く（例: 1日あたりの使用量の分布）。
+欠けのある区切りは除外できる。表示は、分布・持続曲線（その値以上だった時間）・推移（区切りごとの値の棒グラフ）・
+時刻別に切り替えられる。対象は時刻の範囲や曜日で絞り込める。区切りごとの値はParquetまたはCSVに保存でき
+（「区切りの値を保存...」）、画像の保存もできる。
+
+#### 信号の別名
+
+ツールバーの「信号の別名」で、アプリ全体で1つの名前の辞書を編集する。別名ごとに、元の列名の候補を
+優先順に並べる（例: `EngSpd`、`NE_rpm`）。ファイルを開くと、そのファイルにある最初の候補が別名になるので、
+別名で保存したビューは列名の違うファイルでもそのまま使える。変数パネルには別名が出る（元の列名はツールチップ）。
+ビューの読み込みで信号が見つからなかったときの警告から「代わりの信号を割り当てる...」を選べる。
+`cfg/parquet_analyzer/signal_aliases.json`に保存され、使わない設定にもできる。
+
 #### ビューの保存・読込
 
 ツールバーの「ビュー ▾」→「保存...」で、現在のプロット配置・重ね合わせ変数・演算式を「ビュー」としてJSON保存できる
@@ -632,6 +730,24 @@ XYプロットを使う。
 なく描き直すため、時間軸が揃い、各プロットに凡例が付く。右下には元ファイル（とビュー名）、
 表示中の時間範囲、出力日時、アプリのバージョンが記載される。
 
+#### 信号のParquet書き出し
+
+ツールバーの「Parquetに書き出す...」で、プロットに出している信号（元の列と仮想変数。時間軸の列は
+必ず先頭）を計算し、新しいParquetファイルに書き出す。書き出す範囲（全行または表示中の範囲）と信号を
+選べ、使わない仮想変数は計算しない。元として、保存したビューを選んで、開かずに書き出すこともできる。
+書き出しは裏で区切りごとに進む（行数が増えてもメモリは増えない）。進捗バーと取り消しボタンがあり、
+元のファイル名・ビュー名・仮想変数の式はファイルのメタデータに入る。
+
+保存したビュー1つを複数のファイルに適用して、まとめて書き出すこともできる。元のファイルを複数と
+保存先のフォルダを選ぶと、ビューの信号が各ファイルから取り出され、ファイルごとに別の出力ファイル
+（`<ファイル名>_<ビュー名>_<日時>.parquet`）に書かれる（1つに混ぜず、既存のファイルは上書きしない）。
+ビューの信号の一部が無いファイル（信号の別名を適用した後）は、その信号を除いて書き、知らせる。
+1つが失敗しても残りは続く。出力の時間軸の列を選べ、仮想変数はfloat64の代わりにfloat32で書いて
+大きさを約半分にもできる。同時に最大2ファイル（設定で1〜4、「Parquet書き出し: 同時に書くファイル数」）を書き、
+1ファイルの中も複数コアで書く。ディスクの空きとメモリは書き出しの前と途中で確認する。各ファイルの
+進み具合（状態・%・行/秒・残り）は表示メニューの「Parquet書き出しの一覧...」に並び、1つずつ・
+すべてのキャンセルができる。
+
 #### 設定メニュー
 
 ツールバーの「⚙ ▾」→「設定...」から以下を変更できる（`cfg/parquet_analyzer/settings.json` に保存され、
@@ -642,9 +758,10 @@ XYプロットを使う。
 - 列を開いた時点で全体を読み込まず表示範囲だけを都度読み込むようにする容量しきい値
   （変更後に開いたファイルから反映）
 - 無印/Ctrl+/Shift+スクロールそれぞれの動作（X軸ズーム/Y軸ズーム/パン）
-- ツールバーの各操作（全体表示、再描画、開く、プロット追加、統計、XY / 3Dプロット、ビュー保存、
-  ビュー管理、画像を保存、簡易表示の切替、カーソル、値の表示、ユーザー関数、マップ）と、選択した系列の削除
-  （既定はDelete）のショートカットキー
+- ステータスバーにサンプリングレートを表示するか（既定は表示）
+- ツールバーの各操作（全体表示、再描画、開く、プロット追加、統計、ヒストグラム、XY / 3Dプロット、ビュー保存、
+  ビュー管理、画像を保存、Parquetに書き出す、簡易表示の切替、カーソル、値の表示、ユーザー関数、マップ、
+  信号の別名）と、選択した系列の削除（既定はDelete）のショートカットキー
   （周波数解析はメニューから隠している間、ここにも表示されない。上記参照）
 - 表示言語（English / 日本語。再起動後に反映）
 - ログの保存期間（日、既定7日）と「ログのフォルダを開く」
@@ -682,13 +799,15 @@ tools/convert_to_parquet.sh <入力ファイル> [出力先.parquet] [--time-var
 | ログ（通常） | `log/parquet_analyzer/parquet_analyzer_<日付>.log` |
 | 操作ログ（毎回記録） | `log/parquet_analyzer/parquet_analyzer_ops_<日付>.log` |
 | ユーザー関数 | `cfg/parquet_analyzer/user_functions.json` |
+| 信号の別名 | `cfg/parquet_analyzer/signal_aliases.json` |
 | マップ（取り込んだCSVのコピー） | `data/parquet_analyzer/maps/` |
 
 ### 開発者向け
 
 ```sh
 uv sync --group dev   # pytestなど開発用依存関係をインストール
-uv run pytest         # テスト実行
+uv run pytest -q -n auto   # テスト実行（並列）
+uv run ruff check          # lint
 ```
 
 実ディスプレイなしでの動作確認（ヘッドレス）:

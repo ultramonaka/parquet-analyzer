@@ -37,6 +37,38 @@ def warning_with_button(parent, title, text, button_text) -> bool:
     return box.clickedButton() is extra
 
 
+def choose_export_overwrite(parent, title, text, timestamp_text, overwrite_text, cancel_text) -> str | None:
+    """The three-way "file exists" question of an export (export 57.8.1): "timestamp" (the default
+    button), "overwrite" or None (cancel / closed). Records the message like the other helpers."""
+    _record("warning", text, title)
+    box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.NoButton, parent)
+    stamp = box.addButton(timestamp_text, QMessageBox.ButtonRole.AcceptRole)
+    over = box.addButton(overwrite_text, QMessageBox.ButtonRole.DestructiveRole)
+    cancel = box.addButton(cancel_text, QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(stamp)
+    box.setEscapeButton(cancel)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is stamp:
+        return "timestamp"
+    if clicked is over:
+        return "overwrite"
+    return None
+
+
+def confirm_export_start(parent, title, text, start_text, cancel_text) -> bool:
+    """The "may not fit" question before an export starts (export 57.9.6a): True only for the explicit
+    "start anyway" button; the default button, Escape and closing the box all mean "do not start"."""
+    _record("warning", text, title)
+    box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.NoButton, parent)
+    start = box.addButton(start_text, QMessageBox.ButtonRole.DestructiveRole)
+    cancel = box.addButton(cancel_text, QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(cancel)
+    box.setEscapeButton(cancel)
+    box.exec()
+    return box.clickedButton() is start
+
+
 def critical(parent, title, text, *args, **kwargs):
     _record("error", text, title)
     return QMessageBox.critical(parent, title, text, *args, **kwargs)

@@ -108,6 +108,10 @@ class Settings:
     last_data_folder: str | None = None
     recent_data_folders: list[str] = field(default_factory=list)
     last_export_folder: str | None = None  # detailed_specification.md 19.2
+    # How many Parquet export files may be written at the same time (export 57.9.2; 1-4). 1-4.
+    export_parallel_files: int = 2
+    # Free disk space kept besides what an export still has to write (export 57.9.6a). Settings file only.
+    export_disk_margin_mb: int = 100
     default_overlay: bool = False
     # A raw column whose materialized size (row_count * 8 bytes) would exceed this
     # stays a WindowedColumn (Phase D: fetches only the visible range from disk,
@@ -128,6 +132,8 @@ class Settings:
     hover_values_enabled: bool = True
     # Global switch "use signal aliases" (persistence 54.9); the dictionary itself is in signal_aliases.json.
     signal_aliases_enabled: bool = True
+    # Status-bar sampling rate label (data 60.2); the value is computed either way (stats use it).
+    show_sampling_rate: bool = True
     # Map manager: sizes of the [table, graphs] splitter (detailed_specification.md 27.8).
     # Normalize with normalize_splitter_sizes(); None = default proportions.
     map_manager_splitter: list[int] | None = None
@@ -137,6 +143,8 @@ class Settings:
 # value outside them (hand-edited file) is replaced by the default.
 DOWNSAMPLE_RATIO_RANGE = (1, 20)
 EAGER_LOAD_LIMIT_MB_RANGE = (1, 100_000)
+EXPORT_PARALLEL_FILES_RANGE = (1, 4)  # export 57.9.2
+EXPORT_DISK_MARGIN_MB_RANGE = (1, 100_000)  # export 57.9.6a
 
 
 def _int_in_range(value: object, lo_hi: tuple[int, int], default: int) -> int:
@@ -189,6 +197,8 @@ def load_settings() -> Settings:
             settings.hover_values_enabled = True
         if not isinstance(settings.signal_aliases_enabled, bool):
             settings.signal_aliases_enabled = True
+        if not isinstance(settings.show_sampling_rate, bool):
+            settings.show_sampling_rate = True
         settings.map_manager_splitter = normalize_splitter_sizes(settings.map_manager_splitter)
         if settings.language not in LANGUAGES:
             settings.language = DEFAULT_LANGUAGE
@@ -206,6 +216,12 @@ def _normalize_types(s: Settings) -> None:
     d = Settings()
     s.downsample_pixel_ratio = _int_in_range(s.downsample_pixel_ratio, DOWNSAMPLE_RATIO_RANGE, d.downsample_pixel_ratio)
     s.eager_load_limit_mb = _int_in_range(s.eager_load_limit_mb, EAGER_LOAD_LIMIT_MB_RANGE, d.eager_load_limit_mb)
+    s.export_parallel_files = _int_in_range(
+        s.export_parallel_files, EXPORT_PARALLEL_FILES_RANGE, d.export_parallel_files
+    )
+    s.export_disk_margin_mb = _int_in_range(
+        s.export_disk_margin_mb, EXPORT_DISK_MARGIN_MB_RANGE, d.export_disk_margin_mb
+    )
     if not isinstance(s.auto_redraw, bool):
         s.auto_redraw = d.auto_redraw
     if not isinstance(s.default_overlay, bool):

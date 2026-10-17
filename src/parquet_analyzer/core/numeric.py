@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
+
+from .analysis import FFT_JITTER_TOLERANCE
 
 _DATETIME_UNIT_TO_SECONDS_DIVISOR = {"s": 1.0, "ms": 1e3, "us": 1e6}
 
@@ -82,10 +85,29 @@ class TimeOrderReport:
     # the same rule as decreasing_count). Does not affect `ok`: duplicates keep ranges correct.
     duplicate_count: int = 0
     first_duplicate_index: int | None = None  # original row index of the first such value, if any
+    # 60.1: sampling interval from the positive finite differences of the same scan. dt_median is the
+    # median of the per-chunk medians; nan = no usable difference (< 2 points, or no ascending pair).
+    dt_median: float = float("nan")
+    dt_min: float = float("nan")
+    dt_max: float = float("nan")
 
     @property
     def ok(self) -> bool:
         return self.nan_count == 0 and self.decreasing_count == 0
+
+    @property
+    def rate_hz(self) -> float:
+        """1 / dt_median (per time-axis unit); nan when there is no usable interval (60.1)."""
+        dt = self.dt_median
+        return 1.0 / dt if np.isfinite(dt) and dt > 0 else float("nan")
+
+    @property
+    def irregular(self) -> bool:
+        """True when the interval varies by more than FFT_JITTER_TOLERANCE around the median (60.1)."""
+        dt = self.dt_median
+        if not (np.isfinite(dt) and dt > 0 and np.isfinite(self.dt_min) and np.isfinite(self.dt_max)):
+            return False
+        return (self.dt_max - dt) / dt > FFT_JITTER_TOLERANCE or (dt - self.dt_min) / dt > FFT_JITTER_TOLERANCE
 
 
 _TIME_ORDER_CHUNK_ROWS = 2_000_000  # chunked so a 100M-row axis needs only a small temporary
@@ -104,6 +126,10 @@ class TimeOrderScanner:
         self.duplicates = 0  # 56.2
         self.first_dup: int | None = None
         self._prev: float | None = None  # last finite value of the previous chunks
+        # 60.1: sampling interval, from the same pass (no second scan)
+        self._dt_medians: list[float] = []  # median of the positive differences of each chunk
+        self._dt_min = math.inf
+        self._dt_max = -math.inf
 
     def feed(self, chunk: np.ndarray, start: int) -> None:
         finite = np.isfinite(chunk)
@@ -117,6 +143,7 @@ class TimeOrderScanner:
             v = chunk[idx]
         if v.size == 0:
             return
+        self._feed_intervals(v)
         if self._prev is not None and v[0] < self._prev:
             self.decreasing += 1
             if self.first_bad is None:
@@ -140,8 +167,30 @@ class TimeOrderScanner:
                     self.first_dup = start + (int(idx[j]) if idx is not None else j)
         self._prev = v[-1]
 
+    def _feed_intervals(self, v: np.ndarray) -> None:
+        """60.1: positive differences of the finite values (including the one across the chunk
+        boundary); keeps the chunk's median and the running min / max."""
+        d = np.diff(v)
+        if self._prev is not None:
+            d = np.concatenate(([v[0] - self._prev], d))
+        d = d[d > 0]
+        if d.size == 0:
+            return
+        self._dt_medians.append(float(np.median(d)))
+        self._dt_min = min(self._dt_min, float(d.min()))
+        self._dt_max = max(self._dt_max, float(d.max()))
+
     def report(self) -> TimeOrderReport:
-        return TimeOrderReport(self.nan_count, self.decreasing, self.first_bad, self.duplicates, self.first_dup)
+        if self._dt_medians:
+            dt_med = float(np.median(self._dt_medians))
+            dt_min, dt_max = self._dt_min, self._dt_max
+            if not (math.isfinite(dt_med) and math.isfinite(dt_max)):  # overflowed differences
+                dt_med = dt_min = dt_max = float("nan")
+        else:
+            dt_med = dt_min = dt_max = float("nan")
+        return TimeOrderReport(
+            self.nan_count, self.decreasing, self.first_bad, self.duplicates, self.first_dup, dt_med, dt_min, dt_max
+        )
 
 
 def check_time_order(values: np.ndarray) -> TimeOrderReport:

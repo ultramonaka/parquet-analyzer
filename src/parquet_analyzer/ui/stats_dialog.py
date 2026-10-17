@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from PySide6.QtWidgets import (
     QDialog,
     QHeaderView,
@@ -11,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from .i18n import tr
+from .sampling_format import format_rate
 
 _COLUMN_KEYS = [
     "stats.col_variable",
@@ -21,6 +24,7 @@ _COLUMN_KEYS = [
     "stats.col_mean",
     "stats.col_std",
     "stats.col_median",
+    "stats.col_effective_rate",  # 60.3
 ]
 
 
@@ -37,6 +41,7 @@ class StatsDialog(QDialog):
         results: dict[str, dict],
         parent: QWidget | None = None,
         time_unreliable: bool = False,
+        range_width: float | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(tr("toolbar.stats"))
@@ -52,6 +57,9 @@ class StatsDialog(QDialog):
         columns = [tr(key) for key in _COLUMN_KEYS]
         table = QTableWidget(len(results), len(columns))
         table.setHorizontalHeaderLabels(columns)
+        rate_header = table.horizontalHeaderItem(len(columns) - 1)
+        if rate_header is not None:
+            rate_header.setToolTip(tr("stats.col_effective_rate_tooltip"))
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         for row, (name, stats) in enumerate(results.items()):
@@ -71,10 +79,19 @@ class StatsDialog(QDialog):
                 f"{stats['mean']:.6g}",
                 f"{stats['std']:.6g}",
                 f"{stats['median']:.6g}",
+                self._effective_rate_text(stats, range_width),
             ]
             for col, value in enumerate(values):
                 table.setItem(row, col, QTableWidgetItem(value))
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(table)
 
-        self.resize(680, 140 + 28 * len(results))
+        self.resize(780, 140 + 28 * len(results))
+
+    @staticmethod
+    def _effective_rate_text(stats: dict, range_width: float | None) -> str:
+        """60.3: valid points (gaps and non-finite excluded) per time unit over the stats range;
+        '—' when the range has no positive width."""
+        if range_width is None or not math.isfinite(range_width) or range_width <= 0:
+            return "—"
+        return format_rate((stats["count"] - stats["nan_count"]) / range_width)

@@ -761,6 +761,18 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "The output file is the source Parquet file. Choose another file name.",
         "ja": "書き出し先が元のParquetファイルです。別のファイル名を選んでください。",
     },
+    "export_parquet.exists": {
+        "en": (
+            "A file with this name already exists:\n{name}\n{size}, modified {modified}\n\n"
+            "Overwriting replaces it and cannot be undone."
+        ),
+        "ja": (
+            "同名のファイルが既に存在します:\n{name}\n{size}、更新日時 {modified}\n\n"
+            "上書きすると元に戻せません。"
+        ),
+    },
+    "export_parquet.save_timestamp": {"en": "Save with timestamp", "ja": "日時を付けて保存"},
+    "export_parquet.overwrite": {"en": "Overwrite", "ja": "上書き"},
     "export_parquet.cancel": {"en": "Cancel", "ja": "キャンセル"},
     "export_parquet.saved": {
         "en": "Parquet exported: {path} ({rows} rows, {seconds} s)",
@@ -774,6 +786,32 @@ _STRINGS: dict[str, dict[str, str]] = {
     "export_parquet.failed": {
         "en": "Could not export the Parquet file:\n{error}",
         "ja": "Parquetファイルを書き出せませんでした:\n{error}",
+    },
+    # ... disk / memory check before the start (export 57.9.6a)
+    "export_parquet.preflight_disk": {
+        "en": (
+            "The output may need up to {need}, but only {free} is free on {folder}.\n"
+            "Compression usually makes the file smaller, but the export is stopped if the free space "
+            "runs short."
+        ),
+        "ja": (
+            "出力は最大で約{need}になる見込みですが、{folder}の空きは{free}です。\n"
+            "圧縮でもっと小さくなることが多いですが、空きが足りなくなると書き出しを止めます。"
+        ),
+    },
+    "export_parquet.preflight_memory": {
+        "en": "This export is estimated to use about {need} of memory, but about {free} is available now.",
+        "ja": "この書き出しはメモリを約{need}使う見込みですが、今の空きは約{free}です。",
+    },
+    "export_parquet.preflight_start": {"en": "Start anyway", "ja": "それでも始める"},
+    "export_parquet.preflight_stop": {"en": "Do not export", "ja": "やめる"},
+    "export_parquet.disk_full": {
+        "en": "Not enough free disk space for the rest of the file; the export was stopped and the partial file removed.",
+        "ja": "ディスクの空きが残りの書き出しに足りません。書き出しを止め、途中のファイルを消しました。",
+    },
+    "export_parquet.memory_low": {
+        "en": "Not enough free memory for 30 seconds; the export was stopped and the partial file removed.",
+        "ja": "空きメモリが30秒間足りませんでした。書き出しを止め、途中のファイルを消しました。",
     },
     # ... from a saved view (export 57.7)
     "export_parquet.source_label": {"en": "Source:", "ja": "元:"},
@@ -810,6 +848,111 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "There are no rows in the selected range.",
         "ja": "範囲に行がありません。",
     },
+    # ... several files and the export list (export 57.8.2, 57.9.7)
+    "toolbar.export_parquet_list": {"en": "Parquet export list...", "ja": "Parquet書き出しの一覧..."},
+    "export_parquet.details_button": {"en": "Details...", "ja": "詳細..."},
+    "export_parquet.cancel_all": {"en": "Cancel all", "ja": "すべてキャンセル"},
+    "export_parquet.progress_files": {
+        "en": "Exporting to Parquet {done}/{files} - {percent}%",
+        "ja": "Parquetに書き出し中 {done}/{files} · {percent}%",
+    },
+    "export_parquet.files_count": {"en": "{n} files", "ja": "{n} 個のファイル"},
+    "export_parquet.file_ok": {"en": "{name}: all signals available", "ja": "{name}: すべての信号が使えます"},
+    "export_parquet.file_missing": {
+        "en": "{name}: {n} signal(s) not available ({names}) - written without them",
+        "ja": "{name}: {n}個の信号が使えません（{names}）。除いて書き出します",
+    },
+    "export_parquet.file_none": {
+        "en": "{name}: none of the selected signals is available - this file fails",
+        "ja": "{name}: 選んだ信号が1つも使えません。このファイルは失敗します",
+    },
+    "export_parquet.file_error": {"en": "{name}: {error}", "ja": "{name}: {error}"},
+    "export_parquet.file_missing_tip": {
+        "en": "Signals left out (not in this file): {names}",
+        "ja": "除いた信号（このファイルに無い）: {names}",
+    },
+    "export_parquet.no_usable_signal": {
+        "en": "None of the selected signals can be used with this file.",
+        "ja": "選んだ信号がこのファイルでは1つも使えません。",
+    },
+    "export_parquet.batch_summary": {
+        "en": "Parquet export finished: {ok} written, {failed} failed, {cancelled} cancelled. Folder: {folder}",
+        "ja": "Parquetの書き出しが終わりました: 成功 {ok}、失敗 {failed}、キャンセル {cancelled}。フォルダ: {folder}",
+    },
+    "export_parquet.batch_failed_head": {"en": "Failed files:", "ja": "失敗したファイル:"},
+    "export_parquet.batch_missing_head": {
+        "en": "Files written without some signals (signals left out):",
+        "ja": "信号が欠けて書き出されたファイル（除いた信号）:",
+    },
+    "export_parquet.panel_title": {"en": "Parquet export list", "ja": "Parquet書き出しの一覧"},
+    "export_parquet.panel_counts": {
+        "en": "Done {done} / Failed {failed} / Cancelled {cancelled} / Total {total}",
+        "ja": "完了 {done} / 失敗 {failed} / キャンセル {cancelled} / 全体 {total}",
+    },
+    "export_parquet.panel_time": {"en": "Elapsed {elapsed} / Remaining {remaining}", "ja": "経過 {elapsed} / 残り {remaining}"},
+    "export_parquet.col_source": {"en": "Source", "ja": "元のファイル"},
+    "export_parquet.col_output": {"en": "Output", "ja": "出力のファイル"},
+    "export_parquet.col_state": {"en": "State", "ja": "状態"},
+    "export_parquet.col_progress": {"en": "Progress", "ja": "進み"},
+    "export_parquet.col_rows": {"en": "Rows", "ja": "行"},
+    "export_parquet.col_rate": {"en": "Rows/s", "ja": "行/秒"},
+    "export_parquet.col_elapsed": {"en": "Elapsed", "ja": "経過"},
+    "export_parquet.col_remaining": {"en": "Remaining", "ja": "残り"},
+    "export_parquet.col_action": {"en": "Action", "ja": "操作"},
+    "export_parquet.state_waiting": {"en": "Waiting", "ja": "待ち"},
+    "export_parquet.state_range": {"en": "Finding range", "ja": "範囲を探す"},
+    "export_parquet.state_full": {"en": "Computing all rows", "ja": "全行を計算"},
+    "export_parquet.state_writing": {"en": "Writing", "ja": "書き出し中"},
+    "export_parquet.state_cancelling": {"en": "Cancelling", "ja": "キャンセル中"},
+    "export_parquet.state_done": {"en": "Done", "ja": "完了"},
+    "export_parquet.state_failed": {"en": "Failed", "ja": "失敗"},
+    "export_parquet.state_cancelled": {"en": "Cancelled", "ja": "キャンセル済"},
+    "export_parquet.state_wait_disk": {"en": "Waiting for disk space", "ja": "ディスクの空き待ち"},
+    "export_parquet.state_wait_memory": {"en": "Waiting for free memory", "ja": "メモリの空き待ち"},
+    "export_parquet.wait_disk": {
+        "en": "Waiting for free disk space before the next file starts.",
+        "ja": "ディスクの空きが戻るまで、次のファイルを始めずに待っています。",
+    },
+    "export_parquet.wait_memory": {
+        "en": "Waiting for free memory before the next file starts.",
+        "ja": "メモリの空きが戻るまで、次のファイルを始めずに待っています。",
+    },
+    "export_parquet.memory_heavy": {
+        "en": "Uses a lot of memory (about {size}); runs alone.",
+        "ja": "メモリを多く使います（約{size}）。単独で走らせます。",
+    },
+    "export_parquet.memory_over_physical": {
+        "en": "{name}: the memory estimate (about {size}) exceeds the installed memory. Cancel it if unsure.",
+        "ja": "{name}: メモリの見積もり（約{size}）が搭載メモリを超えています。不安ならキャンセルしてください。",
+    },
+    "export_parquet.time_axis_label": {"en": "Time axis:", "ja": "時間軸:"},
+    "export_parquet.time_axis_view": {"en": "The view's time axis ({name})", "ja": "ビューの時間軸（{name}）"},
+    "export_parquet.dtype_label": {"en": "Type of derived variables:", "ja": "仮想変数の型:"},
+    "export_parquet.dtype_float64": {"en": "float64 (default)", "ja": "float64（既定）"},
+    "export_parquet.dtype_float32": {"en": "float32 (half the size, about 7 digits)", "ja": "float32（大きさが約半分、精度は約7桁）"},
+    "export_parquet.dtype_tooltip": {
+        "en": "The time axis and raw columns keep their own types. NaN and Inf are kept.",
+        "ja": "時間軸と元の列は元の型のままです。NaN・Infはそのまま保ちます。",
+    },
+    "export_parquet.float32_overflow": {
+        "en": "Some values were too large for float32 and were written as Inf in: {names}",
+        "ja": "float32に収まらない大きな値がInfとして書き出されました: {names}",
+    },
+    "export_parquet.batch_overflow_head": {
+        "en": "Files with values too large for float32 (written as Inf):",
+        "ja": "float32に収まらない値がInfになったファイル（変数）:",
+    },
+    "export_parquet.range_axis_missing": {
+        "en": "The saved range is in the units of the view's time axis ({name}), which is not in this file.",
+        "ja": "保存した範囲はビューの時間軸（{name}）の単位ですが、この列がこのファイルにありません。",
+    },
+    "export_parquet.cancel_requested": {
+        "en": "Cancelling the Parquet export... (a file that is already finished stays)",
+        "ja": "書き出しのキャンセルを頼みました（すでに書き終えるところのファイルは残ります）。",
+    },
+    "export_parquet.clear_finished": {"en": "Clear finished", "ja": "終わったものを消す"},
+    "export_parquet.close": {"en": "Close", "ja": "閉じる"},
+    "export_parquet.open_folder": {"en": "Open folder", "ja": "フォルダを開く"},
     "view.export_button": {"en": "Export to Parquet...", "ja": "Parquetに書き出す..."},
     "view.problem_alias_name": {
         "en": "named like a signal alias",
@@ -910,6 +1053,30 @@ _STRINGS: dict[str, dict[str, str]] = {
         "restored):\n{list}",
         "ja": "ビュー「{name}」の次の項目は復元できませんでした（他の部分は復元済みです）:\n{list}",
     },
+    "settings.show_sampling_rate": {
+        "en": "Show the sampling rate in the status bar",
+        "ja": "ステータスバーにサンプリングレートを表示",
+    },
+    "sampling.label": {"en": "{rate} ({interval})", "ja": "{rate}（{interval}）"},
+    "sampling.label_irregular": {
+        "en": "~{rate} ({interval}), irregular",
+        "ja": "約 {rate}（{interval}）・不等間隔",
+    },
+    "sampling.tooltip": {
+        "en": "Time-axis sampling: median interval {interval} (min {dt_min}, max {dt_max}). "
+        "One value for the whole file. The stats table's \"effective sample rate\" is per signal and "
+        "per range (valid points per second, gaps excluded).",
+        "ja": "時間軸のサンプリング: 間隔の中央値 {interval}（最小 {dt_min}、最大 {dt_max}）。"
+        "ファイル全体で1つの値です。統計の「有効サンプルレート」は信号ごと・範囲ごと"
+        "（欠損を除いた1秒あたりの有効な点数）で別のものです。",
+    },
+    "stats.col_effective_rate": {"en": "Effective sample rate", "ja": "有効サンプルレート"},
+    "stats.col_effective_rate_tooltip": {
+        "en": "Valid points (gaps and non-finite values excluded) divided by the width of the stats range. "
+        "Differs from the file's sampling rate in the status bar when the signal has gaps.",
+        "ja": "有効な点数（欠損・非有限を除く）÷統計の範囲の幅。信号に欠損があると、"
+        "ステータスバーのファイルのサンプリングレートより小さくなります。",
+    },
     "settings.auto_redraw_checkbox": {
         "en": "Automatically redraw while panning/zooming (when off, press R to redraw manually)",
         "ja": "パン/ズーム時に自動で再描画する（オフの場合はRで手動再描画）",
@@ -934,6 +1101,11 @@ _STRINGS: dict[str, dict[str, str]] = {
     "settings.log_retention_tooltip": {
         "en": "Log files older than this are deleted when the app starts (takes effect at the next start).",
         "ja": "これより古いログファイルはアプリ起動時に削除されます（次回の起動から有効）。",
+    },
+    "settings.export_parallel_label": {"en": "Parquet export: files at once", "ja": "Parquet書き出し: 同時に書くファイル数"},
+    "settings.export_parallel_tooltip": {
+        "en": "How many output files are written at the same time (1-4). More is faster but uses more memory.",
+        "ja": "同時に書き出す出力ファイルの数（1〜4）。多いほど速いが、メモリを多く使います。",
     },
     "settings.open_log_folder": {"en": "Open log folder", "ja": "ログのフォルダを開く"},
     "settings.open_log_folder_tooltip": {

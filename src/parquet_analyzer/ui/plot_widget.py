@@ -15,8 +15,9 @@ from ..core.background_worker import WorkerHub
 from ..core.column import DerivedColumn
 from ..core.downsample import lttb
 from ..core.oplog import log_op
-from ..io.settings import DEFAULT_SCROLL_BINDINGS, normalize_scroll_bindings
+from ..io.settings import normalize_scroll_bindings
 from .i18n import tr
+from .scroll_zoom import apply_wheel
 
 # MIME type of a plot-reorder drag (detailed_specification.md 22.3). Deliberately carries no
 # text: the variable drop above accepts anything with hasText().
@@ -33,7 +34,6 @@ _HOVER_SETTLE_MS = 100  # mouse idle this long -> replace the approximate values
 
 _CURSOR_COLOR = "#ffaa00"  # distinct from _COLOR_CYCLE so a cursor never blends into a series
 
-_PAN_STEP_FRACTION = 0.15  # of the current visible X span, per wheel "notch" (120 units)
 _REDRAW_DEBOUNCE_MS = 120  # coalesce rapid sigRangeChanged bursts (drag-pan, scroll) into one redraw
 
 # Above this many visible rows, a windowed series (Phase D) prefers its pyramid's
@@ -257,6 +257,9 @@ class TimePlotWidget(pg.PlotWidget):
         self._redraw_debounce = QTimer(self)
         self._redraw_debounce.setSingleShot(True)
         self._redraw_debounce.timeout.connect(self._redraw_all_series)
+        # Set by retire() once the plot is removed from the grid: no new job may start after
+        # that, so "nothing pending" stays true once reached and deleting the pane is safe.
+        self._retired = False
 
         self.showGrid(x=True, y=True, alpha=0.3)
         # Custom legend (23.1/23.2): sample click goes through our visible flag, label click selects.
@@ -646,6 +649,16 @@ class TimePlotWidget(pg.PlotWidget):
         if self._series:
             self.go_home()
 
+    def retire(self) -> None:
+        """Called by PlotGrid.remove_plot: this plot is gone and will be deleted once its
+        in-flight jobs are delivered. From now on it starts no background job: its pane is
+        re-laid-out outside the splitter and it is still X-linked until deleted, so its range
+        jumps and a debounced redraw would otherwise submit a job *after* the grid saw
+        `pending_downsample_count() == 0` and called deleteLater() -- that result then lands
+        on a deleted widget and its downsampleStarted is never balanced (busy stays on)."""
+        self._retired = True
+        self._redraw_debounce.stop()
+
     def pending_downsample_count(self) -> int:
         """Number of in-flight background downsample jobs (for tests/debugging)."""
         return len(self._hub.pending)
@@ -1024,29 +1037,7 @@ class TimePlotWidget(pg.PlotWidget):
         - Some trackpads report a Shift+vertical-scroll gesture as a horizontal wheel
           event (delta lands in angleDelta().x() instead of .y()) — use whichever is non-zero.
         """
-        modifiers = ev.modifiers()
-        ctrl = bool(modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier))
-        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
-        # Precedence when both are held at once (unusual, but Qt doesn't prevent it):
-        # shift wins over ctrl, matching the original fixed scheme's own precedence.
-        modifier_key = "shift" if shift else "ctrl" if ctrl else "none"
-        action = self.scroll_bindings.get(modifier_key, DEFAULT_SCROLL_BINDINGS[modifier_key])
-        angle_delta = ev.angleDelta()
-        delta = angle_delta.y() or angle_delta.x()
-        vb = self.getViewBox()
-
-        if action == "pan":
-            x_min, x_max = vb.viewRange()[0]
-            shift_amount = -delta / 120.0 * (x_max - x_min) * _PAN_STEP_FRACTION
-            vb.setXRange(x_min + shift_amount, x_max + shift_amount, padding=0)
-            ev.accept()
-            return
-
-        scale = 0.999**delta
-        scene_pos = self.mapToScene(ev.position().toPoint())
-        center = vb.mapSceneToView(scene_pos)
-        vb.scaleBy((1.0, scale) if action == "y_zoom" else (scale, 1.0), center=center)
-        ev.accept()
+        apply_wheel(self, ev, self.scroll_bindings)  # shared with the histogram plots (42.16)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt override)
         menu = QMenu(self)
@@ -1205,6 +1196,8 @@ class TimePlotWidget(pg.PlotWidget):
             self._redraw_series(name)
 
     def _redraw_series(self, name: str) -> None:
+        if self._retired:
+            return  # removed from the grid: never start a job again (see retire())
         entry = self._series.get(name)
         if entry is None or not entry["visible"]:
             return  # hidden: no recompute until shown again (23.1)
@@ -1459,6 +1452,8 @@ class TimePlotWidget(pg.PlotWidget):
         another plot or the navigator. Success: redraw from it. Failure: report it (the series
         must not stay silently blank), and once the column gave up pyramids redraw anyway --
         that now takes the real-fetch path."""
+        if self._retired:
+            return  # removed from the grid (maybe already deleted): nothing to draw or report
         entry = self._series.get(name)
         if entry is None or entry["y_source"] is not y_source:
             return

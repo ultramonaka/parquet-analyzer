@@ -65,8 +65,11 @@ def test_view_and_settings_menus(win):
     view_button = win.findChild(QToolButton, "view_button")
     assert view_button.popupMode() == QToolButton.ToolButtonPopupMode.InstantPopup
     assert win.view_menu.objectName() == "view_menu"
-    assert win.view_menu.actions() == [win._actions["save_view"], win._actions["load_view"]]
-    assert [a.text() for a in win.view_menu.actions()] == ["Save...", "Manage..."]
+    # the export list (export 57.9.7) sits at the end of the View menu while the Parquet export is on
+    assert win.view_menu.actions() == [
+        win._actions["save_view"], win._actions["load_view"], win._actions["export_parquet_list"]
+    ]
+    assert [a.text() for a in win.view_menu.actions()] == ["Save...", "Manage...", "Parquet export list..."]
     sb = win.findChild(QToolButton, "settings_button")
     assert sb.text() == "⚙" and sb.toolTip() == "Settings and display options"
     assert sb.popupMode() == QToolButton.ToolButtonPopupMode.InstantPopup

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import os
-import threading
 from collections import ChainMap
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__, features
-from ..core import oplog
+from ..core import export_resources, oplog
 from ..core import parquet_export as pq_export
 from ..core.analysis import basic_stats, chunked_stats, fft, sampling_report
 from ..core.background_worker import WorkerHub
@@ -73,8 +73,9 @@ from ..io import user_functions as uf_io
 from ..io import view as view_io
 from ..io.settings import Settings, load_settings, push_recent_folder, save_settings
 from . import messages
+from .export_controller import ExportController
 from .expression_bar import ExpressionBar
-from .folder_picker import pick_parquet_file
+from .folder_picker import pick_parquet_file, pick_parquet_files
 from .i18n import set_language, tr
 from .image_export import EXPORT_FORMATS, export_plots_image
 from .navigator import NavigatorWidget
@@ -83,9 +84,9 @@ from .parquet_export_dialog import (
     ExportChoices,
     ExportItemChoice,
     ParquetExportDialog,
-    ParquetExportProgress,
 )
 from .plot_grid import PlotGridWidget
+from .sampling_format import format_interval, format_rate
 from .settings_dialog import SettingsDialog
 from .signal_alias_assign_dialog import AssignRow, SignalAliasAssignDialog
 from .stats_dialog import StatsDialog
@@ -116,26 +117,6 @@ _VIEW_COMPUTE_PARALLEL = max(1, min((os.cpu_count() or 2) - 1, _VIEW_COMPUTE_PAR
 _VIEW_COMPUTE_SHOW_DELAY_MS = 300
 
 
-class _NoRows:
-    """The export worker's result when the saved time range holds no rows (57.7.4)."""
-
-
-_NO_ROWS = _NoRows()
-
-
-class _ParquetExportJob:
-    """The running Parquet export (export.ja.md 57.3): the plan, the cancel flag the worker polls and
-    an event set when the worker has really finished (it removes its `.part` first)."""
-
-    def __init__(self, plan: pq_export.ExportPlan, path: str):
-        self.plan = plan
-        self.path = path
-        self.cancel_event = threading.Event()
-        self.worker_done = threading.Event()
-        self.token = 0
-        self.progress_key = 0
-
-
 class _ViewExportContext:
     """A saved view and its source file's footer, as read for an export that does not open the view
     (export 57.7). `error` (translated) is why nothing can be exported; `info` is None until the
@@ -149,6 +130,8 @@ class _ViewExportContext:
         self.total_rows = 0
         self.info: pq_export.ViewExport | None = None
         self.time_type = None  # Arrow type of the time column, for showing the saved range
+        self.time_candidates: list[str] = []  # columns usable as the time axis (57.8.3)
+        self.view_time_name = ""
         self.error = ""
 
 
@@ -165,6 +148,8 @@ class MainWindow(QMainWindow):
         self._time_order_label = QLabel("")  # time-axis order warning (29.2); hidden when ok
         self._time_order_label.setStyleSheet("color: #b45309;")
         self._time_order_label.setVisible(False)
+        self._sampling_label = QLabel("")  # sampling rate of the time axis (data 60.2); hidden without a file
+        self._sampling_label.setVisible(False)
         # Transient notices (render failure, image saved) live in a normal label, not
         # statusBar().showMessage(): showMessage hides every addWidget widget (file
         # name, time-order warning) while it is up.
@@ -177,6 +162,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         self.settings: Settings = load_settings()
+        export_resources.set_disk_margin_mb(self.settings.export_disk_margin_mb)  # export 57.9.6a
         set_language(self.settings.language)
 
         self._data_source: ParquetDataSource | None = None
@@ -199,6 +185,7 @@ class MainWindow(QMainWindow):
         self._alias_manager = None
         self._time_column: str | None = None
         self._time_values: np.ndarray | TimeIndex | None = None
+        self._time_order_report = None  # TimeOrderReport of the current axis (29.2 / 60.2)
         self._time_indexes: dict[str, TimeIndex] = {}  # 36.6 D: per-file cache of built indexes
         self._raw_variables: dict[str, Column] = {}  # _file_columns minus the current time column
         self._derived: dict[str, DerivedVariable] = {}
@@ -227,14 +214,10 @@ class MainWindow(QMainWindow):
         self._view_compute: ViewComputeRunner | None = None
         self._view_compute_generation = 0
         self._view_compute_ctx: dict | None = None
-        # Parquet export (export.ja.md 57.3): one job at a time on its own single-thread pool, so a
-        # long export never starves the analysis jobs; `_parquet_export` is the running job (None when
-        # idle), `_parquet_export_cancelled` the jobs cancelled whose worker may still be cleaning up.
-        self._parquet_export_pool = QThreadPool(self)
-        self._parquet_export_pool.setMaxThreadCount(1)
-        self._parquet_export_hub = WorkerHub(self._parquet_export_pool)
-        self._parquet_export: _ParquetExportJob | None = None
-        self._parquet_export_cancelled: list[_ParquetExportJob] = []
+        # Parquet export (export.ja.md 57.3, 57.9): one queue of output files, its own thread pool
+        # (at most `export_parallel_files` threads, so a long export never starves the analysis jobs),
+        # the redraw timer, the status-bar summary and the list window -- all in the controller.
+        self._export = ExportController(self)
         # Live, per-session (not persisted to Settings — saved per-View instead, like
         # x/y axis ranges) toggle for TimePlotWidget/PlotGridWidget.set_downsample_enabled.
         # Off means "always show real per-sample data" — still coherent with the
@@ -321,6 +304,7 @@ class MainWindow(QMainWindow):
 
         self.statusBar().addWidget(self._file_label)  # left-aligned, unlike the permanent widgets below
         self.statusBar().addWidget(self._time_order_label)  # next to the file name (29.2), not permanent
+        self.statusBar().addWidget(self._sampling_label)  # right of the order warning (60.2)
         self.statusBar().addWidget(self._notice_label)
 
         self._progress_bar = QProgressBar()
@@ -334,7 +318,7 @@ class MainWindow(QMainWindow):
         self._view_compute_show_timer.setInterval(_VIEW_COMPUTE_SHOW_DELAY_MS)
         self._view_compute_show_timer.timeout.connect(self._show_view_compute_progress)
         self.statusBar().addPermanentWidget(self._view_compute_progress)
-        self._parquet_export_progress = ParquetExportProgress(self._on_parquet_export_cancel_clicked)  # 57.3
+        self._parquet_export_progress = self._export.status  # 57.3, 57.9.7
         self.statusBar().addPermanentWidget(self._parquet_export_progress)
         self.statusBar().addPermanentWidget(self._progress_bar)
 
@@ -415,6 +399,8 @@ class MainWindow(QMainWindow):
                 "export_parquet", tr("toolbar.export_parquet"), toolbar, lambda *_: self.export_parquet_dialog()
             )
             export_parquet_action.setToolTip(tr("toolbar.export_parquet_tooltip"))
+            # the export list (57.9.7), also reachable from the status bar's "Details..." button
+            self._add_action("export_parquet_list", tr("toolbar.export_parquet_list"), self.view_menu, self._export.show_panel)
         toolbar.addSeparator()
         home_action = self._add_action("home", tr("toolbar.home"), toolbar, self.plot_grid.go_home)
         home_action.setToolTip(tr("toolbar.home_tooltip"))
@@ -638,6 +624,7 @@ class MainWindow(QMainWindow):
             report = check_time_order(tv)
         self._time_order_report = report
         self._apply_time_order_to_readouts()  # 56.1: cached flag for cursor / hover
+        self._update_sampling_label()  # 60.2: same place, same report
         if report is None or (report.ok and not report.duplicate_count):
             self._time_order_label.setText("")
             self._time_order_label.setToolTip("")
@@ -673,6 +660,31 @@ class MainWindow(QMainWindow):
             first_decreasing_index=report.first_decreasing_index,
             duplicate_count=report.duplicate_count,
         )
+
+    def _update_sampling_label(self) -> None:
+        """Status-bar sampling rate of the time axis (data 60.2), from the report of the
+        time-order scan. Hidden without a file, without a usable interval or when the
+        setting is off (the value itself stays in `_time_order_report`)."""
+        report = self._time_order_report
+        label = self._sampling_label
+        if report is None or not self.settings.show_sampling_rate or not math.isfinite(report.dt_median):
+            label.setText("")
+            label.setToolTip("")
+            label.setVisible(False)
+            return
+        rate = format_rate(report.rate_hz)
+        interval = format_interval(report.dt_median)
+        key = "sampling.label_irregular" if report.irregular else "sampling.label"
+        label.setText(tr(key, rate=rate, interval=interval))
+        label.setToolTip(
+            tr(
+                "sampling.tooltip",
+                interval=interval,
+                dt_min=format_interval(report.dt_min),
+                dt_max=format_interval(report.dt_max),
+            )
+        )
+        label.setVisible(True)
 
     def time_order_unreliable(self) -> bool:
         """56.1: True when range-based values (stats, analysis windows, cursor / hover) may be wrong
@@ -1954,6 +1966,8 @@ class MainWindow(QMainWindow):
             if row_end > row_start
             else tr("stats.empty_range")
         )
+        # 60.3: width of the stats range (time units) for the effective sample rate column
+        range_width = float(tv[row_end - 1] - tv[row_start]) if row_end - row_start >= 2 else 0.0
         extra = {"plot": plot.plot_id} if plot is not None else {}
         log_op("stats", variables=candidate_names, row_start=row_start, row_end=row_end, **extra)
 
@@ -1986,6 +2000,7 @@ class MainWindow(QMainWindow):
         names = [n for n in candidate_names if n in resolved or n in errors]
         pending = {
             "range_label": range_label,
+            "range_width": range_width,
             "names": names,
             "results": {n: {"error": m} for n, m in errors.items()},
             "remaining": len(resolved),
@@ -2026,7 +2041,11 @@ class MainWindow(QMainWindow):
         # Preserve the order the user selected the variables in, not completion order.
         ordered_results = {name: batch["results"][name] for name in batch["names"]}
         dialog = StatsDialog(
-            batch["range_label"], ordered_results, parent=self, time_unreliable=self.time_order_unreliable()
+            batch["range_label"],
+            ordered_results,
+            parent=self,
+            time_unreliable=self.time_order_unreliable(),
+            range_width=batch.get("range_width"),
         )
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.show()
@@ -2590,7 +2609,7 @@ class MainWindow(QMainWindow):
 
     # -- Parquet export (export.ja.md 57) ----------------------------------------------------
 
-    _PARQUET_EXPORT_CHUNK_ROWS = pq_export.DEFAULT_CHUNK_ROWS  # a class attribute so tests can shrink it
+    _PARQUET_EXPORT_CHUNK_ROWS: int | None = None  # None: sized from the row width (57.9.3); tests shrink it
 
     def _exportable_signal_names(self) -> list[str]:
         """The signals on the plots, in plot order then in-plot order, each once, hidden series
@@ -2611,9 +2630,6 @@ class MainWindow(QMainWindow):
         if self._view_compute_active():
             messages.information(self, title, tr("export_parquet.busy_view_load"))
             return
-        if self._parquet_export_busy():
-            messages.information(self, title, tr("export_parquet.busy"))
-            return
         views = view_io.list_views()
         have_file = self._data_source is not None and self._time_values is not None
         names = self._exportable_signal_names() if have_file else []
@@ -2629,7 +2645,7 @@ class MainWindow(QMainWindow):
         sources.extend((tr("export_parquet.source_view", name=v), v) for v in views)
         initial = view_name if view_name in views else (None if names else views[0])
 
-        def provider(key: str | None, override: str | None) -> ExportChoices:
+        def provider(key: str | None, override: str | None, time_column: str | None = None) -> ExportChoices:
             if key is None:
                 total = len(self._time_values)
                 v_start, v_end = self._visible_row_range()
@@ -2639,43 +2655,96 @@ class MainWindow(QMainWindow):
                     visible_rows=max(0, v_end - v_start),
                     time_name=self._display_name(self._time_column) or "",
                 )
-            return self._view_export_choices(key, override)
+            return self._view_export_choices(key, override, time_column)
 
-        def pick_other_file() -> str | None:
-            return pick_parquet_file(self, self.settings.last_data_folder, self.settings.recent_data_folders)
+        def pick_other_files() -> list[str]:  # one or several (57.8.2)
+            return pick_parquet_files(self, self.settings.last_data_folder, self.settings.recent_data_folders)
 
         dialog = ParquetExportDialog(
-            names, 0, 0, "", self, sources=sources, provider=provider, pick_file=pick_other_file, initial_key=initial
+            names, 0, 0, "", self, sources=sources, provider=provider, pick_file=pick_other_files, initial_key=initial
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         key = dialog.selected_source()
+        files = dialog.source_files()
+        if key is not None and len(files) >= 2:  # one view applied to several files (57.8.2)
+            self._export_batch_dialog(
+                title, key, dialog.selected_names(), dialog.use_visible_range(), files,
+                time_column=dialog.selected_time_column(), derived_dtype=dialog.selected_dtype(),
+            )
+            return
         if key is not None:
             source = self._view_export_context(key, dialog.source_file_override()).source_path
         else:
             source = Path(self._data_source.path)
         folder = self.settings.last_export_folder or str(source.parent)
         default = Path(folder) / f"{source.stem}_{datetime.now():%Y%m%d_%H%M%S}.parquet"
-        path, _selected = QFileDialog.getSaveFileName(self, title, str(default), tr("export_parquet.filter"))
+        # DontConfirmOverwrite: the one confirmation is ours, asked after the suffix is completed (57.8.1)
+        path, _selected = QFileDialog.getSaveFileName(
+            self, title, str(default), tr("export_parquet.filter"), options=QFileDialog.Option.DontConfirmOverwrite
+        )
         if not path:
             return
         if not Path(path).suffix:
             path += ".parquet"
+        resolved = self._resolve_export_target(path, source, title)
+        if resolved is None:
+            return
+        path, overwrite, renamed = resolved
         if key is not None:
             self.export_parquet_from_view(
-                path, key, dialog.selected_names(), dialog.use_visible_range(), dialog.source_file_override()
+                path, key, dialog.selected_names(), dialog.use_visible_range(), dialog.source_file_override(),
+                overwrite=overwrite, renamed=renamed, time_column=dialog.selected_time_column(),
+                derived_dtype=dialog.selected_dtype(),
             )
             return
         total = len(self._time_values)
         v_start, v_end = self._visible_row_range()
         row_range = (v_start, v_end) if dialog.use_visible_range() else (0, total)
-        self.export_parquet(path, dialog.selected_names(), row_range)
+        self.export_parquet(
+            path, dialog.selected_names(), row_range, overwrite=overwrite, renamed=renamed,
+            derived_dtype=dialog.selected_dtype(),
+        )
+
+    def _resolve_export_target(self, path: str, source: str | os.PathLike, title: str) -> tuple[str, bool, bool] | None:
+        """Decide what to do when the chosen export file may exist (57.8.1): `(path, overwrite, renamed)`,
+        or None when nothing should be exported (cancelled, or `path` is the source file)."""
+        if self._is_source_file(path, source):  # refused as before, never reaches the question
+            messages.warning(self, title, tr("export_parquet.same_as_source"))
+            return None
+        target = Path(path)
+        if not target.exists():
+            return path, False, False
+        try:
+            st = target.stat()
+            size = f"{st.st_size / 1_048_576:,.1f} MB"
+            modified = f"{datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M:%S}"
+        except OSError:
+            size, modified = "?", "?"
+        choice = messages.choose_export_overwrite(
+            self, title, tr("export_parquet.exists", name=str(target), size=size, modified=modified),
+            tr("export_parquet.save_timestamp"), tr("export_parquet.overwrite"), tr("export_parquet.cancel"),
+        )
+        if choice == "overwrite":
+            return path, True, False
+        if choice != "timestamp":
+            return None
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        candidate = target.with_name(f"{target.stem}_{stamp}{target.suffix}")
+        n = 2
+        while candidate.exists():
+            candidate = target.with_name(f"{target.stem}_{stamp}_{n}{target.suffix}")
+            n += 1
+        return str(candidate), False, True
 
     def _parquet_export_busy(self) -> bool:
-        """An export is running, or a cancelled one's worker has not finished removing its `.part`
-        yet (a new export must not meet it)."""
-        self._parquet_export_cancelled = [j for j in self._parquet_export_cancelled if not j.worker_done.is_set()]
-        return self._parquet_export is not None or bool(self._parquet_export_cancelled)
+        """Anything in the export queue waits, runs, or still removes its `.part` after a cancel."""
+        return self._export.busy()
+
+    @property
+    def _parquet_export(self):
+        """The export file being written (the first one running), None when none runs (57.9)."""
+        return self._export.running_item
 
     def _is_source_file(self, path: str, source: str | os.PathLike | None = None) -> bool:
         """True when `path` is the source Parquet file (57.2; default: the open file): `samefile` when
@@ -2688,7 +2757,9 @@ class MainWindow(QMainWindow):
             pass
         return Path(path).resolve() == Path(source).resolve()
 
-    def _build_export_plan(self, names: list[str], row_range: tuple[int, int]) -> pq_export.ExportPlan:
+    def _build_export_plan(
+        self, names: list[str], row_range: tuple[int, int], derived_dtype: str = "float64"
+    ) -> pq_export.ExportPlan:
         """The immutable snapshot the worker runs (57.2): taken here on the UI thread, so editing
         variables or functions during the export changes nothing in it."""
         alias = self._alias_sources
@@ -2708,66 +2779,61 @@ class MainWindow(QMainWindow):
             registry=self._registry_snapshot(),
             metadata={"view": self._view_name, "software": f"Parquet Analyzer v{__version__}"},
             chunk_rows=self._PARQUET_EXPORT_CHUNK_ROWS,
+            derived_dtype=derived_dtype,
         )
 
-    def export_parquet(self, path: str, names: list[str], row_range: tuple[int, int]) -> bool:
+    def export_parquet(
+        self,
+        path: str,
+        names: list[str],
+        row_range: tuple[int, int],
+        overwrite: bool = False,
+        renamed: bool = False,
+        derived_dtype: str = "float64",
+    ) -> bool:
         """Start the background export of `names` (rows `row_range`) to `path`; False when it could
-        not be started (a dialog says why)."""
+        not be started (a dialog says why). An existing `path` is only replaced with `overwrite`
+        (the confirmed choice of the dialog, 57.8.1); `renamed`: `path` is a timestamped name."""
         log_op(
             "export_parquet", path=path, range=list(row_range), columns=len(names),
-            rows=max(0, row_range[1] - row_range[0]),
+            rows=max(0, row_range[1] - row_range[0]), overwrite=overwrite, renamed=renamed,
+            derived_dtype=derived_dtype,
         )
         title = tr("toolbar.export_parquet")
         if self._data_source is None or self._time_values is None:
             messages.information(self, title, tr("error.open_file_first"))
             return False
-        if self._parquet_export_busy():
-            messages.information(self, title, tr("export_parquet.busy"))
-            return False
         if self._is_source_file(path):
             messages.warning(self, title, tr("export_parquet.same_as_source"))
             return False
         try:
-            plan = self._build_export_plan(names, row_range)
+            plan = self._build_export_plan(names, row_range, derived_dtype)
         except pq_export.ExportError as e:
             messages.warning(self, title, tr("export_parquet.failed", error=e))
             return False
-        return self._start_parquet_export(plan, path)
+        return self._start_parquet_export(plan, path, overwrite)
 
-    def _start_parquet_export(self, plan: pq_export.ExportPlan, path: str) -> bool:
-        """Run `plan` on the export worker (57.3); the plan is a snapshot, nothing of the window is read
-        again. Shared by the current screen and a saved view as the source."""
-        job = _ParquetExportJob(plan, str(path))
-        hub = self._parquet_export_hub
-        job.progress_key, emit = hub.progress_sink(
-            lambda done, total: self._on_parquet_export_progress(job, done, total)
-        )
-
-        def run() -> pq_export.ExportResult | None | _NoRows:
-            try:
-                return pq_export.export_parquet(plan, job.path, emit, job.cancel_event.is_set)
-            except pq_export.ExportCancelled:
-                return None
-            except pq_export.NoRowsInRange:  # an expected outcome of a saved range (57.7.4), not an error
-                return _NO_ROWS
-            finally:
-                job.worker_done.set()
-
-        self._parquet_export = job
-        self._parquet_export_progress.begin()
-        job.token = hub.submit(
-            run,
-            lambda result: self._on_parquet_export_finished(job, result),
-            lambda error: self._on_parquet_export_failed(job, error),
-            job="parquet_export",
-            target=job.path,
-        )
+    def _start_parquet_export(
+        self, plan: pq_export.ExportPlan, path: str, overwrite: bool = False, view: str | None = None
+    ) -> bool:
+        """Add `plan` to the export queue (57.3, 57.9); it starts at once when a slot is free, else it
+        waits behind the running files. The plan is a snapshot, nothing of the window is read again.
+        Shared by the current screen and a saved view as the source. False when the resource check
+        was declined."""
+        item = self._export.new_item(plan.source_path, str(path), plan, overwrite=overwrite, view=view)
+        if not self._export.confirm_resources([item]):
+            return False
+        self._export.submit([item])
         return True
 
     # -- Parquet export from a saved view, without opening it (export 57.7) --------------------
 
     def _view_export_context(
-        self, name: str, override: str | None, on_resolved: Callable[[_ViewExportContext], None] | None = None
+        self,
+        name: str,
+        override: str | None,
+        on_resolved: Callable[[_ViewExportContext], None] | None = None,
+        time_column: str | None = None,
     ) -> _ViewExportContext:
         """Read the saved view and the footer of its source file (or `override`) on the UI thread:
         schema and row count only, no data. Nothing of the open file / variables is used."""
@@ -2791,21 +2857,23 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001 (not a Parquet file, unreadable...)
             ctx.error = tr("export_parquet.source_unreadable", error=e)
             return ctx
+        ctx.time_candidates = pq_export.time_candidates(schema)
+        ctx.view_time_name = view.time_column or (schema.names[0] if schema.names else "")
         ctx.info = pq_export.view_export_info(
             view, list(schema.names), self._effective_aliases(), self._registry_snapshot(),
-            alias_names=set(self._aliases),
+            alias_names=set(self._aliases), time_column=time_column,
         )
-        if ctx.info.time_source in schema.names:
-            ctx.time_type = schema.field(ctx.info.time_source).type
+        if ctx.info.range_source in schema.names:  # the saved range's numbers belong to the view's own axis (57.8.3)
+            ctx.time_type = schema.field(ctx.info.range_source).type
         if ctx.info.time_problem is not None:
             ctx.error = tr("export_parquet.time_missing", name=ctx.info.time_problem.detail)
         return ctx
 
-    def _view_export_choices(self, name: str, override: str | None) -> ExportChoices:
-        ctx = self._view_export_context(name, override)
+    def _view_export_choices(self, name: str, override: str | None, time_column: str | None = None) -> ExportChoices:
+        ctx = self._view_export_context(name, override, time_column=time_column)
         shown = str(ctx.source_path) if ctx.source_path is not None else ""
         if ctx.info is None:
-            return ExportChoices([], source_file=shown, error=ctx.error)
+            return ExportChoices([], source_file=shown, error=ctx.error, view_time_name=ctx.view_time_name)
         items = [
             ExportItemChoice(i.name, i.checked, i.usable, problem_text(i.problem) if i.problem else "")
             for i in ctx.info.items
@@ -2822,10 +2890,18 @@ class MainWindow(QMainWindow):
             source_file=shown,
             error=ctx.error,
             saved_range_text=saved_text,
+            time_candidates=ctx.time_candidates,
+            view_time_name=ctx.view_time_name,
         )
 
+    @staticmethod
+    def _plan_error_text(e: pq_export.ExportError) -> str:
+        if isinstance(e, pq_export.RangeAxisMissing):
+            return tr("export_parquet.range_axis_missing", name=e.name)
+        return str(e)
+
     def _build_view_export_plan(
-        self, ctx: _ViewExportContext, names: list[str], use_saved_range: bool
+        self, ctx: _ViewExportContext, names: list[str], use_saved_range: bool, derived_dtype: str = "float64"
     ) -> pq_export.ExportPlan:
         return pq_export.plan_from_view(
             ctx.view,
@@ -2838,6 +2914,7 @@ class MainWindow(QMainWindow):
             software=f"Parquet Analyzer v{__version__}",
             registry=self._registry_snapshot(),
             chunk_rows=self._PARQUET_EXPORT_CHUNK_ROWS,
+            derived_dtype=derived_dtype,
         )
 
     def export_parquet_from_view(
@@ -2847,6 +2924,10 @@ class MainWindow(QMainWindow):
         names: list[str],
         use_saved_range: bool = False,
         source_file: str | None = None,
+        overwrite: bool = False,
+        renamed: bool = False,
+        time_column: str | None = None,
+        derived_dtype: str = "float64",
     ) -> bool:
         """Export `names` of the saved view `view_name` to `path` without opening the view (57.7):
         the plan comes from the view's JSON and the file's footer; the app's open file, variables
@@ -2861,17 +2942,15 @@ class MainWindow(QMainWindow):
                 "export_parquet", path=path, from_view=view_name,
                 source=str(resolved.source_path) if resolved.source_path is not None else None,
                 range="saved" if use_saved_range else "all", columns=len(names),
+                overwrite=overwrite, renamed=renamed, time_column=time_column, derived_dtype=derived_dtype,
             )
 
-        ctx = self._view_export_context(view_name, source_file, on_resolved=log_start)
+        ctx = self._view_export_context(view_name, source_file, on_resolved=log_start, time_column=time_column)
         if not logged:  # the view itself could not be read
             log_start(ctx)
         title = tr("toolbar.export_parquet")
         if self._view_compute_active():
             messages.information(self, title, tr("export_parquet.busy_view_load"))
-            return False
-        if self._parquet_export_busy():
-            messages.information(self, title, tr("export_parquet.busy"))
             return False
         if ctx.error:
             messages.warning(self, title, tr("export_parquet.failed", error=ctx.error))
@@ -2880,75 +2959,121 @@ class MainWindow(QMainWindow):
             messages.warning(self, title, tr("export_parquet.same_as_source"))
             return False
         try:
-            plan = self._build_view_export_plan(ctx, names, use_saved_range)
+            plan = self._build_view_export_plan(ctx, names, use_saved_range, derived_dtype)
         except pq_export.ExportError as e:
-            messages.warning(self, title, tr("export_parquet.failed", error=e))
+            messages.warning(self, title, tr("export_parquet.failed", error=self._plan_error_text(e)))
             return False
-        return self._start_parquet_export(plan, path)
+        return self._start_parquet_export(plan, path, overwrite, view=view_name)
 
-    def _on_parquet_export_progress(self, job: _ParquetExportJob, done: int, total: int) -> None:
-        if job is self._parquet_export:
-            self._parquet_export_progress.set_progress(done, total)
+    # -- one view applied to several files (export 57.8.2) -------------------------------------------
 
-    def _end_parquet_export(self, job: _ParquetExportJob) -> None:
-        self._parquet_export_hub.drop_progress(job.progress_key)
-        if job is self._parquet_export:
-            self._parquet_export = None
-            self._parquet_export_progress.end()
+    @staticmethod
+    def _safe_name(text: str) -> str:
+        """`text` as part of a file name: the characters a file name cannot hold become `_`."""
+        cleaned = "".join("_" if c in '<>:"/\\|?*' or ord(c) < 32 else c for c in text).strip(" .")
+        return cleaned or "view"
 
-    def _on_parquet_export_finished(
-        self, job: _ParquetExportJob, result: pq_export.ExportResult | None | _NoRows
+    def _export_batch_dialog(
+        self,
+        title: str,
+        view_name: str,
+        names: list[str],
+        use_saved_range: bool,
+        files: list[str],
+        time_column: str | None = None,
+        derived_dtype: str = "float64",
     ) -> None:
-        if job is not self._parquet_export:
+        """After the dialog accepted several files: ask for the output *folder* and run the batch."""
+        first = Path(files[0])
+        default = self.settings.last_export_folder or str(first.parent)
+        folder = QFileDialog.getExistingDirectory(self, title, default)
+        if not folder:
             return
-        self._end_parquet_export(job)
-        if result is _NO_ROWS:
-            messages.warning(
-                self, tr("toolbar.export_parquet"), tr("export_parquet.failed", error=tr("export_parquet.no_rows"))
+        self.export_parquet_batch(
+            folder, view_name, names, use_saved_range, files, time_column=time_column, derived_dtype=derived_dtype
+        )
+
+    def _batch_output_path(self, folder: Path, source: Path, view_name: str, stamp: str, taken: set[str]) -> str:
+        """`<source name>_<view name>_<YYYYmmdd_HHMMSS>.parquet` in `folder`; when that exists (or another
+        file of the batch / the queue has it) `_2`, `_3`... -- a batch never overwrites (57.8.2)."""
+        base = f"{self._safe_name(source.stem)}_{self._safe_name(view_name)}_{stamp}"
+        n = 1
+        while True:
+            candidate = folder / (f"{base}.parquet" if n == 1 else f"{base}_{n}.parquet")
+            key = os.path.normcase(str(candidate.resolve()))
+            if key not in taken and not candidate.exists():
+                taken.add(key)
+                return str(candidate)
+            n += 1
+
+    def export_parquet_batch(
+        self,
+        folder: str,
+        view_name: str,
+        names: list[str],
+        use_saved_range: bool,
+        source_files: list[str],
+        time_column: str | None = None,
+        derived_dtype: str = "float64",
+    ) -> bool:
+        """Apply the saved view `view_name` to each of `source_files` and write one Parquet file per
+        file into `folder` (57.8.2), without opening the view. A signal a file lacks is left out of that
+        file (named in the list and in the final notice); a file with no usable signal, or that cannot
+        be read, fails alone and the rest go on. All files join the export queue (57.9). False when
+        nothing was started."""
+        parallel = self._export.parallel()
+        log_op(
+            "export_parquet_batch", view=view_name, files=[str(f) for f in source_files], folder=str(folder),
+            parallel=parallel, columns=len(names), range="saved" if use_saved_range else "all",
+            time_column=time_column, derived_dtype=derived_dtype,
+        )
+        title = tr("toolbar.export_parquet")
+        if self._view_compute_active():
+            messages.information(self, title, tr("export_parquet.busy_view_load"))
+            return False
+        out_folder = Path(folder)
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        taken = {os.path.normcase(str(Path(i.output).resolve())) for i in self._export.queue.active()}
+        items = []
+        for file in source_files:
+            ctx = self._view_export_context(view_name, file, time_column=time_column)
+            source = ctx.source_path if ctx.source_path is not None else Path(file)
+            output = self._batch_output_path(out_folder, source, view_name, stamp, taken)
+            log_op(
+                "export_parquet", path=output, from_view=view_name, source=str(source),
+                range="saved" if use_saved_range else "all", columns=len(names), overwrite=False, renamed=False,
+                batch=True, time_column=time_column, derived_dtype=derived_dtype,
             )
-            return
-        if result is None:  # cancelled inside the worker without the UI asking (not expected)
-            self._show_notice(tr("export_parquet.cancelled"), 8_000)
-            return
-        self.settings.last_export_folder = str(Path(result.path).resolve().parent)
+            if ctx.error or ctx.info is None:
+                items.append(self._export.new_item(str(source), output, None, view=view_name, error=ctx.error))
+                continue
+            usable = {i.name for i in ctx.info.items if i.usable}
+            use = [n for n in names if n in usable]
+            lost = tuple(n for n in names if n not in usable)
+            if not use:
+                items.append(
+                    self._export.new_item(
+                        str(source), output, None, view=view_name, missing=lost,
+                        error=tr("export_parquet.no_usable_signal"),
+                    )
+                )
+                continue
+            try:
+                plan = self._build_view_export_plan(ctx, use, use_saved_range, derived_dtype)
+            except pq_export.ExportError as e:
+                items.append(
+                    self._export.new_item(
+                        str(source), output, None, view=view_name, missing=lost, error=self._plan_error_text(e)
+                    )
+                )
+                continue
+            items.append(self._export.new_item(str(source), output, plan, view=view_name, missing=lost))
+        if not self._export.confirm_resources(items):
+            return False
+        self.settings.last_export_folder = str(out_folder.resolve())
         save_settings(self.settings)
-        seconds = f"{result.elapsed:.1f}"
-        if result.full_computed:
-            text = tr(
-                "export_parquet.saved_full", path=result.path, rows=f"{result.rows:,}", seconds=seconds,
-                names=", ".join(result.full_computed),
-            )
-        else:
-            text = tr("export_parquet.saved", path=result.path, rows=f"{result.rows:,}", seconds=seconds)
-        self._show_notice(text, 20_000)
-
-    def _on_parquet_export_failed(self, job: _ParquetExportJob, error: str) -> None:
-        if job is not self._parquet_export:
-            return
-        self._end_parquet_export(job)
-        messages.warning(self, tr("toolbar.export_parquet"), tr("export_parquet.failed", error=error))
-
-    def _on_parquet_export_cancel_clicked(self) -> None:
-        """The status-bar cancel button (57.3)."""
-        log_op("export_parquet_cancel")
-        self._cancel_parquet_export(tr("export_parquet.cancelled"))
-
-    def _cancel_parquet_export(self, notice: str | None) -> None:
-        """Stop the running export (if any): the worker stops at the next chunk boundary and removes
-        its `.part`; its late result is ignored. `notice`: what the status bar says (None: nothing).
-        Only the cancel button and closing the window stop an export: opening another file or view
-        does not (it runs on its start-time snapshot, 57.3)."""
-        job = self._parquet_export
-        if job is None:
-            return
-        job.cancel_event.set()
-        self._parquet_export_hub.cancel(job.token)  # whatever arrives later is ignored
-        self._parquet_export_cancelled.append(job)
-        self._end_parquet_export(job)
-        if oplog.is_active():
-            oplog.record_job("parquet_export", "cancel", target=job.path)
-        if notice:
-            self._show_notice(notice, 8_000)
+        self._export.submit(items)
+        return True
 
     def _image_stamp(
         self, now: datetime, range_override: tuple[float, float] | None = None
@@ -2994,17 +3119,24 @@ class MainWindow(QMainWindow):
             log_retention_days=settings.log_retention_days,
             language=settings.language,
             eager_load_limit_mb=settings.eager_load_limit_mb,
+            show_sampling_rate=settings.show_sampling_rate,
             scroll_bindings=settings.scroll_bindings,
             shortcuts=settings.shortcuts,
         )
         self.settings = settings
+        export_resources.set_disk_margin_mb(settings.export_disk_margin_mb)
         self.plot_grid.set_auto_redraw(settings.auto_redraw)
         self.plot_grid.set_downsample_pixel_ratio(settings.downsample_pixel_ratio)
         self.plot_grid.set_scroll_bindings(settings.scroll_bindings)
+        for window in self._analysis_windows:  # histogram plots follow the same wheel bindings (analysis 42.16)
+            hook = getattr(window, "set_scroll_bindings", None)
+            if hook is not None:
+                hook(settings.scroll_bindings)
         hover_action = self._actions.get("hover_values")
         if hover_action is not None:
             hover_action.setChecked(settings.hover_values_enabled)
         self.plot_grid.set_hover_enabled(settings.hover_values_enabled)
+        self._update_sampling_label()  # 60.2: applies at once, no restart
         for key, action in self._actions.items():
             seq = settings.shortcuts.get(key, "")
             action.setShortcuts(self._shortcut_sequences(key, seq))
@@ -3064,8 +3196,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
         self._abort_view_compute(resync=False)
-        self._cancel_parquet_export(None)  # no notice: the window is going away
-        self._parquet_export_pool.waitForDone(5000)  # the worker stops at its next chunk boundary (57.3)
+        self._export.shutdown()  # cancels every export file; no notice: the window is going away (57.9.8)
         self._close_analysis_windows()  # cancels their in-flight jobs (children are not closeEvent'ed)
         oplog.flush_pending()  # the last operation's result must not be lost on exit
         self._save_layout()

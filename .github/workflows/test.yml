@@ -1,10 +1,9 @@
 name: Test
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:  # run on any pushed branch: gh workflow run test.yml --ref <branch> (app 51.1)
+  # Manual only (user-set 2026-10-16): the suite runs locally before merging.
+  # Run on any pushed branch: gh workflow run test.yml --ref <branch> (app 51.1)
+  workflow_dispatch:
 
 jobs:
   pytest:

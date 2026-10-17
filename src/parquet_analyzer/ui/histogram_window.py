@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QTime, QTimer
+from PySide6.QtCore import Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -58,12 +58,14 @@ from ..core.histogram import (
     validate_two_stage,
 )
 from ..core.oplog import log_op
+from ..io.settings import normalize_scroll_bindings
 from . import messages
 from .analysis_window import CANCELLED, AnalysisWindow
 from .flow_layout import FlowLayout
 from .i18n import tr
-from .image_export import _FIG_DPI, _font_context, _local_offset_s, _to_local_datetime64
+from .image_export import _FIG_DPI, _font_context, _to_local_datetime64
 from .plot_widget import _COLOR_CYCLE
+from .scroll_zoom import apply_wheel, wheel_action
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,38 @@ def _fmt(v: float) -> str:
     return "-" if not math.isfinite(v) else f"{v:.6g}"
 
 
+class _HistPlotWidget(pg.PlotWidget):
+    """A histogram-window plot with the normal plots' mouse operation (analysis 42.16): the wheel
+    follows `Settings.scroll_bindings` through `scroll_zoom.apply_wheel`; H / double-click ask the
+    window to restore the plot's first view (`reset_requested`). Drag stays pyqtgraph's default."""
+
+    reset_requested = Signal()
+    wheel_started = Signal(str)  # the action about to be applied (before the view changes)
+
+    def __init__(self, *args, scroll_bindings: dict[str, str] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scroll_bindings = normalize_scroll_bindings(scroll_bindings)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)  # so H reaches the plot after a click
+
+    def set_scroll_bindings(self, bindings: dict[str, str]) -> None:
+        self.scroll_bindings = normalize_scroll_bindings(bindings)
+
+    def wheelEvent(self, ev):  # noqa: N802 (Qt override)
+        self.wheel_started.emit(wheel_action(ev.modifiers(), self.scroll_bindings))
+        apply_wheel(self, ev, self.scroll_bindings)
+
+    def keyPressEvent(self, ev):  # noqa: N802 (Qt override)
+        if ev.key() == Qt.Key.Key_H and not ev.modifiers():
+            self.reset_requested.emit()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):  # noqa: N802 (Qt override)
+        super().mouseDoubleClickEvent(ev)
+        self.reset_requested.emit()
+
+
 class HistogramWindow(AnalysisWindow):
     """The histogram window (42.1-42.5)."""
 
@@ -143,6 +177,8 @@ class HistogramWindow(AnalysisWindow):
         self._result: HistogramResult | None = None
         self._refresh_pending = False
         self._lines_visible: list[pg.InfiniteLine] = []
+        self._homes: dict[str, tuple] = {}  # first view of each plot: view -> (x range, y range | None) (42.16)
+        self._trend_y_manual = False  # Y set by the wheel: the automatic fit is off until H (42.16)
         super().__init__(main, tr("hist.title"))
         self._export_dir: str | None = None  # last folder used by "save bucket values" (this window only, 42.8)
         self._build_export_action()
@@ -636,7 +672,8 @@ class HistogramWindow(AnalysisWindow):
         box = QWidget()
         lay = QVBoxLayout(box)
         lay.setContentsMargins(0, 0, 0, 0)
-        self._plot_widget = pg.PlotWidget()
+        bindings = getattr(getattr(self._main, "settings", None), "scroll_bindings", None)
+        self._plot_widget = _HistPlotWidget(scroll_bindings=bindings)
         self._plot_widget.setObjectName("histogram_plot")
         self._plot = self._plot_widget.getPlotItem()
         self._plot.showGrid(x=True, y=True, alpha=0.3)
@@ -645,7 +682,7 @@ class HistogramWindow(AnalysisWindow):
         # The trend (42.12) has its own plot: a time axis like the main plots' (local time, or plain
         # numbers for a numeric time axis), zoom / pan along X only.
         axis_items = {"bottom": pg.DateAxisItem()} if self._time_is_datetime() else None
-        self._trend_widget = pg.PlotWidget(axisItems=axis_items)
+        self._trend_widget = _HistPlotWidget(axisItems=axis_items, scroll_bindings=bindings)
         self._trend_widget.setObjectName("histogram_trend_plot")
         self._trend_plot = self._trend_widget.getPlotItem()
         self._trend_plot.showGrid(x=True, y=True, alpha=0.3)
@@ -656,17 +693,21 @@ class HistogramWindow(AnalysisWindow):
         self._trend_vb.disableAutoRange()
         self._trend_vb.sigXRangeChanged.connect(self._trend_fit_y)
         self._trend_series: list[tuple[np.ndarray, np.ndarray]] = []  # drawn (x0, value) arrays per variable
-        # The time-of-day view (42.13) also has its own plot: a clock axis, no mouse zoom.
+        # The time-of-day view (42.13) also has its own plot: a clock axis, limited to 0-24 h (42.16).
         self._clock_axis = _ClockAxis("bottom")
-        self._tod_widget = pg.PlotWidget(axisItems={"bottom": self._clock_axis})
+        self._tod_widget = _HistPlotWidget(axisItems={"bottom": self._clock_axis}, scroll_bindings=bindings)
         self._tod_widget.setObjectName("histogram_tod_plot")
         self._tod_plot = self._tod_widget.getPlotItem()
         self._tod_plot.showGrid(x=True, y=True, alpha=0.3)
         self._tod_plot.setMenuEnabled(False)
         self._tod_legend = self._tod_plot.addLegend()
         self._tod_vb = self._tod_plot.getViewBox()
-        self._tod_vb.setMouseEnabled(x=False, y=False)
+        self._tod_vb.setMouseEnabled(x=True, y=False)
         self._tod_vb.disableAutoRange()
+        self._plot_widget.reset_requested.connect(lambda: self.reset_view("dist"))
+        self._trend_widget.reset_requested.connect(lambda: self.reset_view("trend"))
+        self._tod_widget.reset_requested.connect(lambda: self.reset_view("timeofday"))
+        self._trend_widget.wheel_started.connect(self._on_trend_wheel)
         self._stack = QStackedWidget()
         self._stack.addWidget(self._plot_widget)
         self._stack.addWidget(self._trend_widget)
@@ -677,6 +718,30 @@ class HistogramWindow(AnalysisWindow):
         self._hover_label.setObjectName("histogram_hover")
         lay.addWidget(self._hover_label)
         return box
+
+    def set_scroll_bindings(self, bindings: dict[str, str]) -> None:
+        """The settings changed the wheel bindings: follow them in the open window (42.16)."""
+        for w in (self._plot_widget, self._trend_widget, self._tod_widget):
+            w.set_scroll_bindings(bindings)
+
+    def _on_trend_wheel(self, action: str) -> None:
+        if action == "y_zoom":  # Y is now set by hand: stop the automatic fit until H (42.16)
+            self._trend_y_manual = True
+
+    def reset_view(self, view: str) -> None:
+        """H / double-click: back to the plot's first view (the whole drawing, 42.4 / 42.12 / 42.13)."""
+        log_op("histogram_view_reset", view=view)
+        home = self._homes.get(view)
+        if home is None:
+            return
+        xr, yr = home
+        if view == "trend":
+            self._trend_y_manual = False
+            self._trend_vb.setXRange(*xr, padding=0)
+            self._trend_fit_y()
+            return
+        plot = self._tod_plot if view == "timeofday" else self._plot
+        plot.setRange(xRange=xr, yRange=yr, padding=0)
 
     # -- compute -------------------------------------------------------------------
 
@@ -950,7 +1015,9 @@ class HistogramWindow(AnalysisWindow):
         top = max((float(h.max()) for h in heights if len(h)), default=0.0)
         top = top if top > 0 and math.isfinite(top) else 1.0
         span = (edges[-1] - edges[0]) or 1.0
-        self._plot.setRange(xRange=(edges[0] - 0.02 * span, edges[-1] + 0.02 * span), yRange=(0, top * 1.08), padding=0)
+        xr, yr = (edges[0] - 0.02 * span, edges[-1] + 0.02 * span), (0, top * 1.08)
+        self._homes["dist"] = (xr, yr)
+        self._plot.setRange(xRange=xr, yRange=yr, padding=0)
         self._hover_label.setText(tr("hist.hover_hint"))
 
     def mean_median_lines(self) -> list[pg.InfiniteLine]:
@@ -1133,7 +1200,10 @@ class HistogramWindow(AnalysisWindow):
                 self._trend_plot.addItem(mean_line)
         if len(starts):
             span = float(ends[-1] - starts[0]) or 1.0
-            self._trend_vb.setXRange(float(starts[0]) - 0.02 * span, float(ends[-1]) + 0.02 * span, padding=0)
+            xr = (float(starts[0]) - 0.02 * span, float(ends[-1]) + 0.02 * span)
+            self._homes["trend"] = (xr, None)
+            self._trend_y_manual = False  # a new drawing starts with the automatic fit
+            self._trend_vb.setXRange(*xr, padding=0)
             self._trend_fit_y()
         self._hover_label.setText(tr("hist.hover_hint"))
 
@@ -1154,7 +1224,7 @@ class HistogramWindow(AnalysisWindow):
 
     def _trend_fit_y(self, *_a) -> None:
         """Y follows the values visible in the current X range (42.12); 0 stays in view."""
-        if not self._trend_series or self._closed:
+        if not self._trend_series or self._closed or self._trend_y_manual:
             return
         x_lo, x_hi = self._trend_vb.viewRange()[0]
         lo, hi = 0.0, 0.0
@@ -1259,7 +1329,11 @@ class HistogramWindow(AnalysisWindow):
             if len(fin):
                 lo, hi = min(lo, float(fin.min())), max(hi, float(fin.max()))
         pad = 0.06 * ((hi - lo) or abs(hi) or 1.0)
-        self._tod_plot.setRange(xRange=(0.0, float(edges[-1])), yRange=(lo - (pad if lo < 0 else 0.0), hi + pad), padding=0.01)
+        # Never outside 0-24 h (42.16): the slot edges end at the end of the clock day.
+        xr, yr = (0.0, float(edges[-1])), (lo - (pad if lo < 0 else 0.0), hi + pad)
+        self._tod_vb.setLimits(xMin=xr[0], xMax=xr[1])
+        self._homes["timeofday"] = (xr, yr)
+        self._tod_plot.setRange(xRange=xr, yRange=yr, padding=0)
         self._hover_label.setText(tr("hist.hover_hint"))
 
     @staticmethod
@@ -1507,7 +1581,7 @@ def _plot_trend_axes(win: HistogramWindow, r: HistogramResult, ax) -> None:
     ends = np.asarray(r.bucket_end, dtype=np.float64)
     dated = win._time_is_datetime()
     if dated and len(starts):
-        offset = _local_offset_s(float(starts[0]))
+        offset = hexport.local_offset_s(float(starts[0]))
         sd = mdates.date2num(_to_local_datetime64(starts, offset))
         ed = mdates.date2num(_to_local_datetime64(ends, offset))
     else:

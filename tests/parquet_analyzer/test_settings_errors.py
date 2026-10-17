@@ -466,3 +466,11 @@ def test_closing_with_a_failing_save_shows_no_dialog(qapp, isolated_config, monk
     config.PARQUET_ANALYZER_CFG_DIR.write_text("a file")
     w.close()
     assert warnings == []
+
+
+@pytest.mark.parametrize("value,expect", [(1, 1), (4, 4), (0, 2), (5, 2), ("3", 2), (True, 2), (None, 2)])
+def test_export_parallel_files_is_kept_only_in_range(isolated_config, value, expect):
+    """export 57.9.2: 1-4, default 2; anything else falls back to the default."""
+    assert Settings().export_parallel_files == 2
+    _write(json.dumps({"export_parallel_files": value}))
+    assert load_settings().export_parallel_files == expect

@@ -58,6 +58,18 @@ def _rep(values):
     return check_time_order(np.array(values, dtype=float))
 
 
+def _order_fields(report):
+    """The ordering fields only: dt_median is a median of per-chunk medians (data 60.1), so it depends
+    on the chunking by design (and nan != nan)."""
+    return (
+        report.nan_count,
+        report.decreasing_count,
+        report.first_decreasing_index,
+        report.duplicate_count,
+        report.first_duplicate_index,
+    )
+
+
 def _one_shot(values):
     s = TimeOrderScanner()
     s.feed(np.asarray(values, dtype=float), 0)
@@ -118,7 +130,7 @@ def test_chunked_equals_one_shot(values, chunk):
     s = TimeOrderScanner()
     for start in range(0, v.size, chunk):
         s.feed(v[start : start + chunk], start)
-    assert s.report() == _one_shot(v)
+    assert _order_fields(s.report()) == _order_fields(_one_shot(v))
     fin = v[np.isfinite(v)]
     assert s.report().duplicate_count == int(np.count_nonzero(np.diff(fin) == 0))
 

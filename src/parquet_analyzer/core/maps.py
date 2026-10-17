@@ -42,17 +42,62 @@ def natural_spline_second_derivatives(x: np.ndarray, y: np.ndarray) -> np.ndarra
 # ---------------------------------------------------------------- index helpers
 
 
-def _cell(grid: np.ndarray, q: np.ndarray) -> np.ndarray:
-    return np.clip(np.searchsorted(grid, q, side="right") - 1, 0, len(grid) - 2)
+def _uniform_step(grid: np.ndarray) -> float | None:
+    """The step of a uniformly spaced axis (every diff within relative 1e-9 of it), else None.
+
+    Such an axis finds its cell by arithmetic instead of `searchsorted` (expressions 55.8)."""
+    n = len(grid)
+    if n < 2 or not np.isfinite(grid).all():
+        return None
+    dx = (grid[-1] - grid[0]) / (n - 1)
+    if not (np.isfinite(dx) and dx > 0):
+        return None
+    if np.all(np.abs(np.diff(grid) - dx) <= 1e-9 * dx):
+        return float(dx)
+    return None
 
 
-def _prev_index(grid: np.ndarray, q: np.ndarray) -> np.ndarray:
-    return np.clip(np.searchsorted(grid, q, side="right") - 1, 0, len(grid) - 1)
+def _count_right(grid: np.ndarray, dx: float | None, q: np.ndarray) -> np.ndarray:
+    """`np.searchsorted(grid, q, side="right")`; for a uniform axis (`dx` given) computed
+    from the step and corrected by one cell, so the result is identical (NaN -> len(grid))."""
+    if dx is None:
+        return np.searchsorted(grid, q, side="right")
+    n = len(grid)
+    q = np.asarray(q, dtype=np.float64)
+    nan = np.isnan(q)
+    f = np.floor((np.clip(np.where(nan, 0.0, q), grid[0] - dx, grid[0] + n * dx) - grid[0]) / dx)
+    c = np.clip(f, -1, n - 1).astype(np.intp) + 1  # candidate count of grid points <= q
+    # too high: grid[c-1] > q; too low: grid[c] <= q
+    c = c - ((c > 0) & (grid[np.maximum(c - 1, 0)] > q))
+    c = c + ((c < n) & (grid[np.minimum(c, n - 1)] <= q))
+    return np.where(nan, n, c)
 
 
-def _nearest_index(grid: np.ndarray, q: np.ndarray) -> np.ndarray:
+def _count_left(grid: np.ndarray, dx: float | None, q: np.ndarray) -> np.ndarray:
+    """`np.searchsorted(grid, q, side="left")` by the same means (NaN -> len(grid))."""
+    if dx is None:
+        return np.searchsorted(grid, q, side="left")
+    n = len(grid)
+    q = np.asarray(q, dtype=np.float64)
+    nan = np.isnan(q)
+    f = np.ceil((np.clip(np.where(nan, 0.0, q), grid[0] - dx, grid[0] + n * dx) - grid[0]) / dx)
+    c = np.clip(f, 0, n).astype(np.intp)  # candidate count of grid points < q
+    c = c - ((c > 0) & (grid[np.maximum(c - 1, 0)] >= q))
+    c = c + ((c < n) & (grid[np.minimum(c, n - 1)] < q))
+    return np.where(nan, n, c)
+
+
+def _cell(grid: np.ndarray, q: np.ndarray, dx: float | None = None) -> np.ndarray:
+    return np.clip(_count_right(grid, dx, q) - 1, 0, len(grid) - 2)
+
+
+def _prev_index(grid: np.ndarray, q: np.ndarray, dx: float | None = None) -> np.ndarray:
+    return np.clip(_count_right(grid, dx, q) - 1, 0, len(grid) - 1)
+
+
+def _nearest_index(grid: np.ndarray, q: np.ndarray, dx: float | None = None) -> np.ndarray:
     q = np.clip(q, grid[0], grid[-1])
-    hi = np.clip(np.searchsorted(grid, q, side="left"), 1, len(grid) - 1)
+    hi = np.clip(_count_left(grid, dx, q), 1, len(grid) - 1)
     lo = hi - 1
     # a tie goes to the upper grid point
     return np.where(q - grid[lo] < grid[hi] - q, lo, hi)
@@ -65,7 +110,7 @@ def _nearest_index(grid: np.ndarray, q: np.ndarray) -> np.ndarray:
 
 def _curve_linear(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
     x, y = t.x, t.y
-    i = _cell(x, q)
+    i = _cell(x, q, t.dx)
     f = (q - x[i]) / (x[i + 1] - x[i])
     r = y[i] + f * (y[i + 1] - y[i])
     if t.has_empty:
@@ -77,11 +122,11 @@ def _curve_linear(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
 
 
 def _curve_nearest(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
-    return t.y[_nearest_index(t.x, q)]
+    return t.y[_nearest_index(t.x, q, t.dx)]
 
 
 def _curve_previous(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
-    return t.y[_prev_index(t.x, q)]
+    return t.y[_prev_index(t.x, q, t.dx)]
 
 
 def _curve_spline(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
@@ -90,7 +135,7 @@ def _curve_spline(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
         return _curve_linear(t, q, extend)
     m = t._spline_m()
     qc = np.clip(q, x[0], x[-1])
-    i = _cell(x, qc)
+    i = _cell(x, qc, t.dx)
     h = x[i + 1] - x[i]
     a = (x[i + 1] - qc) / h
     b = (qc - x[i]) / h
@@ -109,7 +154,7 @@ def _curve_spline(t: LookupTable, q: np.ndarray, extend: bool) -> np.ndarray:
 
 def _map_linear(t: LookupTable, qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
     x, y, z = t.x, t.y, t.z
-    ix, iy = _cell(x, qx), _cell(y, qy)
+    ix, iy = _cell(x, qx, t.dx), _cell(y, qy, t.dy)
     fx = (qx - x[ix]) / (x[ix + 1] - x[ix])
     fy = (qy - y[iy]) / (y[iy + 1] - y[iy])
     if not t.has_empty:
@@ -133,11 +178,11 @@ def _map_linear(t: LookupTable, qx: np.ndarray, qy: np.ndarray, extend: bool) ->
 
 
 def _map_nearest(t: LookupTable, qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
-    return t.z[_nearest_index(t.y, qy), _nearest_index(t.x, qx)]
+    return t.z[_nearest_index(t.y, qy, t.dy), _nearest_index(t.x, qx, t.dx)]
 
 
 def _map_previous(t: LookupTable, qx: np.ndarray, qy: np.ndarray, extend: bool) -> np.ndarray:
-    return t.z[_prev_index(t.y, qy), _prev_index(t.x, qx)]
+    return t.z[_prev_index(t.y, qy, t.dy), _prev_index(t.x, qx, t.dx)]
 
 
 @dataclass(frozen=True)
@@ -224,6 +269,9 @@ class LookupTable:
         if self.extrapolation not in EXTRAPOLATIONS:
             raise ValueError(f"unknown extrapolation: {self.extrapolation}")
         self._m: np.ndarray | None = None
+        # steps of uniformly spaced axes (None: searchsorted); the curve's y is values, not an axis
+        self.dx = _uniform_step(self.x)
+        self.dy = _uniform_step(self.y) if self.kind == "map" else None
 
     @property
     def values(self) -> np.ndarray:

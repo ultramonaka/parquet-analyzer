@@ -260,8 +260,9 @@ makes a general mechanism so new features can be "committed off until finished a
   | `user_functions` | `True` (on 2026-10-03 after review + real-machine check) | ch. 26 |
   | `maps` | `True` (on 2026-10-03 after review + real-machine check) | ch. 27 |
   | `parquet_export` | `True` (on 2026-10-16, after review and real-machine check) | export 57 |
+  | `map_exclude_points` | `False` (2026-10-13, hidden because it was confusing in the real-machine check; user's decision) | analysis 44.13 |
   | `big_a_thin_first_draw`, `big_c_windowed_derived`, `big_d_time_index` | `True` (adopted 2026-10-04, data 36.8; the flags themselves are removed if everyday use shows no problems) | data ch. 36 A, C, D |
-  Each is set to `True` once its chapter is implemented and reviewed (the main session makes that
+  Each is set to `True` once its chapter is implemented and reviewed (the developer makes that
   change).
 - Can be overridden temporarily with the environment variable `PARQUET_ANALYZER_FEATURES`:
   comma-separated `name=value` (e.g. `fft=on,xy_plot=on`). Values are
@@ -511,9 +512,9 @@ Requirements: 5.36. This chapter only adds tests; the app's behavior does not ch
   (they are checked by the tests of their own chapters).
 - Entry points of features whose feature flag is OFF (such as `fft`) are skipped by leaving them out of the table
   (not by `pytest.skip`). They enter the table when the flag is turned ON.
-- **When the table and the actual behavior disagree**: the implementer does not loosen the test to match the table, nor
-  change app code to match it. The implementer reports the operation, item and before/after values that disagree; the
-  main session decides whether it is a bug or a table error. Items judged to be bugs are marked
+- **When the table and the actual behavior disagree**: the test is not loosened to match the table, nor is
+  app code changed to match it. The report lists the operation, item and before/after values that disagree; the
+  developer decides whether it is a bug or a table error. Items judged to be bugs are marked
   `pytest.mark.xfail`, so that the fix is noticed automatically later
   (example: saving or reloading a map returned the navigator range to the whole range; found during
   implementation, fixed by item 14's change (plots 24.1), so the xfail was removed).
@@ -663,6 +664,46 @@ The oracle is built **without going through the class under test**: the column r
 |---|---|---|
 | `ParquetDataSource.read_window`, `WindowedColumn.window` | A **sequence** of arbitrary `(lo, hi)` (including repeated identical ranges, adjacent ranges, ranges crossing block boundaries, `lo == hi`, `hi > row count`, `lo < 0`), read in order, each exactly equal to the full `[lo:hi]` (NaN positions included). `read_window` reading several columns at once too | `ParquetDataSource(path, block_rows=small, cache_blocks=small)` (e.g. 1000 rows, 2–4 blocks; both cache hits and evictions occur). Row count 0.5–20 times the block size; row-group sizes arbitrary. Columns `float64`, integer, with NaN. Since files are written, `max_examples` 30, with many ranges in each example |
 | `DerivedColumn.window` (data 36.6 C) | `window(lo, hi)` of a column built by `make_derived_column` equals `[lo:hi]` of the full computation (`assert_allclose`, `rtol=1e-12`, `equal_nan=True`; for functions with a margin, the edge rows too) | Expressions: element-wise (`a*2+b`), `delta(a)`, `rolling_mean(a, n)`, `rolling_nanmean(a, n)`, their nestings (`delta(rolling_mean(a, 5))`), and ones taking another `DerivedColumn` as input. Inputs are `WindowedColumn` (same small blocks as above). `n` from 1 to beyond the row count. An expression for which `make_derived_column` returns `None` (margin unknown) is out of scope; confirm this in one example. `max_examples` 50 |
+| `TimeIndex.window`, `value_at` | `window(lo, hi)` equals the full `[lo:hi]` and `value_at(r)` equals the full `[r]` (outside the range and `lo == hi` too) | Build the time axis in the same way as `TimeIndex.searchsorted` in 46.2 (ascending, runs of duplicates, anchor boundaries). `max_examples` 30 |
+
+- If 28 (`trailing_*`) has already entered `main`, also put `trailing_mean(a, n)` in the `DerivedColumn` expressions (if not, do not; add it on the
+  side of 28).
+
+**(2) Watching tests** (`tests/parquet_analyzer/test_no_full_read.py`)
+
+For columns that become windowed reads, confirm that **no full read** happens during ordinary operations.
+
+- Preparation: `isolated_config`, `win.settings.eager_load_limit_mb = 0` (the same as the existing `test_windowed_loading.py`; first confirm that all columns are
+  `WindowedColumn` and the time axis is a `TimeIndex`). The data is a small-column Parquet of several hundred thousand rows (spanning several blocks of 100,000
+  rows), written to `tmp_path`.
+- How to count: with monkeypatch, count `WindowedColumn.values`, `DerivedColumn.values`, promotion to `MaterializedColumn` (if any), and the reads of
+  `ParquetDataSource.read_window` **over half the row count** (record the call-site stack one line at a time so that a failure reports where it was called from).
+  The counter takes a lock so that it can count calls from background threads too.
+- Operations to watch (for each, wait in real time until background work settles, then look at the count; one test per operation via parametrize, ID = operation name):
+  1. Open the file and draw 2 columns in 2 plots (including the first draw, the navigator overview and building the pyramid)
+  2. Zoom (plot X range to 1% of the whole) and pan
+  3. Dragging the navigator frame (send drag events to `windowHandle()`, or the same frame-moving route as the existing tests)
+  4. Hover (mouse move over the viewport -> the one-row read after the 100 ms stop; plots ch. 39)
+  5. Place and move a cursor
+  6. Switch the time axis (to another ascending column, and back)
+  7. Add and draw derived variables that become windowed reads (`delta(a)`, `rolling_mean(a, 50)`) (confirm they become `DerivedColumn`. The **chunked** scan for the range's
+     `bounds()` is not counted as a full read = only `values()` and `read_window` over half are counted)
+- Out of scope (places that read everything at this point; the reason is recorded here): evaluation of expressions that do not become `DerivedColumn` (margin unknown, some
+  user functions), the histogram, XY, FFT, and image/data export. Reducing these is (C). Whole-column statistics became per-window aggregation in stage 1 of
+  29 (data ch. 53), so they are included (operation 8).
+- If a watching test finds a full read, report which operation and where it was called from, and the developer decides (the beginning of ch. 46).
+
+**Differences from the spec found during implementation (2026-10-08)**:
+- The watching test runs with `plot_widget._PYRAMID_PREFERRED_ROW_THRESHOLD` (5 million rows) **monkeypatched** to 50,000 rows. The app reads the range directly in one go
+  for drawing when "the visible range is at most 5 million rows" (data 36.6), so with a 300,000-row file the state where everything is visible legitimately reads all rows,
+  unlike a real large file. The threshold was lowered to reproduce the region of a large file.
+- The "chunked scans are not counted" of operation 7 is realized by excluding calls whose `read_window` call stack contains `build_pyramid_from_windows`,
+  `DerivedColumn.scan` or `bounds` (with 300,000 rows one chunk is the whole, so it cannot be told apart by the size of the range).
+- Even if one operation (`values()` and `read_window`) is counted twice, only whether the count is 0 is looked at, so it does not matter.
+
+**Test plan**: each row of the tables above and each operation is at least one test. The increase in total test time is within 10 seconds (`-n auto`). To confirm that the
+watching test is "really counting", one of them is an **operation that deliberately calls `values()`** (`WindowedColumn.values()`; until 2026-10-13 this was whole-column
+statistics, data ch. 53) and also confirms that the count becomes 1 or more (this prevents the counting from breaking and always giving 0).
 
 #### 46.7 A4: view backward compatibility
 
@@ -696,12 +737,12 @@ Purpose: confirm that view JSON saved by past versions can be read by the curren
   and `load_view`. Confirm: no exception, no `ViewFormatError`; the number of plots, the series names of each plot, the names and expressions of derived
   variables, the time-axis column (if any) and the shown/hidden state are as saved. Warnings (count them by monkeypatching `ui/messages`) must be **only the
   expected ones** (the expectations per version are written as a table in the test; e.g. items for features removed in the current version). The expectations
-  are decided by first reading with the current code and having the main session judge whether the result matches the spec (persistence chapter); the implementer reports the actual results.
+  are decided by first reading with the current code and having the developer judge whether the result matches the spec (persistence chapter); the report lists the actual results.
 - The "missing" marks in the view manager (`view_manager.py`) match exactly what `load_view` actually skipped (an invariant).
 - After loading, save again with the current version and read again: the same state results (round trip).
 - In future, when the view format changes, run the same script on `main` before the change and add the JSON (noted at the top of the script).
 
-**Test plan**: all 3 versions × several files pass; any that do not are reported (whether to mark them xfail(strict) is decided by the main session).
+**Test plan**: all 3 versions × several files pass; any that do not are reported (whether to mark them xfail(strict) is decided by the developer).
 
 ### 48. Toolbar cleanup (added 2026-10-13, user request)
 
@@ -844,7 +885,7 @@ Requirements: 5.45.
   - F841 (unused variable): remove in tests. The `consts` in `src/parquet_analyzer/core/functions.py` must be **checked for intent before removing it**
     (if it is an unused leftover it is a bug; stop, do not remove it, and report).
   - UP031 (`%` formatting): change to f-string. However, lazy `logging` formatting (`log.debug("%s", x)`) should be out of scope; if it appears, report it.
-- Findings that could change behavior (beyond the above, or those needing unsafe fixes) are not fixed; they are listed in the report and the main session decides each one.
+- Findings that could change behavior (beyond the above, or those needing unsafe fixes) are not fixed; they are listed in the report and the developer decides each one.
 
 - **Implementation result (2026-10-13, `feat/52-ruff`)**: counted with the settings in `pyproject.toml` (the `src` setting changes how packages are
   classified), I001 is 57 (76 above is the value counted without settings). 139 items fixed automatically (I001 57, UP037 33, UP035 23, F401 18, UP017 8),

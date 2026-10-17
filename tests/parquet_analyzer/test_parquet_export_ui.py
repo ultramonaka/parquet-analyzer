@@ -110,8 +110,9 @@ class Dialogs:
             dlg.accept()
             return QDialog.DialogCode.Accepted
 
-        def get_save(parent, caption, directory, filter_):
+        def get_save(parent, caption, directory, filter_, **kw):
             self.file_args = (caption, directory, filter_)
+            self.file_kw = kw
             return self.file_answer, ""
 
         monkeypatch.setattr(ParquetExportDialog, "exec", exec_)
@@ -389,7 +390,8 @@ def test_progress_text_and_bar_values(win):
     assert progress.isHidden()
 
 
-def test_cancel_button_stops_the_export_and_leaves_no_file(win, dialogs, tmp_path, monkeypatch, slow, log):
+def test_cancel_button_stops_the_export_and_leaves_no_file(win, dialogs, tmp_path, monkeypatch, slow, log, choice):
+    choice.answer = "overwrite"
     monkeypatch.setattr(MainWindow, "_PARQUET_EXPORT_CHUNK_ROWS", 5000)
     plot_signals(win)
     out = tmp_path / "out.parquet"
@@ -400,7 +402,7 @@ def test_cancel_button_stops_the_export_and_leaves_no_file(win, dialogs, tmp_pat
     job = win._parquet_export
     QTest.mouseClick(win._parquet_export_progress.cancel_button, Qt.MouseButton.LeftButton)
     assert win._parquet_export is None and win._parquet_export_progress.isHidden()
-    assert win._notice_label.text() == tr("export_parquet.cancelled")
+    assert win._notice_label.text() == tr("export_parquet.cancel_requested")  # a request: it may still finish
     slow.release.set()
     assert wait_until(job.worker_done.is_set)
     assert out.read_bytes() == b"previous"  # the existing file survives
@@ -411,16 +413,23 @@ def test_cancel_button_stops_the_export_and_leaves_no_file(win, dialogs, tmp_pat
     assert op_records("export_parquet")[0]["details"]["columns"] == 3
 
 
-def test_second_export_is_refused_while_one_runs(win, dialogs, slow, boxes):
+def test_a_second_export_joins_the_queue_instead_of_being_refused(win, dialogs, slow, boxes, tmp_path):
+    """57.9.2 no. 4: an export started while one runs is appended and starts when a slot is free."""
+    win.settings.export_parallel_files = 1
     plot_signals(win)
     slow.block = True
     win._actions["export_parquet"].trigger()
     slow.wait_entered()
-    win._actions["export_parquet"].trigger()
-    assert boxes.info == [tr("export_parquet.busy")]
-    assert win.export_parquet("/nonexistent/x.parquet", ["a"], (0, 10)) is False
+    two = tmp_path / "two.parquet"
+    assert win.export_parquet(str(two), ["a"], (0, 10)) is True
+    assert boxes.info == []  # no "already running" refusal
+    items = win._export.queue.items
+    assert [i.state.value for i in items] == ["running", "waiting"]
+    assert not two.exists()
     slow.release.set()
-    finish(win)
+    assert wait_until(lambda: win._export.queue.is_idle())
+    assert two.exists() and (tmp_path / "out.parquet").exists()
+    assert pq.read_table(two).num_rows == 10
 
 
 def test_opening_another_file_does_not_stop_the_export(win, dialogs, tmp_path, slow, sample_parquet_path):
@@ -566,3 +575,272 @@ def test_progress_widget_class_is_the_status_bar_widget(win):
     assert isinstance(win._parquet_export_progress, dialog_module.ParquetExportProgress)
     assert win._parquet_export_progress.objectName() == "parquet_export_progress"
     assert win.statusBar().findChild(dialog_module.ParquetExportProgress) is win._parquet_export_progress
+
+
+# -- overwrite protection (export 57.8.1) ------------------------------------------------------------
+
+
+@pytest.fixture
+def choice(monkeypatch):
+    """Replaces the three-way "file exists" box; `answer` is "timestamp" / "overwrite" / None."""
+    from parquet_analyzer.ui import messages
+
+    class Choice:
+        answer = None
+
+    c = Choice()
+    c.asked = []
+
+    def fake(parent, title, text, timestamp_text, overwrite_text, cancel_text):
+        c.asked.append(text)
+        return c.answer
+
+    monkeypatch.setattr(messages, "choose_export_overwrite", fake)
+    return c
+
+
+def test_file_dialog_does_not_confirm_overwrite_itself(win, dialogs, tmp_path):
+    plot_signals(win)
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert dialogs.file_kw["options"] & QFileDialog.Option.DontConfirmOverwrite
+
+
+def test_existing_file_asks_and_cancel_does_nothing(win, dialogs, choice, tmp_path):
+    plot_signals(win)
+    out = tmp_path / "out.parquet"
+    out.write_bytes(b"precious")
+    choice.answer = None
+    win._actions["export_parquet"].trigger()
+    assert len(choice.asked) == 1 and "out.parquet" in choice.asked[0]
+    assert win._parquet_export is None
+    assert out.read_bytes() == b"precious"
+    assert not list(tmp_path.glob("out_*.parquet")) and not list(tmp_path.glob("*.part"))
+
+
+def test_name_without_extension_whose_completed_name_exists_asks(win, dialogs, choice, tmp_path):
+    """The data-loss path: the suffix is added after the file dialog, so only our question can notice."""
+    plot_signals(win)
+    out = tmp_path / "noext.parquet"
+    out.write_bytes(b"precious")
+    dialogs.file_answer = str(tmp_path / "noext")
+    win._actions["export_parquet"].trigger()
+    assert len(choice.asked) == 1 and "noext.parquet" in choice.asked[0]
+    assert out.read_bytes() == b"precious"
+
+
+def test_save_with_timestamp_makes_a_new_file(win, dialogs, choice, tmp_path, log):
+    plot_signals(win)
+    out = tmp_path / "out.parquet"
+    out.write_bytes(b"precious")
+    choice.answer = "timestamp"
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert out.read_bytes() == b"precious"
+    new = list(tmp_path.glob("out_*.parquet"))
+    assert len(new) == 1 and pq.read_table(new[0]).num_rows == len(win._time_values)
+    rec = op_records("export_parquet")[-1]["details"]
+    assert rec["overwrite"] is False and rec["renamed"] is True
+
+
+def test_timestamp_name_collision_gets_a_counter(win, dialogs, choice, tmp_path, monkeypatch):
+    from parquet_analyzer.ui import main_window as mw
+
+    class FixedDatetime(mw.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 1, 2, 3, 4, 5)
+
+    monkeypatch.setattr(mw, "datetime", FixedDatetime)
+    plot_signals(win)
+    (tmp_path / "out.parquet").write_bytes(b"precious")
+    (tmp_path / "out_20260102_030405.parquet").write_bytes(b"other")
+    choice.answer = "timestamp"
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert (tmp_path / "out_20260102_030405.parquet").read_bytes() == b"other"
+    assert pq.read_table(tmp_path / "out_20260102_030405_2.parquet").num_rows == len(win._time_values)
+
+
+def test_overwrite_replaces_the_file(win, dialogs, choice, tmp_path, log):
+    plot_signals(win)
+    out = tmp_path / "out.parquet"
+    out.write_bytes(b"precious")
+    choice.answer = "overwrite"
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert pq.read_table(out).num_rows == len(win._time_values)
+    rec = op_records("export_parquet")[-1]["details"]
+    assert rec["overwrite"] is True and rec["renamed"] is False
+
+
+def test_no_question_for_a_new_file(win, dialogs, choice, tmp_path):
+    plot_signals(win)
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert choice.asked == []
+
+
+def test_source_file_is_refused_without_the_question(win, dialogs, choice, boxes, sample_parquet_path):
+    plot_signals(win)
+    dialogs.file_answer = str(sample_parquet_path)
+    win._actions["export_parquet"].trigger()
+    assert choice.asked == [] and boxes.warn == [tr("export_parquet.same_as_source")]
+
+
+def test_direct_call_to_an_existing_file_is_refused_by_the_core(win, boxes, tmp_path):
+    plot_signals(win)
+    out = tmp_path / "out.parquet"
+    out.write_bytes(b"precious")
+    win.export_parquet(str(out), ["a"], (0, len(win._time_values)))
+    finish(win)
+    assert out.read_bytes() == b"precious"
+    assert boxes.warn and "already exists" in boxes.warn[-1]
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_the_question_box_maps_its_buttons(qapp, monkeypatch):
+    from parquet_analyzer.ui import messages
+
+    for pick, expected in (("stamp", "timestamp"), ("over", "overwrite"), ("cancel", None), (None, None)):
+        state = {}
+
+        def fake_exec(box, pick=pick, state=state):
+            texts = {b.text(): b for b in box.buttons()}
+            state["default"] = box.defaultButton().text()
+            box._clicked = {"stamp": texts["S"], "over": texts["O"], "cancel": texts["C"], None: None}[pick]
+            return 0
+
+        monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+        monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: self._clicked)
+        assert messages.choose_export_overwrite(None, "t", "x", "S", "O", "C") == expected
+        assert state["default"] == "S"
+
+
+# -- disk / memory checks and the responsive screen (export 57.9.6a, 57.9.9) ---------------------------
+
+
+@pytest.fixture
+def start_question(monkeypatch):
+    """Replaces the "may not fit" question; `answer` is what the user presses."""
+    from parquet_analyzer.ui import messages
+
+    class Q:
+        answer = False
+        asked: list[str] = []
+
+    q = Q()
+    q.asked = []
+    monkeypatch.setattr(
+        messages, "confirm_export_start", lambda parent, title, text, start, cancel: (q.asked.append(text), q.answer)[1]
+    )
+    return q
+
+
+def short_disk(monkeypatch, free):
+    from parquet_analyzer.core import export_resources as res
+
+    monkeypatch.setattr(res, "disk_free_bytes", lambda p: free)
+    monkeypatch.setattr(res, "available_memory_bytes", lambda: 64 * res.GB)
+
+
+def test_not_enough_disk_asks_and_the_default_answer_does_not_export(
+    win, dialogs, start_question, tmp_path, monkeypatch, log
+):
+    plot_signals(win)
+    short_disk(monkeypatch, 2 * 1024**3)  # the output (upper bound) needs more than 2 GB minus the margin
+    monkeypatch.setattr(pe, "estimate_output_bytes", lambda plan: 5 * 1024**3)
+    win._actions["export_parquet"].trigger()
+    assert len(start_question.asked) == 1 and "5.0 GB" in start_question.asked[0]
+    assert win._parquet_export is None and not (tmp_path / "out.parquet").exists()
+    assert op_records("export_parquet_preflight")
+
+
+def test_not_enough_disk_can_be_started_anyway(win, dialogs, start_question, tmp_path, monkeypatch):
+    plot_signals(win)
+    from parquet_analyzer.core import export_resources as res
+
+    monkeypatch.setattr(pe, "estimate_output_bytes", lambda plan: 5 * 1024**3)
+    monkeypatch.setattr(res, "disk_free_bytes", lambda p: 3 * 1024**3)  # a question, but above the 1 GB stop
+    start_question.answer = True
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert len(start_question.asked) == 1
+    assert pq.read_table(tmp_path / "out.parquet").num_rows == len(win._time_values)
+
+
+def test_enough_room_asks_nothing(win, dialogs, start_question, tmp_path):
+    plot_signals(win)
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert start_question.asked == [] and (tmp_path / "out.parquet").exists()
+
+
+def test_not_enough_memory_asks(win, dialogs, start_question, monkeypatch):
+    from parquet_analyzer.core import export_resources as res
+
+    plot_signals(win)
+    monkeypatch.setattr(res, "available_memory_bytes", lambda: 100 * 1024**2)
+    win._actions["export_parquet"].trigger()
+    assert len(start_question.asked) == 1 and win._parquet_export is None
+
+
+def test_disk_running_out_fails_the_export_with_a_clear_message(win, dialogs, start_question, boxes, tmp_path, monkeypatch):
+    plot_signals(win)
+    from parquet_analyzer.core import export_resources as res
+
+    start_question.answer = True
+    monkeypatch.setattr(pe, "estimate_output_bytes", lambda plan: 1)  # no question; the run-time guard acts
+    monkeypatch.setattr(res, "disk_free_bytes", lambda p: res.MB)
+    monkeypatch.setattr(res, "available_memory_bytes", lambda: 64 * res.GB)
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    assert boxes.warn and tr("export_parquet.disk_full") in boxes.warn[-1]
+    assert list(tmp_path.glob("out*")) == []
+
+
+def test_the_screen_keeps_running_while_exporting(win, dialogs, tmp_path, monkeypatch, slow):
+    """A 10 ms timer on the UI thread keeps firing during an export that takes well over a second
+    (57.9.9). Run on the UI thread, that same work would block the timer for the whole second, far
+    beyond the 250 ms limit: the work is slowed on purpose and the thread it runs on is recorded."""
+    from PySide6.QtCore import QTimer
+
+    plot_signals(win)
+    monkeypatch.setattr(MainWindow, "_PARQUET_EXPORT_CHUNK_ROWS", 2_000)  # 25 chunks of 2,000 rows
+    slow.delay = 0.08
+    threads: set[int] = set()
+    inner = pe.evaluate_expression
+
+    def spy(expr, variables, registry=None):
+        threads.add(threading.get_ident())
+        return inner(expr, variables, registry)
+
+    monkeypatch.setattr(pe, "evaluate_expression", spy)
+    stamps: list[float] = []
+    timer = QTimer()
+    timer.setInterval(10)
+    timer.timeout.connect(lambda: stamps.append(time.perf_counter()))
+    timer.start()
+    t0 = time.perf_counter()
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    elapsed = time.perf_counter() - t0
+    timer.stop()
+    assert elapsed > 1.0  # the work is long enough that a UI-thread run could not hide
+    assert threading.get_ident() not in threads and threads  # it ran off the UI thread
+    assert len(stamps) >= 30
+    gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]
+    assert max(gaps) < 0.25 < elapsed  # on the UI thread the gap would be the whole export
+    assert pq.read_table(tmp_path / "out.parquet").num_rows == len(win._time_values)
+
+
+def test_a_finished_export_logs_the_writer_and_the_memory_guard(win, dialogs, tmp_path, log):
+    plot_signals(win)
+    win._actions["export_parquet"].trigger()
+    finish(win)
+    oplog.flush()
+    rows = [json.loads(line) for line in oplog.log_path_for(date.today()).read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    texts = [r["text"] for r in rows if r.get("kind") == "message" and r.get("where") == "export_parquet"]
+    assert len(texts) == 1
+    assert "writer=polars" in texts[0] and "chunk_halvings=0" in texts[0] and "memory_wait=0.0s" in texts[0]

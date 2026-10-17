@@ -139,13 +139,33 @@ def test_stats_jobs_are_freed(qapp, isolated_config, sample_parquet_path, tracke
     win.close()
 
 
-def test_fft_jobs_are_freed(qapp, isolated_config, sample_parquet_path, tracked):
+@pytest.mark.parametrize("late_redraw", ["fast", "slow"])
+def test_fft_jobs_are_freed(qapp, isolated_config, sample_parquet_path, tracked, monkeypatch, late_redraw):
+    """The FFT job and every job its result starts are freed. The result adds an FFT plot whose
+    first layout moves its range, so a debounced redraw starts one more downsample job ~120 ms
+    after the FFT job itself was freed: the wait must cover it (`_is_settling`). "slow" makes
+    that late job slow, as on a loaded CI runner, where checking too early found its _Task
+    alive (a CI flake); with the late job in flight at the final check the test fails."""
     win = _open(sample_parquet_path)
     _drain(qapp, lambda: not win._is_settling())
     tracked.clear()
+    if late_redraw == "slow":
+        real_lttb, calls = plot_widget_module.lttb, []
+
+        def lttb(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 1:  # the FFT plot's first draw is quick, the debounced redraw slow
+                time.sleep(0.5)
+            return real_lttb(*args, **kwargs)
+
+        monkeypatch.setattr(plot_widget_module, "lttb", lttb)
     _select(win, "a")
     win._on_fft_requested()
-    _drain(qapp, lambda: tracked and not win._fft_workers and not _alive(tracked))
+    _drain(qapp, lambda: tracked and not win._fft_workers and not win._is_settling() and not _alive(tracked))
+    pause = time.monotonic() + 2 * plot_widget_module._REDRAW_DEBOUNCE_MS / 1000
+    while time.monotonic() < pause:  # real time past the redraw debounce: a late job shows up now
+        qapp.processEvents()
+        time.sleep(0.01)
     assert tracked and not win._fft_workers
     assert not _alive(tracked), "FFT task/function/array leaked after its result was handled"
     win.close()

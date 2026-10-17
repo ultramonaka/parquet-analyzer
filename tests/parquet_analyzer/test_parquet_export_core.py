@@ -22,6 +22,20 @@ N = 3000
 TZ = "Asia/Tokyo"
 
 
+@pytest.fixture(autouse=True, params=["polars", "pyarrow"])
+def writer(request, monkeypatch):
+    """Every test here runs with both writers (57.9.9): `export_parquet` defaults to this writer
+    ("polars" = the streaming sink when the column types survive it, else pyarrow)."""
+    real = pe.export_parquet
+
+    def run(*args, **kwargs):
+        kwargs.setdefault("writer", request.param)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pe, "export_parquet", run)
+    return request.param
+
+
 @pytest.fixture
 def src(tmp_path):
     rng = np.random.default_rng(3)
@@ -325,7 +339,8 @@ def test_full_phase_blocks_equal_whole_read(src, registry, tmp_path):
     )
 
 
-def test_progress_is_monotonic_and_ends_at_100_percent(src, registry, tmp_path):
+def test_progress_is_monotonic_and_ends_at_100_percent(src, registry, tmp_path, monkeypatch):
+    monkeypatch.setattr(pe, "PROGRESS_INTERVAL", 0.0)  # no throttling here (see test_parquet_export_speed)
     calls: list[tuple[int, int]] = []
     plan = make_plan(src, registry, ["a"], rows=(100, 1000), chunk_rows=250)
     pe.export_parquet(plan, tmp_path / "o.parquet", progress=lambda d, t: calls.append((d, t)))
@@ -356,7 +371,7 @@ def test_cancel_removes_part_and_keeps_an_existing_output(src, registry, tmp_pat
 
     plan = make_plan(src, registry, ["a", "d"], {"d": "delta(a)"}, chunk_rows=100)
     with pytest.raises(pe.ExportCancelled):
-        pe.export_parquet(plan, out, cancelled=cancelled)
+        pe.export_parquet(plan, out, cancelled=cancelled, overwrite=True)
     assert out.read_bytes() == b"previous content"
     assert not (tmp_path / "o.parquet.part").exists()
 
@@ -384,7 +399,7 @@ def test_failure_in_the_middle_leaves_no_part_file(src, registry, tmp_path, monk
     monkeypatch.setattr(pe, "evaluate_expression", failing)
     plan = make_plan(src, registry, ["d"], {"d": "a + 1"}, chunk_rows=100)
     with pytest.raises(RuntimeError):
-        pe.export_parquet(plan, out)
+        pe.export_parquet(plan, out, overwrite=True)
     assert not (tmp_path / "o.parquet.part").exists()
     assert out.read_bytes() == b"previous content"
 
@@ -402,3 +417,45 @@ def test_target_equal_to_source_is_refused(src, registry):
     with pytest.raises(pe.ExportError):
         pe.export_parquet(plan, src)
     assert src.read_bytes() == before
+
+
+# -- overwrite protection (export 57.8.1) ------------------------------------------------------------
+
+
+def test_existing_target_is_refused_without_overwrite(src, registry, tmp_path):
+    out = tmp_path / "o.parquet"
+    out.write_bytes(b"previous content")
+    plan = make_plan(src, registry, ["a"])
+    with pytest.raises(pe.ExportError):
+        pe.export_parquet(plan, out)
+    assert out.read_bytes() == b"previous content"
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_existing_target_is_replaced_with_overwrite(src, registry, tmp_path):
+    out = tmp_path / "o.parquet"
+    out.write_bytes(b"previous content")
+    res = pe.export_parquet(make_plan(src, registry, ["a"]), out, overwrite=True)
+    assert res.rows == N and pq.read_table(out).num_rows == N
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_source_is_refused_even_with_overwrite(src, registry):
+    before = src.read_bytes()
+    with pytest.raises(pe.ExportError):
+        pe.export_parquet(make_plan(src, registry, ["a"]), src, overwrite=True)
+    assert src.read_bytes() == before
+
+
+def test_overwrite_cancelled_keeps_the_original(src, registry, tmp_path):
+    out = tmp_path / "o.parquet"
+    out.write_bytes(b"previous content")
+    with pytest.raises(pe.ExportCancelled):
+        pe.export_parquet(make_plan(src, registry, ["a"]), out, cancelled=lambda: True, overwrite=True)
+    assert out.read_bytes() == b"previous content"
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_the_parametrized_writer_is_the_one_used(src, registry, tmp_path, writer):
+    res = pe.export_parquet(make_plan(src, registry, ["a", "cnt"]), tmp_path / "o.parquet")
+    assert res.writer == writer

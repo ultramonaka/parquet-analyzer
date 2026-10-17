@@ -66,6 +66,9 @@ annotation and metadata). The analysis windows' image export uses the same mecha
   (persistence ch. 54) are covered. The list is the plots' signals (checked by default) plus the
   view's other virtual variables (unchecked by default). The range is all rows or the range saved
   in the view. Details in 57.7.
+- **An existing file is never silently overwritten** (added 2026-10-16, user request; data was actually lost). When the destination already exists, a warning is shown; the default is
+  "save under a different name with a timestamp", and overwriting is allowed after confirmation. Writing onto the source Parquet file is refused as before. Details in 57.8.1.
+- **One view can be applied to several files A, B and C and written separately as A', B' and C'** (added 2026-10-16, user request). They are never mixed into one file. The time axis can also be chosen on the export screen. Details in 57.8.2 and 57.8.3.
 - Details in [ch. 57](#57-writing-the-views-signals-to-parquet-added-2026-10-15).
 
 ## Design
@@ -288,7 +291,7 @@ Requirement: 5.51.
 - Add `export_parquet` and `export_parquet_cancel` to the list in the operation side-effect tests
   (app ch. 45).
 
-#### 57.6 Decisions made during implementation and differences from the spec (2026-10-15, implementer)
+#### 57.6 Decisions made during implementation and differences from the spec (2026-10-15)
 
 - **`source_row` (56.4) is not implemented** (56.4 is not on `main`). The structure is such that
   adding one column to the column order of `_Run.chunk_table` in `core/parquet_export.py` suffices
@@ -492,6 +495,387 @@ from the view JSON and the file's schema (reading only the footer). It builds on
   created) / operation log.
 - App ch. 45 table: a row for `export_parquet` from a saved view (items allowed to change: none).
 
+#### 57.8 Stage 3: overwrite protection and exporting several files (added 2026-10-16, user request)
+
+##### 57.8.1 Overwriting an existing file (a bug fix; fix first)
+
+Background: the user picked an existing file as the destination and the original data was lost. Currently there is no confirmation of our own; we rely on the OS save dialog's confirmation (`ui/main_window.py`
+`QFileDialog.getSaveFileName`). When `.parquet` is appended afterwards to a name without an extension, nobody checks whether the resulting name already exists (it slips past the OS confirmation.
+**Not yet confirmed to be the cause**; one tries to reproduce it and records the result in 57.6). The core also replaces an existing `path` unconditionally.
+
+- **Core** (`core/parquet_export.py`): `export_parquet(..., overwrite=False)`. If `path` already exists and `overwrite` is not set, raise `ExportError` without writing anything
+  (no `.part` either). The source-file check (57.2) still refuses regardless of `overwrite`. `overwrite=True` is passed only after the screen's confirmation
+  (double defence: even a path that forgot the screen's confirmation cannot destroy a file).
+- **Screen**: after the destination is decided (**after** the extension is completed), if the path already exists, show a confirmation dialog (`ui/messages.py`). The OS confirmation is
+  suppressed with `DontConfirmOverwrite` so that there is exactly one confirmation. Three buttons:
+  - "Save with a timestamp" (**default**): `<name>_<YYYYmmdd_HHMMSS>.parquet` (`_2`, `_3`, ... if that already exists within the same second).
+  - "Overwrite": shows the existing file's name, size and modification time in the body, and states that overwriting cannot be undone.
+  - "Cancel": does nothing.
+  If the source Parquet file itself was chosen, the flow does not reach the third confirmation and is refused as before with `export_parquet.same_as_source`.
+- The export-from-a-view path (57.7) and the multi-file path (57.8.2) go through the same function (one confirmation component; not written per path).
+- Operation log: `export_parquet` gets `overwrite` (`true`/`false`) and `renamed` (`true` when saved with a timestamp).
+- **Test plan**: core — with an existing `path`, `overwrite=False` raises `ExportError`, the existing file's content is unchanged and no `.part` remains / `overwrite=True` replaces it (the
+  existing tests are kept: a failure or cancel midway leaves the original) / the source file is refused even with `overwrite=True`. Screen (dialogs replaced) — a confirmation appears for an existing path /
+  choose a name without an extension, and if the completed name exists a confirmation appears (**a regression test that fails without this fix**) / "Save with a timestamp" creates a different file and the existing one is untouched /
+  only "Overwrite" replaces it / "Cancel" does nothing / `_2` when the timestamped name also exists / the source file is refused without reaching the confirmation / the same holds for export from a view.
+
+##### 57.8.2 Applying one view to several files and exporting them together
+
+The user's intent (2026-10-16): prepare different files A, B and C and **choose one view**. The signals chosen in the view are taken from each of A, B and C
+and written as A', B' and C' to **separate files** (never mixed into one file). (This was first misread as "choose several views". The unit of input is the file; the view is the common
+definition of "what to write".)
+
+Since 57.7 already handles "one view + one other file", this is widened to "several files". The signal alias mechanism (persistence ch. 54) that absorbs per-file column-name differences
+is used as it is.
+
+- Entry: when "Source: saved view" is chosen on the export screen (57.7.1), the source-file field accepts **several files** ("Another file..." becomes multi-select;
+  the default is the view's one file). The list shows the chosen files, with "usable / not usable" per file. The same screen can be entered from the view manager's button.
+- Signals and range are **common**: the signal list is the view's content (57.7.3) and the same selection is used for all files. The range is "all rows" / "the range saved in the view" (it is expressed in time, so it is
+  converted to rows per file; if it lies outside that file's time, the file fails with 57.7.4's "no rows").
+- Per file, the view's signals, virtual variables and time axis are **resolved against that file's columns** (including aliases; a signal that cannot be resolved is "not usable" as in 57.7.3. A file with
+  unusable signals is **written without those signals, with a notice** (user decision 2026-10-16; not a failure). To prevent output with silently missing columns, the notice appears in two places: the
+  pre-run list shows "N signals unusable (names)" per file, and the final message also lists the "files with missing signals" and the missing signal names. Only a file with no usable signal at all fails).
+- One **folder** is chosen as the destination (`last_export_folder` is the default). File names are `<that file's name>_<view name>_<YYYYmmdd_HHMMSS>.parquet` (unusable characters become `_`;
+  duplicates get `_2`...). Names contain a timestamp so they normally do not collide, but if they do, the name is **always changed** rather than asking 57.8.1's confirmation (batch export never overwrites).
+- Execution: **re-decided in 57.9** (2026-10-16). Up to 2 files at once (1 to 4 in settings, narrowed by the memory estimate), and each file is also written multi-core.
+  Progress is shown as a status-bar summary and the "export list" (state, %, rows/s, remaining per file). Cancel is per file or all (finished files remain; `.part` files are removed).
+  (The first version's "one at a time in order" was changed because measurement showed the write pinned to one core is the bottleneck.)
+- If one fails (file unreadable, signal unresolved, write failure), **the rest continue**. At the end one message shows the number succeeded, the failed files with reasons, and the output folder.
+- Metadata (57.7.5) is per file (`source` is that file, `view` is common). Operation log: `export_parquet_batch` for the whole (view name, file list, folder),
+  and `export_parquet` per file.
+- **Test plan**: the core is unchanged (`plan_from_view` is called per file). Screen — choosing 3 files produces 3 outputs, each with correct source, signals and row count / a file with different column names
+  is resolved by alias / a file whose signal cannot be resolved is written without that signal, and the missing signal names appear in the pre-run list and the final message / a file with no usable signal fails and the others are written / they run in order (never 2 at once) / cancel prevents the rest from starting and finished ones remain /
+  with the same name `_2` is used and batch never overwrites an existing file / export without opening the view (`load_view` is not called) / with one file the flow is as before.
+
+##### 57.8.3 Choosing the time axis
+
+The answer to the feedback, "make the Export time axis selectable". **Current specification**: the leading time-axis column of the output cannot be chosen. From "the current screen" it is the time axis in use at that moment; from a view it is
+the view's `time_column` (resolved by alias); for an old view without that, the file's first column (`time_name` in `parquet_export.py`). The name is not fixed to `TIME`, but
+the export screen has no place to choose it, and changing it requires changing the time axis on the main screen.
+
+In 57.8.2 the time-axis column name can differ per file (e.g. `TIME` in A, `t` in B), so it is made selectable here:
+
+- Add a **time axis** combo to the export screen. The choices are "the view's time axis (default; resolved by alias)" and the columns of the chosen files usable as time (monotonic numeric / datetime columns).
+- With several files, choose either "the view's time axis" (resolved per file by alias) or a column name common to all files. A file without the chosen column name fails (treated as in 57.8.2).
+- The chosen column becomes the leading time axis of the output. **The range computation (57.7.4) uses the view's time-axis column, not the chosen column** (2026-10-17, fixed in review): the numbers of "the range saved in the view" are in the view's time-axis unit, so applying them as they are to another column (e.g. `idx = time × 1000`) silently picks wrong rows. `find_row_range` is run on the view's time-axis column to get rows, and those rows are written with the chosen column. If the view's time axis cannot be resolved in that file and the saved range is used, that file fails (`RangeAxisMissing`, "The saved range is in the view's time axis (X) unit, but this column is not in this file"). The order check (data ch. 29) is not in the export path to begin with and is not added.
+- Test plan: screen — the combo's choices / the chosen column appears first / resolution and failure when column names differ across files / the default is the same output as before.
+
+#### 57.9 Speed, parallelism and progress display (2026-10-16)
+
+Background: facing 57.8.2 (several files), the user asked: "Should files run at the same time, or should one file be written multi-core, or in sequence? How do we make export fast?"
+The user's mandatory conditions (2026-10-16): (1) **the screen never freezes** during export. (2) Progress is clearly visible (what is running, k/N, % per file and overall,
+per-file state: waiting, running, done, failed, cancelled). 57.4's "decided in stage 2" and 57.8.2's "one at a time in order" are re-decided here.
+
+##### 57.9.1 Measurements (2026-10-16, Apple M4 Pro 12 cores, 24 GB, polars 1.44.2, pyarrow 25.0.1)
+
+Input: four files of 4 million rows x 20 float32 columns (hard-to-compress values, about 84 bytes/row, 338 MB per file, row groups of 1 million rows). The columns written match the actual use in 58.5.1:
+**time axis + 10 original columns + 20 virtual variables** (element-wise expressions, `rolling_mean`, `delta`, `where`, chains; all expressions that can be computed in chunks). Files were in the page cache
+(disk reads were not measured). Rows/s is total throughput, not per file. The heartbeat is the maximum interval at which a separate Python thread wakes every 10 ms
+(a measure of the time spent waiting for the GIL; stands in for the UI thread).
+
+**Breakdown of the current implementation** (one file, 57.6's `export_parquet` as is):
+
+| Stage | Time | Share |
+|---|---:|---:|
+| Read original columns (polars→Arrow, type `cast`) | 0.15 s | 6% |
+| Read for computation (per column, to float64) | 0.15 s | 6% |
+| Evaluate expressions (numpy) | 0.15 s | 6% |
+| **`ParquetWriter.write_table` (encode, zstd, write)** | **2.06 s** | **82%** |
+| Total (CPU 1.0 core) | 2.53 s | 1.56M rows/s |
+
+**Write settings** (one chunk of 1 million rows x 31 columns, pyarrow `ParquetWriter`): dictionary encoding (ON by default) is ineffective for floating point and only costs time.
+
+| Setting | ms/chunk | Size |
+|---|---:|---:|
+| zstd, dictionary (current) | 403 | 202 MB |
+| zstd level 3 | 432 | 201 MB |
+| zstd, no dictionary | 244 | 191 MB |
+| zstd, no dictionary, BYTE_STREAM_SPLIT | 177 | 148 MB |
+| snappy / lz4, no dictionary | 122-123 | 206-207 MB |
+| no compression, no dictionary | 104 | 208 MB |
+| polars `write_parquet` (zstd) | 91 (CPU 4.3 cores) | 187 MB |
+
+Even for rounded values (3 digits, like an ADC), the size difference without a dictionary is small: 0.9 → 1.3 MB per 1 million rows x 10 columns. pyarrow's writer processes one row group on one core
+and has no setting to write columns in parallel. polars encodes columns in parallel.
+
+**Speed within one file** (one file, same columns as above):
+
+| Method | Time | Rows/s | CPU (cores) | Peak resident |
+|---|---:|---:|---:|---:|
+| Current (pyarrow, zstd, dictionary) | 2.56 s | 1.56M | 1.0 | 1051 MB |
+| pyarrow, no dictionary | 1.88 s | 2.13M | 1.0 | — |
+| pyarrow, no dictionary, BYTE_STREAM_SPLIT | 1.31 s | 3.06M | 1.05 | 771 MB |
+| Above + overlap computation and writing (one queue, 500k-row chunks) | 0.99 s | 4.06M | 1.5 | 790 MB |
+| **polars `register_io_source` (generator returning chunks) + `sink_parquet` (zstd)** | **0.60 s** | **6.63M** | **4.3** | **758 MB** |
+| Same, original columns only (no virtual variables) | 0.31 s | 12.99M | 3.5 | 476 MB |
+| Reference: polars `scan_parquet().select().sink_parquet()` (original columns only, nothing in between) | 0.19 s | 21.5M | 6.0 | 881 MB |
+
+**Several files** (4 files, 16 million rows in total):
+
+| Method | Total time | Rows/s | CPU (cores) | Peak resident | Max heartbeat |
+|---|---:|---:|---:|---:|---:|
+| Current implementation in sequence | 10.23 s | 1.56M | 1.0 | 1217 MB | 13 ms |
+| Current implementation, 2 threads | 5.34 s | 3.00M | 2.0 | 1879 MB | 15 ms |
+| Current implementation, 4 threads | 2.97 s | 5.39M | 3.9 | 3047 MB | 22 ms |
+| pyarrow, no dictionary, 4 threads | 2.16 s | 7.41M | 4.0 | 2983 MB | 13 ms |
+| pyarrow, no dictionary, 4 **processes** | 2.29 s | 7.00M | 4.0 | (children) | 14 ms |
+| polars writer, in sequence | 2.51 s | 6.37M | 4.1 | 852 MB | 22 ms |
+| **polars writer, 2 threads** | **1.69 s** | **9.45M** | **6.3** | **1380 MB** | **21 ms** |
+| polars writer, 4 threads | 1.30 s | 12.29M | 8.5 | 1758 MB | 21 ms |
+
+What can be read from this:
+
+- **The bottleneck is the write (encoding and compression), pinned to one core**. Reading and computation together are under 20%. One at a time in order (57.8.2's first version) uses only 1 of 12 cores.
+- Merely switching to polars' writer makes one file **about 4x faster** (using 4 cores). Running 2 files at once gives a further ~1.5x (about **6x** the current in total). 4 at once is 8x but
+  doubles the memory, and with real data it is expected to hit a ceiling from disk reads and writes.
+- **Threads and processes are equally fast** (7.41M vs 7.00M rows/s), because polars, pyarrow and numpy release the GIL in the heavy parts. There is no reason to use processes.
+- In every method the maximum heartbeat is 22 ms (waiting for the GIL is at most about 12 ms). As long as heavy work is not placed on the UI thread, the screen does not freeze.
+- Memory is **determined by the chunk size, not by the row count**: about 500-600 MB per file (1 million rows x 31 columns). It is proportional to the number running at once. Only variables
+  computed over all rows first (57.6) are proportional to the row count (4 GB per variable at 500 million rows).
+
+**Limits**: (1) Values are from a page-cached state and exclude disk reads and writes. For an output of 500 million rows x (10 original + 20 virtual), extrapolating from these values gives about 64 GB per file
+(float64 virtual variables are hard to compress) and about 76 seconds of CPU alone (about 320 seconds now). With an internal SSD (several GB/s of writing) the write time would be 20-30 seconds and the CPU is still
+expected to be the bottleneck. On external disks the benefit of running at once is small. (2) On CI Ubuntu (around 4 cores) the numbers are smaller and the benefit of 2 at once is small. Tests do not check
+speed (57.9.9 below). (3) Single measurements (no repetition).
+
+##### 57.9.2 Decisions (summary)
+
+1. **Within one file**: replace the write with polars' streaming write (generator returning chunks → `sink_parquet`). Column encoding and compression become multi-core.
+   Read → compute stays per chunk inside the generator as before (the rules and results of 57.2 and 57.6 are unchanged). Only when columns whose types polars cannot preserve are included, fall back to the
+   current pyarrow write (dictionary only for non-floating-point columns) (57.9.3).
+2. **Between files**: **at most 2 at once** (setting `export_parallel_files`, 1 to 4, default 2). In addition, narrowed so that the total memory estimate does not exceed the budget (57.9.5).
+   A file that alone exceeds the budget runs alone (it is not refused).
+3. **Done with threads** (no processes). One file = one `WorkerHub` job (exactly one of success, failure or cancel, ch. 37). The maximum thread count of the dedicated export
+   `QThreadPool` is `export_parallel_files`.
+4. **One export queue** (replacing 57.1's "only one at a time"): if another export is started during an export, it is not refused but appended to the end of the queue.
+5. **Progress**: the worker only sends numbers, at most 10 times/s per job. The screen draws from the latest values on a 4 times/s timer. The status bar shows a summary and details are in the
+   "export list" (a modeless window) (57.9.7).
+6. **Free disk space** is checked with an estimate before starting and also per chunk while running (57.9.6).
+
+Not adopted: splitting into processes (same speed, and adds the hand-over of plan, function and map copies, the operation log and GC rules) / overlapping computation and writing with pyarrow kept (about 1.3x, short of polars' ~4x) / using
+`scan_parquet().sink_parquet()` directly when only original columns are written (about 1.7x faster, but per-chunk progress, cancel, disk checks and the row range after `find_row_range` would have to be built
+separately. One path is preferred. If it is called slow, handle it in another section) / BYTE_STREAM_SPLIT (also makes the size smaller, but it is unknown whether receiving tools can read it. Not used in the polars path).
+
+##### 57.9.3 Writing one file (`core/parquet_export.py`)
+
+- `_Run.chunk_table(lo, hi)` stays as it is (column order, type `cast`, float64 for virtual variables, slicing values computed over all rows). The write loop of `export_parquet` is replaced with a
+  **generator** `_chunks()` (per chunk: `check()` → `chunk_table` → `pl.from_arrow`, then yield; emits progress), and a `LazyFrame` from
+  `polars.io.plugins.register_io_source(io_source=..., schema=the polars schema of the first chunk)` is written with
+  `sink_parquet(part, compression="zstd", row_group_size=chunk_rows, statistics=True, arrow_schema=Arrow schema with metadata)`
+  (found in the 2026-10-16 implementation: `metadata=` goes only into the file's key-values and cannot be read via `pq.read_schema(...).metadata`; with `arrow_schema=` both can read it. It can be used because only columns whose types round-trip take this path).
+  The first chunk (which determines the schema and the metadata's range text, 57.6) is still built before the generator, and the generator yields it first.
+- **Cancel / failure** (revised 2026-10-16, review): the generator **does not raise**. When `check()` / `chunk_table` etc. raise an exception
+  (`ExportCancelled`, disk/memory failure, expression error), the generator stores that exception in the closure and **simply `return`s**
+  (ends normally). Then `sink_parquet` closes the file itself and returns, after which the **stored exception is re-raised** (`ExportCancelled` for cancel, otherwise
+  the original exception) and `.part` is removed **exactly once**. Before calling `sink_parquet`, `check()` and `gate()` are each run once, so polars' write is not started for a failure before the first chunk.
+  Reason: measurement showed that if the generator raises, polars' writer thread **creates `.part` about 34 ms after the error is returned** (under high load).
+  A fixed wait cannot prevent this, and later exporting to the same path could produce a broken (zero-filled) file. If the generator ends normally, the writer thread finishes before returning, so
+  no guessing about timing is needed. The file is closed in a "too few rows" state but is removed immediately and never published.
+- **The generator runs on polars' thread** (a `Dummy-n` thread as seen from Python). It must not touch UI parts or `QObject`s there (as now).
+  Automatic GC is off (37.2), so GC does not run on that thread. The chunk arrays create no reference cycles and are freed by reference counting.
+- **Types**: polars preserves the original types (integer widths, float32, timezone-aware times, nanoseconds, date), but strings become `large_string` (confirmed by measurement; specifying it with `arrow_schema`
+  fails). So at planning time, check whether each output column's Arrow type **round-trips to the same type** via `pl.from_arrow(empty table).to_arrow()`; if even one does not, that
+  file is written with **pyarrow's writer** (the current `ParquetWriter`; `use_dictionary` only for non-floating-point columns, zstd). Which one was used is recorded in
+  `ExportResult.writer` (`"polars"` / `"pyarrow"`) and in the operation log. Values, types, metadata and row groups (one row group has at most `chunk_rows` rows) must be the same in
+  both (57.5's tests are run on both).
+- **Row groups**: 57.5's "number of row groups = number of chunks" is relaxed to "each row group has at most `chunk_rows` rows and they total the row count" (polars may cut row groups
+  differently from chunk boundaries; they matched in measurement). The time-axis column's statistics (min, max) are written (for when `find_row_range` reads that output).
+- **Chunk size**: `chunk_rows` is the row count at which one chunk's Arrow table fits in about 256 MB, from "the size of one output row (sum of type widths + the float64 intermediates of computation)"
+  (clamped to 65,000 to 1,000,000 rows). With 31 columns it stays 1 million rows; with 300 columns about 120,000 rows. Memory stays constant even with many columns.
+- **Progress**: the generator emits `progress(rows returned, total)` just before returning `chunk_table`. polars buffers a little before writing, so rows returned run ahead of rows
+  written. On the screen side, it is held at 99% until the job's completion notice arrives (57.9.7).
+- polars' `register_io_source` is an API documented as "unstable". The polars version is pinned in `uv.lock`, and the behaviour above (how cancel is wrapped, `.part`, types) is watched
+  by tests. If it is unavailable (`ImportError` etc.), fall back to the pyarrow write.
+
+##### 57.9.4 Ordering between files (`core/export_queue.py`, new; no Qt dependency)
+
+- `ExportQueue`: the export queue and its state. An item = one output file (`ExportItem`: number, source file, output path, plan (or a function to build the plan),
+  memory estimate, state, rows, failure reason). States: `waiting` → `running` (stages: finding the range / computing over all rows / writing) →
+  `done` / `failed` / `cancelling` (cancel requested but the worker is cleaning up) → `cancelled`. An item cancelled while waiting goes straight to `cancelled`.
+- `next_to_start(running)`: from the head of the waiting items, returns the first one satisfying (a) the number running is below `export_parallel_files`, (b) the running estimates' total + this estimate is within the budget
+  (it starts even over budget if nothing is running), and (c) its output path equals no running or cancelling item's (57.6's "don't delete each other's `.part`"). It never
+  overtakes: if the head waits on (b), the ones behind also wait (so the order is predictable).
+- Addendum (B1 implementation, 2026-10-17): items being cancelled in (a) also count toward the concurrency (they still use a thread). The free-space check in (d) is performed **only when one or more are running** (waiting when nothing is running would wait forever, so the head is started and left to fail through the file's own protection). Re-checks while waiting for free space happen at most once per second. The consecutive disk-shortage count (2 in a row fails the remaining waiting items) is **reset to 0 when a new batch starts** (so that a write after space was freed does not fail immediately because of the previous batch's streak).
+- The actual starting and receiving of results is done by `MainWindow` (below). `ExportQueue` holds only the state table and can be tested purely.
+
+##### 57.9.5 Memory budget
+
+- Estimate (`estimate_export_memory(plan)`, a pure function): `min(chunk_rows, max(rows, 1)) x (bytes per output row x 3 + 8 x (number of original columns used by the expressions + virtual variables computed per chunk))`
+  (a chunk is never larger than the rows being written, so a 1,000-row export is not estimated at 1 million rows)
+  + `total rows x 8 x (number of variables computed over all rows first and their inputs)` + 200 MB. The factor 3 stands for "Arrow table, polars copy, write buffer" (against the measured about 500-600 MB per file,
+  about 1.1 GB for 31 columns, i.e. conservative).
+- Budget: 40% of physical memory (obtained with the standard library: `os.sysconf` `SC_PAGE_SIZE` x `SC_PHYS_PAGES` on macOS and Linux, `ctypes` `GlobalMemoryStatusEx` on Windows.
+  `psutil` is not an app dependency so it is not added. 4 GB if it cannot be obtained). When a memory limit setting exists in 58.5 stage 2-3, follow it.
+- A file that alone exceeds the budget (e.g. 500 million rows with many variables computed over all rows first) runs alone, and its list row shows "Uses a lot of memory (about N GB)".
+  If the estimate exceeds physical memory, a warning appears in the list before starting (the user decides whether to stop; the cancel button).
+
+##### 57.9.6 Free disk space
+
+- Before starting (when adding to the queue): compare the free space of the output folder (`shutil.disk_usage`) with "rows x uncompressed bytes per output row" summed over all waiting and running items, and if
+  insufficient show a warning above the list (it still starts, since how much compression shrinks is unknown).
+- While running: the generator checks free space per chunk, and **when free space drops below (bytes still expected to be written) + a 100 MB margin**, that file fails with `DiskFull` (`ExportError("disk full")`) (`.part` is removed).
+  Bytes still expected = remaining rows x (bytes written to `.part` so far / rows so far) (a measured value that accounts for compression; while nothing has been written it is 0 and only the margin is considered).
+  Reason: with a fixed 1 GB, not even a 1 MB export could be written to a nearly full drive such as a USB stick with 800 MB free. What we want to protect against is "using it all up and dragging the OS and
+  other apps down", so stopping at the needed amount + a small margin is enough. The pre-start check margin (57.9.6a) was also fixed to the same 100 MB.
+  This prevents exhausting the disk and dragging other apps and the OS down. The rest of the queue continues (it can be written if space frees up), but if it fails consecutively for the same reason, the rest are not started and are failed
+  (reason: "Not enough free disk space").
+- **The decision to start a new file** (`next_to_start`'s (d)) estimates the remainder of running files as "uncompressed upper bound (`max_bytes`) x remaining fraction" (no compression assumed, the safe side. Intentional design. The stop while running (formula above) uses the measured compression ratio).
+- Reference: 500 million rows x (10 original + 20 virtual) is about 64 GB per file (57.9.1). Three files come to about 190 GB, exceeding the development machine's free space (about 178 GB, 58.1).
+
+##### 57.9.6a Not failing midway (memory and disk monitoring, 2026-10-16, user request)
+
+57.9.5 and 57.9.6's "warn and start" is strengthened to **stop before starting + protect by slowing down and waiting while running**. "Failing while writing" becomes the last resort.
+
+- **Decided before starting (when adding to the queue)** (pure functions in `core/export_queue.py`; free disk and memory can be replaced via arguments):
+  - Disk: whether the **upper-bound estimate** of all waiting and running outputs (rows x uncompressed bytes per output row; savings from compression not assumed) is at most the output folder's free space
+    minus the margin (fixed 100 MB; the former "1 GB or 5% of free space" was dropped because it would make even small exports ask for confirmation on a nearly full drive). **If it is exceeded, show a confirmation screen** (default "Stop"; "Start anyway", "Reduce files".
+    Compression may make it fit, so the user decides whether to continue). When outputs span several folders or drives, sum per folder (volume).
+  - Memory: the same confirmation if one file's estimate exceeds **the currently free memory** (not physical memory, but what the OS regards as "available").
+- **While running**:
+  - Disk: check free space per chunk. (a) If free space is about to fall below "bytes still expected + margin", **do not start new files** (they stay waiting with "Waiting for disk space" shown).
+    (b) If free space still falls below "bytes still expected + 100 MB margin" (the 57.9.6 formula), **stop only that file and fail it** (`.part` removed). Other running files continue (they free space as `.part` is removed).
+    (c) It stops starting from the running file with the least progress, so finished files always remain.
+  - Memory: check free memory per chunk. When free memory drops below 2 GB, **do not start new files** and halve the chunk row count (floor 10,000 rows).
+    Halving happens **once per drop below 2 GB** (even if the state persists, it is not halved at every 0.5-second check; this avoids 1M rows becoming 10,000 in 3.5 seconds).
+    When it returns to 2 GB or more, it is doubled at each check until `plan.chunk_rows` (halved once again if it drops again). `chunk_halvings` is the number of halvings. Below 1 GB the
+    running file is **paused** (waits at a chunk boundary; the screen stays responsive) until free memory returns, and if it does not return within 30 seconds only the newest file fails.
+    This is a second safety in addition to the budget (40% of physical memory) at the default concurrency of 2.
+  - The list row's state gets "Waiting for disk space" and "Waiting for memory", with the reason displayed.
+- Free space is obtained with the standard library only (disk: `shutil.disk_usage`; memory: "available" obtained as in 57.9.5. If it cannot be obtained, monitoring is skipped and only the pre-start decision is made).
+- Tests: with free disk and memory replaced, check (1) the pre-start confirmation (exceeds / fits / per volume), (2) new files are not started when free space shrinks, (3) when it drops below "remaining + 100 MB"
+  only that file fails, no `.part`, finished files remain, (4) the chunk halves under memory pressure, and pausing then resuming when it returns.
+
+##### 57.9.6b Choosing the virtual-variable type (float32, 2026-10-16, user request)
+
+- Add "Virtual variable type" to the export screen: `float64` (default; as before) / `float32`. The time axis and original columns are **kept in their original types** regardless of the choice (57.1).
+- float32 makes the output about half the size (500 million rows x 20 virtual: 64 GB → about 44 GB; the original columns' share is unchanged) but precision is about 7 digits. The chosen type is
+  recorded in the metadata (57.7.5). The disk estimate (57.9.6a) is also computed with this type.
+- NaN and Inf of virtual variables are kept as they are. A large value that does not fit float32 becomes Inf. **The check is done per chunk during the export** (the values to write are unknown without computing them); the names of variables that
+  have finite values turned into Inf are left in `ExportResult.float32_overflow`, and **the names are shown in the final message** (the values are written as Inf).
+
+##### 57.9.7 Progress display (`ui/parquet_export_dialog.py`)
+
+- **Worker → screen**: the progress path stays the current `progress_sink` (37.1, relay object). The worker-side `emit` is **throttled**: nothing is sent if less than 100 ms has passed since the last one.
+  However, stage changes (the `total < 0` marker, 57.6) and the last chunk are always sent. The UI-thread receiver only puts each item's latest `(done, total, time)` into
+  a dict (it touches no widgets).
+- **Screen update**: a 250 ms timer (`QTimer`, on the UI thread) that runs only during export redraws the status bar and the list from the latest values. Rows/s is a moving average over the last
+  about 5 seconds; the remaining estimate is (remaining rows / rows/s). The stages of computing over all rows and finding the range have no fraction, so they show a moving bar with "Computing all rows..." / "Finding the range...".
+  The row's % is held at 99% until the job's completion notice arrives (57.9.3). Note for stage B: progress reaches 100% when the last chunk is handed to polars, but polars is still writing at that time
+  (rows returned run ahead of rows written). The screen holds 99% until the completion notice, and actual completion is decided by `worker_done` / the job's completion. Heavy work (other than building the plan and reading footers) is not done on the UI thread.
+- **Status bar** (extends 57.3's `ParquetExportProgress` component): an overall bar (weighted by rows: sum of finished rows / sum of total rows; files whose row range is not yet known
+  are counted by the file's row count), "Exporting to Parquet 2/5 · 43%" (with one file, as before "Exporting to Parquet NN%"), "Details...", and
+  "Cancel all". Hidden when the queue becomes empty (as now).
+- **Export list** (`ParquetExportPanel`, new, a modeless `QDialog` with an `objectName`, one per `MainWindow`):
+  - Opens automatically when an export of two or more files starts. Not for one file (can be opened from the status bar's "Details..." or the menu). Closing it does not stop the exports.
+  - Top: the overall bar, "Done 2 / Failed 0 / Cancelled 0 / Total 5", elapsed and remaining estimates, disk and memory warnings (57.9.5, 57.9.6).
+  - Table (one row = one output file, in start order): source file name / output file name / state (waiting, finding range, computing all rows, writing, cancelling, done, failed,
+    cancelled; shown by both colour and text) / % bar / rows (done/total) / rows/s / elapsed / remaining / actions ("Cancel" for waiting and running, "Open folder" for done).
+    The failure reason is in the row's tooltip, and in full in the field below the selected row.
+  - Bottom: "Cancel all", "Clear finished", "Close".
+- Opening a file or a view leaves the list and the status-bar display as they are (the rule of 57.3 stays). When everything finishes, the status bar shows a one-line summary (number succeeded, number failed, output
+  folder). If there is at least one failure, a single warning from `ui/messages.py` appears once (57.8.2's "one message").
+
+##### 57.9.8 Cancel and cleanup (`MainWindow`)
+
+- **Cancel one**: if waiting, just make it `cancelled`. If running, set that job's `cancel_event` and make it `cancelling` (the worker stops at the next chunk boundary,
+  at most one chunk = around 1 second, and removes `.part`; as in 57.6). On the job's completion (`worker_done`) it becomes `cancelled` and the next one starts. The screen discards the result (the current
+  `hub.cancel(token)`).
+- **Cancel all**: mark all waiting as `cancelled`, then treat all running as above.
+- **Closing the window**: cancel all, then `waitForDone(5000)` on the dedicated export pool (as now).
+- For each finished job (success, failure, cancel), call `ExportQueue.next_to_start` to start the next (the completion notice arrives on the UI thread exactly once, ch. 37).
+  The job's strong reference (`pending`) is held until the notice is handled (ch. 37's rule is unchanged). What the in-flight job captured (plan, chunk arrays) is returned to the
+  UI thread by `_Task`'s `del func`.
+- Addendum (B1 implementation): the spec's `hub.cancel(token)` is used **only when closing the window**. Normal cancel receives the result notification and uses it for the "cancelling → cancelled" transition and for starting the next file. A file the worker had already finished writing during cancelling becomes "done" (the file actually exists). So right after pressing, the status bar shows "Cancel requested", and "Cancelled" only after everything has finished.
+- Operation log: `export_parquet_cancel` with `target` (the output path, or `"all"`). The job's `job` record is per file (the current `parquet_export`).
+  `export_parquet_batch` (57.8.2) gets `parallel` (the number run at once).
+
+##### 57.9.9 Test plan
+
+- `core/parquet_export`: all of 57.5's tests pass with **both the polars and the pyarrow writer** (values, types, metadata, row groups at most `chunk_rows` rows and totalling the row count) /
+  if some column's type does not round-trip in polars, such as a string column, pyarrow is chosen (`ExportResult.writer`) / in the polars path, a cancel in the middle of the generator becomes
+  `ExportCancelled` and no `.part` remains, and other exceptions come out with their original type / when `register_io_source` is unavailable it falls back to pyarrow (replaced) / time-axis
+  statistics are written / the automatic size of `chunk_rows` (smaller with many columns, upper and lower limits) / progress throttling (clock replaced: nothing sent under 100 ms;
+  stage changes and the last are always sent) / free disk (`shutil.disk_usage` replaced: fails below "remaining + 100 MB" and no `.part` remains; a small export passes even with 800 MB free; 0 rows can be written even with little free space) /
+  the generator ends normally without raising (checked with a spy), and polars' write is not started for a failure before the first chunk / halving the chunk under memory pressure happens once per drop and returns to the original size when it recovers.
+  `core` tests take `writer` as a parameter and run on **both polars and pyarrow** (all of `test_parquet_export_core.py`, via an autouse fixture). Disk and memory readings are replaced by an autouse fixture in `tests/.../conftest.py` (the real machine's free space is not read).
+- `core/export_queue`: state transitions (all combinations) / up to `export_parallel_files` at once / waiting by budget, starting even over budget when nothing is running,
+  no overtaking / the same output path does not start until the previous one finishes (including cancel cleanup) / cancel while waiting, cancel while running, cancel all /
+  continuing after a failure, and failing the rest when disk shortage continues / an item added during export goes last. The value of `estimate_export_memory` (with and without all-rows computation).
+- Screen (`MainWindow`, dialogs replaced):
+  - **The screen does not freeze**: with a 10 ms `QTimer` on the UI thread, measure the maximum interval while exporting 3 files (300,000 rows each, with a small `chunk_rows`, enough to take over 1 second in total), and require
+    **under 250 ms** (about 20 ms measured; leaving margin for CI slowness). Progress updates arrive at least twice midway. Regression check: calling the same export directly on the
+    UI thread fails this condition (confirming the amount is sufficient). Waiting is in real time.
+  - The number running at once never exceeds `export_parallel_files` (counted inside the worker). With the setting at 1 they run in order.
+  - The list rows' state, %, k/N, the status-bar summary; the list does not open automatically for one file and opens for two or more; closing the list does not stop them.
+  - Screen updates are throttled (about 4 redraws per second even if hundreds of progress notices arrive).
+  - Cancel one (only that file has no `.part`, the others complete), cancel all, closing the window (no `.part` remains).
+  - Opening another file or view during export still lets everything finish correctly (57.3) / starting another during export puts it in the queue (it is not refused with "Export in progress").
+  - Operation log and app ch. 45's table (`export_parquet_cancel`'s `target`).
+- Speed is not checked in tests. Run `bench_large_file.py`'s `parquet_export` stage (58.3) in its form with the export entry point available, and record time, CPU and memory on ch. 58's large files
+  (at the user's measurement).
+
+##### 57.9.10 How to proceed
+
+- Stage A (the core's speed: 57.9.3, 57.9.5, 57.9.6, 57.9.6a, progress throttling) first on one branch (`feat/57-export-speed`). Writing one file becomes faster as it is.
+  Implemented (2026-10-16, awaiting review). Decided in stage A: the pure functions for disk/memory decisions live in `core/export_resources.py` (`export_queue.py` is built in stage B;
+  `preflight` / `can_start_new_file` are called from stage B's queue). The pre-start confirmation is `MainWindow._start_parquet_export` (default "Stop").
+  Protection while running is within one file (per chunk: free disk below "remaining + 100 MB" → fail with `DiskFull`; free memory below 2 GB → halve the chunk (floor 10,000 rows); below 1 GB → pause; `MemoryLow` after 30 s).
+  "Stop from the file with the least progress" and "do not start new files" are arbitration across several files, so they belong to stage B. `chunk_rows` is automatic via `build_plan(chunk_rows=None)` (default).
+  review fixes (2026-10-16): the generator ends normally without raising (57.9.3), memory halving is once per drop plus returning to the original (57.9.6a), the disk stop is "remaining + 100 MB" (57.9.6).
+  `result.writer`, `chunk_halvings` and `memory_wait` are recorded in the operation log message (`where=export_parquet`) at the same time as the success notice.
+  `_darwin_available` does not add "Pages purgeable" (it double-counts as part of active/inactive; confirmed with `vm_stat`).
+  Measurement (4M rows x (10+20) columns, M4 Pro): pyarrow 1.96 s → polars 0.50 s (about 3.9x).
+- Stage B (57.9.4, 57.9.7, 57.9.8) goes with 57.8.2 on `feat/57-export-batch` (the entry for several files and the list are work on the same screen).
+- Both touch thread handling, so they are large tasks (implementation → review).
+
+##### 57.9.10a What stage B1 implemented and differences from the spec (2026-10-17)
+
+Scope: `core/export_queue.py`, 57.8.2 (several files), 57.9.7/57.9.8 (list, summary, cancel). 57.8.3 (time-axis choice), 57.9.6b (float32), the `export_parallel_files` field in the settings screen and making `DISK_MARGIN` a setting are B2.
+
+- **Structure**: the queue driver was split out into `ui/export_controller.py` (`ExportController`) (to keep `main_window.py` from growing further). It holds the queue, the dedicated pool (max = concurrency), the `WorkerHub`, the 250 ms timer, the status bar and the list. `MainWindow._parquet_export` is a compatibility property (the first running item, or None), and `_parquet_export_busy()` is "at least one item is waiting, running or cancelling".
+- **`Settings.export_parallel_files`** (1 to 4, default 2, out-of-range falls back to the default) is added and read. The settings-screen input is B2.
+- **`next_to_start`**: examines only the head waiting item (it does not overtake on (a), (c), (d) either, not just (b) memory). Items being cancelled also use a thread, so they count toward the concurrency. (d) The free disk/memory check (`can_start_new_file`) is made **only when one or more are running**. Waiting when nothing is running would wait forever, so the head is started and made to fail through the file's own protection (`DiskFull`) (an addendum not in the spec). Re-checks while waiting for free space are at most once per second (so `vm_stat` is not called every time). Consecutive disk shortages are 2 (`DISK_FAIL_STREAK`), after which the rest of the waiting items fail with `DiskFull`. The streak resets on success or a different failure.
+- **Cancel**: the spec's `hub.cancel(token)` is not used, and the result notification is received (the screen-side notification is needed for the cancelling → cancelled transition and for starting the next file). If the worker had finished writing during cancelling, that file becomes "done" (the file actually exists). Only when closing the window is `hub.cancel` used to discard notifications.
+- **Final message**: once, when the queue is empty (and nothing is cancelling). For one file the wording is as before (saved / warning / cancelled). For two or more, a one-line status plus one warning if there are failures or missing signals. When a new export is added to an empty queue, the previous batch's finished rows are cleared.
+- **57.8.2**: "Another file..." is multi-select (`pick_parquet_files`). When two or more are chosen, per-file "usable / not usable" is shown under the list (following the checked signals), then folder choice → `export_parquet_batch`. Characters unusable in a view name become `_` via `MainWindow._safe_name`. The "all rows" row-count display is the total over all chosen files. Signals usable in "any of the files" can be selected in the signal list. Files whose plan cannot be built (unreadable, no time axis, zero usable signals) appear as `failed` items in the list and message.
+- **List window**: `ParquetExportPanel` (`objectName` `parquet_export_panel`). Opens automatically with two or more items. A "Parquet export list..." entry was added to the View menu (when the flag is ON). "Open folder" is `ExportController.open_folder` (replaced in tests).
+- **Progress**: the worker-side throttling (100 ms) is as in stage A. The screen side only stores values, and the 250 ms timer draws. Both overall and row stay at 99% until the completion notice.
+- **Log**: `export_parquet_batch` (`parallel`), `export_parquet` per file (`batch`), `export_parquet_cancel` (`target` = output path / `all`).
+- **Implemented in B2**: the concurrency in the settings screen, time-axis choice, float32, making `DISK_MARGIN` a setting, and 57.9.6a (c) (57.9.10b).
+- Existing tests changed: the two tests "starting another during export is refused" became "goes into the queue", the replacement of `pick_parquet_file` became `pick_parquet_files`, and the View-menu item check gained the list entry.
+
+##### 57.9.10b What stage B2 implemented and differences from the spec (2026-10-17, including review fixes)
+
+- **Time-axis choice (57.8.3)**: when exporting from a saved view, the export screen has a "Time axis" combo (`export_time_combo`). The first entry is "The view's time axis (name)" (default; resolved by alias), followed by the chosen files' columns of numeric, datetime, date, time, duration or decimal type (`parquet_export.time_candidates`). **Candidates are narrowed by type only; monotonicity is not checked** (the data is not read; an order check is not in the export path to begin with). With several files the candidates are the **union**, and a file without the chosen column fails with "The time-axis column (X) is not in this file" (also shown in the pre-run file list). The combo is not shown for export from the current screen. If changing files or the source leaves the chosen column out of the candidates, it returns to the view's time axis. The chosen column is resolved including aliases via `view_export_info(time_column=)` and becomes the output's leading column and the metadata's `time_column`. The saved-range search uses the view's time-axis column (57.8.3, `ExportPlan.time_range_column`, `ViewExport.range_source`).
+- **Virtual-variable type (57.9.6b)**: `export_dtype_combo` (float64 default / float32) on the export screen. `ExportPlan.derived_dtype`, the metadata `derived_dtype` (always written), and the output row size and disk estimate also use this type (float32 is 4 bytes). The float32 range check **reports after the export** (57.9.6b): a dedicated warning for one file, a section of the final warning for several files.
+- **Settings**: `export_parallel_spin` in the settings screen (`export_parallel_files`, 1 to 4; shown only when the feature flag `parquet_export` is ON; changes take effect from the next file started). `export_disk_margin_mb` is **a settings-file key only** (no UI, default 100, outside 1 to 100000 falls back to the default). `export_resources.disk_margin()` is the single read point, and the three places (pre-check, deciding to start a new file, stop while running) read the same value (`MainWindow` calls `set_disk_margin_mb` at startup and in `apply_settings`). `DISK_MARGIN` remains as the default value.
+- **57.9.6a (c) Stop from the file with the least progress**: `export_resources.DiskArbiter` (a table of running files' progress and output volumes; one is held by `ExportController` and passed through `export_parquet(arbiter=, arbiter_key=)`). When the disk falls below "remaining + margin", the file fails with `DiskFull` if it is **the one with the least progress among the running files on the same volume** (the newer one if tied) or if there is no other. Otherwise `request_stop_least` marks the least-progressed file for stopping, and it itself waits up to `DISK_YIELD_WAIT` (10 s, waiting at chunk boundaries; cancel still works) for free space to return. The marked file **raises `DiskFull` at its next `gate` (even if its own free space is sufficient)**, removes `.part` and returns the space. The waiting side continues if the space returns, and fails if it becomes the least progressed, gets marked, or times out. It does not arbitrate with files on other volumes. Calls without an arbiter behave as before.
+  - Limitation: each file updates its progress in its own `gate`, so the decision can be one chunk stale.
+- **Messages**: "1 GB" was removed from `export_parquet.disk_full` and the pre-check body (since the margin changes with the setting).
+- **Dialog**: with several files, the reading of each file's choices (footer) is cached for the duration of the dialog per (view, file, time-axis column) (not re-read when toggling a check).
+- **Export list**: column widths are fitted after the first row is drawn (source and output stretch; state, rows, rows/s, elapsed and remaining fit their contents; progress and actions are fixed).
+- Tests: `test_parquet_export_b2_core.py` (float32, time axis, range units, the margin shared in three places, arbiter, and an integration test that actually runs two `export_parquet` calls side by side), the second half of `test_parquet_export_batch_ui.py` (combo, multi-file failures, float32 warning, settings input, resetting the streak, column widths, failure on range units, cancel wording, footer cache), and `test_export_queue.py` (`new_batch`).
+
+##### 57.9.10 Export speed by expression kind (measured 2026-10-16)
+
+`tests/parquet_analyzer/bench_export_expr.py` (writes one derived variable + the time axis. The maps are a 1-input 1-output curve `cv(x)` and a 2-input 1-output map `mp(x, y)`. 3D is the maps' surface display and is not involved in this computation).
+M4 Pro, polars streaming write, single measurements (files in the page cache; the first read is slower than this). The output row count and the first, middle and last values were confirmed to match direct computation from the source data.
+
+| Condition | bench_100m (100M rows, 4.6 GB) s | wide_300m_f32 (300M rows, 3.9 GB) s |
+|---|---|---|
+| Raw column (baseline) | 0.76 | 2.90 |
+| Arithmetic `x*0.5+y` | 0.82 | 3.13 |
+| if-expression / `where` (simple) | 0.75 / 0.76 | 3.58 / 3.61 |
+| if-expression nested 3 levels / `where` with and/or | 1.54 / 1.32 | 5.50 / 5.54 |
+| Curve 33 points / 2049 points | 2.03 / 4.91 | 5.33 / 6.39 |
+| 2D map 9x9 / 65x65 / 513x513 (linear) | 4.45 / 7.04 / 10.12 | 11.32 / 12.07 / 13.23 |
+| 2D map 65x65 (nearest) | 5.89 | 8.53 |
+| Map + if / sum of two maps | 7.41 / 9.85 | 13.03 / 20.57 |
+
+- Simple if, `where` and arithmetic are nearly the same as the baseline (1.0 to 1.25x). Maps are 4 to 13x. The larger the grid, the slower (binary search cost).
+- During maps the cores used are 1.4 to 1.8 (3 to 6 for simple expressions): computation is bottlenecked on single-threaded NumPy. Running the map computation in threads per chunk is expected to speed it up (not started; do it if needed).
+- Memory is about 400 to 600 MB in all conditions (`ru_maxrss` is the process's overall peak).
+
 ## Relations to other domains
 
 - **Plots** ([plots.md](./plots.md)): what `export_snapshot()` contains (hidden series excluded,
@@ -504,3 +888,11 @@ from the view JSON and the file's schema (reading only the footer). It builds on
 - **Expressions / Data** (ch. 57, 2026-10-15): the Parquet export computes only the chosen virtual variables and their dependencies, in chunks (per chunk for formulas with a known `expression_margin`, over all rows for the others). Functions and maps use a copy.
 - **Data** (56.4, ch. 58): `source_row` is added when displayed sorted. Export speed is judged by the measurements in ch. 58.
 - **Persistence** (57.7, 2026-10-15): export from a saved view uses the same judgments as the view JSON (`resolve_source`), signal aliases (ch. 54) and the view manager's "missing" marks (20.2, 54.5). The view manager gets an export button.
+- **Data** (ch. 37 and 58, 57.9, 2026-10-16): several export jobs run at once on a dedicated export pool (at most `export_parallel_files` threads). The `WorkerHub`
+  API is unchanged (one file = one job; throttling is done by the caller of `progress_sink`'s `emit`). polars' generator runs Python on polars' threads, but automatic GC is off
+  (37.2), so the rule is unchanged. polars' thread pool is one per process and shares CPU with the app's loading (drawing jobs) during an export. The memory budget (57.9.5) follows
+  58.5's stage 2-3 (memory limit setting) once it exists. Values for large files are taken with `bench_large_file.py`'s `parquet_export` stage (58.3).
+- **Persistence** (57.9): the setting `Settings.export_parallel_files` (1 to 4, default 2; added to the settings screen). The export list window's position and size are not recorded.
+- **App** (57.9): the export list (`ParquetExportPanel`) has an `objectName`. All strings go through `tr()` (en + ja). The operation log `export_parquet_cancel` gets `target` and
+  `export_parquet_batch` gets `parallel`. Update app ch. 45's table.
+- **Persistence** (57.8, 2026-10-16): multi-file export uses 57.7's alias resolution and the view manager's button. The existing-file confirmation uses the `ui/messages.py` component, and `last_export_folder` records the folder for batch export.

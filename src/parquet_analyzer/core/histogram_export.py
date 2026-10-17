@@ -37,7 +37,8 @@ class ExportError(ValueError):
 # ---------------------------------------------------------------------------
 
 
-def _offset_at(x: float) -> float:
+def local_offset_s(x: float) -> float:
+    """Local UTC offset (seconds) at epoch second `x` (0 when the time cannot be converted)."""
     try:
         return (datetime.fromtimestamp(x) - datetime.fromtimestamp(x, UTC).replace(tzinfo=None)).total_seconds()
     except (OverflowError, OSError, ValueError):
@@ -57,13 +58,13 @@ def local_datetime_ms(x: np.ndarray) -> np.ndarray:
     hour = np.floor(xv / HOUR_S).astype(np.int64)
     lo, hi = int(hour.min()), int(hour.max())
     if hi - lo > 200_000:  # a very sparse span: one lookup per value instead of one per hour
-        out[ok] = np.round((xv + np.array([_offset_at(float(v)) for v in xv])) * 1000.0).astype(np.int64)
+        out[ok] = np.round((xv + np.array([local_offset_s(float(v)) for v in xv])) * 1000.0).astype(np.int64)
         return out.view("datetime64[ms]")
-    grid = np.array([_offset_at(h * HOUR_S) for h in range(lo, hi + 2)])  # offset at each hour start (+1 past the end)
+    grid = np.array([local_offset_s(h * HOUR_S) for h in range(lo, hi + 2)])  # offset at each hour start (+1 past the end)
     off = grid[hour - lo]
     changes = grid[hour - lo] != grid[hour - lo + 1]  # an offset change inside this hour
     for i in np.flatnonzero(changes):
-        off[i] = _offset_at(float(xv[i]))
+        off[i] = local_offset_s(float(xv[i]))
     out[ok] = np.round((xv + off) * 1000.0).astype(np.int64)
     return out.view("datetime64[ms]")
 

@@ -203,6 +203,8 @@ per-series select / remove / show-hide, independent X axes per plot, the "A" but
 
 ### 4. Interaction (settled, 11.3, v2)
 
+> The wheel handling is shared in `apply_wheel` of `ui/scroll_zoom.py`, and the histogram's three plots (analysis 42.16) follow the same `scroll_bindings` too (H / double-click resets).
+
 | Action | Effect (current defaults — configurable, see below) |
 |---|---|
 | Mouse wheel scroll | pan along the X axis (time) (move only, no zoom) |
@@ -895,7 +897,7 @@ state `_navigator_overview_gen`, `_nav_pyramid_column`, `_navigator_hub` (`Worke
    calls `set_overview_data`.
 5. Real operations: with zoom on, run each path above, then drag the navigator range (real mouse events) and confirm the plots do not jump to the whole range.
 
-Scale: large (Sonnet plus reviewer). Touches WorkerHub and the navigator invariants.
+Scale: large. Touches WorkerHub and the navigator invariants.
 
 - Added 2026-10-08: when the overview shape is re-decided (the start of `_refresh_impl`), `_gen` is always bumped on every path, which clears the
   navigator's "drawing" mark. Previously the bump did not happen on the in-memory column path, so a decimation read from the previous file kept the mark
@@ -1082,7 +1084,7 @@ Navigator (the picture is identified with `navigator`'s curve, e.g. the Y maximu
 9. After loading a view (two plots, three series each), the navigator picture = the anchor's first series, and the range = the linked group's range
    (the same check as the tests of 24.9).
 
-Scale: medium (Sonnet, `implementer`). It touches the navigator invariants (24.9), so before merging into `main`, this session confirms by running headless and with the full test suite.
+Scale: medium. It touches the navigator invariants (24.9), so before merging into `main`, the developer confirms by running headless and with the full test suite.
 
 ## Relations to other domains
 

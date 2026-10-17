@@ -622,7 +622,7 @@ With grouping:
   is `ceil(day length / length)`, so the last group is at most the length; if it is shorter, it has gaps. Using `round` would make the last
   group of a 25-hour day longer and give a false "no gap" outlier; found in review. It is as specified that after the time changes, groups
   start at odd local hours). Whole numbers of days are counted in local calendar days. The conversion to local time is the same as the
-  screen's time axis (`datetime.fromtimestamp`, the same approach as `image_export._local_offset_s`). Upper limit on the number of groups
+  screen's time axis (`datetime.fromtimestamp`, the same approach as `histogram_export.local_offset_s`). Upper limit on the number of groups
   `HIST_MAX_BUCKETS` (1,000,000; above it, nothing is computed and "too many groups" is reported).
 - For each chunk, the group number of each row is found with `np.searchsorted(edges, x)` (since the time axis is ascending, so are the
   numbers), and per group the following are added: count, sum of values, integral (`∫y dt`), effective time (`∫dt`), max and min
@@ -697,7 +697,7 @@ with gaps); common (number of gaps, number of groups in range, a summary of the 
 - **Data**: windowed reads (`Column.window`), the ordering of the time axis (ch. 29), `WorkerHub` (ch. 37), and the same approach as `chunked_stats`
   (36.8).
 - **Plots**: the "Graphs ▾" menu (25.5), notification of the displayed range (`rangeChanged`).
-- **Image export**: the save process of `image_export`, the notes, CJK fonts, and the handling of local time (`_local_offset_s`).
+- **Image export**: the save process of `image_export`, the notes, CJK fonts, and the handling of local time (`histogram_export.local_offset_s`).
 - **Expressions**: derived variables can be targets (derived variables computed per window are read with `window` as they are).
 - **App foundation**: the feature flag `histogram` (ch. 21), shortcut settings, the operation log (ch. 30), i18n.
 - **Saving and export** (42.8): the Parquet of values per group is written with `pyarrow` (the same library as data reading).
@@ -771,7 +771,7 @@ feature flag stays `histogram` (no new flag; merged after the real-machine check
   2026-10-07: with Qt's dialog on Windows the extension was not rewritten, so choosing CSV still wrote Parquet).
 - Operation log: `histogram_export_windows` (path, format, number of rows, columns).
 
-**Decided during implementation** (2026-10-06, by the implementer; adopted after review on 2026-10-07):
+**Decided during implementation** (2026-10-06; adopted after review on 2026-10-07):
 - The denominator for second-stage gaps is "group length / first-stage window length" (the nominal number of windows). Using the number of windows
   actually falling in the group would make the short last group of a daylight-saving day (e.g. the last 1 hour of a 25-hour day) "without gaps", which would
   disagree with the one-stage case (42.3). At the ends of the range and at gaps, the nominal and actual counts are the same (first-stage windows always tile
@@ -813,7 +813,7 @@ feature flag stays `histogram` (no new flag; merged after the real-machine check
   - With the actual `HistogramWindow`: two-stage settings → recompute → "Save group values" (`QFileDialog` monkeypatched) → the file is created, and the
     operation log keeps `histogram_export_windows`. Without grouping the button is disabled.
   - When the dialog returns `("x.parquet", CSV type)`, a CSV (`x.csv`) is written; and the reverse (`x.csv` with Parquet type) likewise.
-- Visual check of the power sample (`generate_power_sample_parquet.py`) is done in the main session's final check (the daily marker values must appear).
+- Visual check of the power sample (`generate_power_sample_parquet.py`) is done in the final check (the daily marker values must appear).
 
 #### 42.9 Fixes found in review (2026-10-07, agreed by the user)
 
@@ -1040,6 +1040,33 @@ as in 42.8).
 - Tests (added to 42.14): "narrowing to all day and all weekdays = no narrowing" is compared on all result items (values, gaps, group count, times, counts, excluded, gaps in the
   time axis) (origin 6:00, 7 days, two stages over 7 days, range ends in the middle of a group); a random check (`hypothesis`) gives the same agreement, and with narrowing ON the
   result does not depend on the chunk size.
+
+#### 42.16 Aligning the histogram's mouse operations with the normal plots (added 2026-10-16, user request)
+
+Requirement: the feedback, "carry over the same feel as the normal plot, e.g. zoom". Facts (checked in the code on 2026-10-16): the normal plot
+(`TimePlotWidget.wheelEvent`, plots ch. 4) lets the **settings** (`Settings.scroll_bindings`) assign X-axis zoom / Y-axis zoom / pan to each modifier key (none, Ctrl,
+Shift). The histogram's three plots do not use this; they use either pyqtgraph's default wheel (zoom on both axes) or have the wheel disabled (time of day).
+
+- **Target**: the histogram's three plots: the main one, the trend and the time-of-day (`ui/histogram_window.py`). The XY map display is out of scope this time (but build it so that
+  the same part can be used).
+- **Wheel**: use the same `scroll_bindings` as the normal plots. "X axis" is that plot's horizontal axis (the main plot: the value; the trend: time; the time-of-day: the time of day),
+  "Y axis" is the vertical axis (count, etc.). Changing the settings is reflected in the open histograms too (`set_scroll_bindings`, the same path as the normal plots). The macOS traps
+  (the physical Ctrl is `MetaModifier`; Shift + vertical scroll arrives as a horizontal wheel) are handled the same way. The pan step is 15% of the visible width x notches
+  (`_PAN_STEP_FRACTION`).
+- **Drag**: left-drag pans etc.; pyqtgraph's default stays as it is, the same as the normal plots (no change).
+- **Reset**: the H key / double-click returns that plot to its initial view (the range that fits everything; 42.4, 42.12, 42.13).
+- **Trend**: the vertical axis still fits the displayed values (42.12). An operation whose wheel binding is Y-axis zoom changes the vertical range by hand, so automatic vertical fitting
+  stops while it is in effect, and H brings it back. (The same as Y-axis zoom of the normal plot becoming a manual vertical range.)
+- **Time of day**: until now neither horizontal nor vertical could be operated (42.13). The same operations as the normal plots are added, but the horizontal axis cannot go outside
+  0-24 hours (the range is limited).
+- **Shared part**: move the wheel handling of `TimePlotWidget.wheelEvent` (decision of modifier -> action, the zoom centre, pan) into a small function in `ui/` (e.g.
+  `scroll_zoom.apply_wheel(vb, ev, bindings)`), and call it from both `TimePlotWidget` and the histogram's three plots (a small subclass of `pg.PlotWidget`). Do not make a copy. The
+  change that only splits it out (no behavior change) goes first in a separate commit.
+- **Test plan**: shared part - the three modifier keys and the bindings (all combinations) / MetaModifier / horizontal wheel / zoom centre / pan amount. The existing wheel tests of
+  `TimePlotWidget` pass unchanged. Screen (through Qt's real route: `QTest` wheel events to the viewport) - in the three histograms, the default bindings give horizontal zoom, vertical
+  zoom and pan / a settings change is reflected in open windows / the time-of-day plot cannot go outside 0-24 hours / H returns to the initial range / in the trend, automatic vertical
+  fitting stops after Y-axis zoom.
+- **Relations to other domains**: add one line to plots (the wheel table in plots ch. 4) and the settings screen (`scroll_bindings`) saying the histogram follows them too.
 
 ### 44. Making a map from measurements (map display and export in XY) (added 2026-10-06, user request)
 
@@ -1296,7 +1323,7 @@ Two items remained after the merge of the fixes of 44.10.
 - Tests: (1) a map with X constant and Z = sine shown in 3D → the surface colour range, colour bar and Z range on screen are finite and match the image export's `get_zlim()` and colour bar range (the result of `min_width_range`); (2) the existing tests where the overlay widens Z pass;
   (3) export with "both", with `os.replace` made to fail (monkeypatched) → the map is not registered (with overwrite, the original map remains and the files in `maps/` are as they were), the original CSV content is unchanged, and the temporary file
   is not left behind, and a warning appears; (4) "Save as CSV only" with `os.replace` failing → the warning as before, and no temporary file. (1) and (3) must fail before the fix.
-- Size: small to medium (Sonnet; the main session checks the review).
+- Size: small to medium (checked in review).
 
 #### 44.12 Tidying `xy_plot_window.py`
 
@@ -1338,7 +1365,7 @@ Current structure (lines as of `main` on 2026-10-08): calculation of scatter and
 - Structure check: `xy_plot_window.py` no longer contains the overlay state attributes such as `_overlay_names` (a simple test that reads the source).
 - Exercise it: open the XY window without a screen, go through scatter, map (2D/3D), curve, overlays (contour and curve), hide in the legend, the contour values and the export dialog; render the 2D screen and image export before and after the tidy-up and compare the images (they must be the same).
 
-Size: medium (Sonnet and reviewer). Start after 20 is merged (it does not touch the same files as 20, but the limit of two parallel tasks applies).
+Size: medium. Start after 20 is merged (it does not touch the same files as 20, but the limit of two parallel tasks applies).
 
 **Result of the implementation (2026-10-08, confirmed in review)**
 
@@ -1401,7 +1428,7 @@ Requirement: 5.39. Mainly touches `ui/xy_map_view.py` (`XYMapViewMixin`, 44.12),
 - Image export: × for excluded points and "excluded points n" in the notes (check by drawing the image).
 - Visual check: add a few outliers to `feature_test.parquet` or to generated data, and check the 2D map before and after excluding them, and the 3D surface, in images.
 
-**(7) Changes decided in review (2026-10-08, reviewer)**
+**(7) Changes decided in review (2026-10-08)**
 
 - **Display range**: on recomputation caused by excluding or restoring (clicks, rectangle, clicking ×), **the current display range is kept** (so that further exclusion is possible, and a × just excluded remains visible on screen to be restored). The generation of that recomputation carries a "keep range" mark; if a recomputation caused by a settings change arrives later, it follows the grid as now. "Restore all", changes of settings, and "Auto" still fit the grid. It is not fitted to the range containing the grid and all × marks (one distant outlier would leave the display zoomed out, weakening the point of excluding). Image export keeps the grid range (× marks outside the grid are not drawn; the count of excluded points is kept in the notes as "excluded points n").
 - **Rectangle when the variables change**: when the X, Y or Z selection changes, the rectangle job in progress is made stale (the generation is raised) even if no rows were excluded. The job records the set of variables it was issued for, and when its result arrives and the current set differs, it is discarded. While the displayed result's variables differ from the combo selections (waiting for recomputation), clicks and rectangles are not accepted.

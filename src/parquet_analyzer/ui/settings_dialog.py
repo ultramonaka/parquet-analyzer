@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QKeySequenceEdit,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -22,6 +23,7 @@ from .. import config, features
 from ..core.oplog import log_op
 from ..io.settings import (
     DEFAULT_SHORTCUTS,
+    EXPORT_PARALLEL_FILES_RANGE,
     LANGUAGES,
     SCROLL_ACTIONS,
     SCROLL_MODIFIERS,
@@ -44,6 +46,9 @@ class SettingsDialog(QDialog):
         self.auto_redraw_check = QCheckBox(tr("settings.auto_redraw_checkbox"))
         self.auto_redraw_check.setChecked(settings.auto_redraw)
 
+        self.show_sampling_rate_check = QCheckBox(tr("settings.show_sampling_rate"))
+        self.show_sampling_rate_check.setChecked(settings.show_sampling_rate)
+
         self.downsample_spin = QSpinBox()
         self.downsample_spin.setRange(1, 20)
         self.downsample_spin.setValue(settings.downsample_pixel_ratio)
@@ -60,6 +65,14 @@ class SettingsDialog(QDialog):
         self.log_retention_spin.setValue(normalize_log_retention_days(settings.log_retention_days))
         self.log_retention_spin.setToolTip(tr("settings.log_retention_tooltip"))
 
+        self.export_parallel_spin = QSpinBox()  # export 57.9.2 (shown while the Parquet export is on)
+        self.export_parallel_spin.setObjectName("export_parallel_spin")
+        self.export_parallel_spin.setRange(*EXPORT_PARALLEL_FILES_RANGE)
+        self.export_parallel_spin.setValue(
+            max(EXPORT_PARALLEL_FILES_RANGE[0], min(EXPORT_PARALLEL_FILES_RANGE[1], settings.export_parallel_files))
+        )
+        self.export_parallel_spin.setToolTip(tr("settings.export_parallel_tooltip"))
+
         self.language_combo = QComboBox()
         for language in LANGUAGES:
             self.language_combo.addItem(LANGUAGE_LABELS[language], language)
@@ -68,9 +81,12 @@ class SettingsDialog(QDialog):
 
         general_form = QFormLayout()
         general_form.addRow(self.auto_redraw_check)
+        general_form.addRow(self.show_sampling_rate_check)
         general_form.addRow(tr("settings.downsample_density_label"), self.downsample_spin)
         general_form.addRow(tr("settings.eager_load_limit_label"), self.eager_load_limit_spin)
         general_form.addRow(tr("settings.log_retention"), self.log_retention_spin)
+        if features.is_enabled("parquet_export"):
+            general_form.addRow(tr("settings.export_parallel_label"), self.export_parallel_spin)
         general_form.addRow(tr("settings.language_label"), self.language_combo)
 
         # scroll_bindings is a modifier -> action permutation ({"none", "ctrl",
@@ -113,7 +129,10 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-        layout = QVBoxLayout(self)
+        # The sections go in a scroll area so the dialog never outgrows the screen and the
+        # OK / Cancel buttons stay reachable.
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.addWidget(QLabel(tr("settings.section_general")))
         layout.addLayout(general_form)
         layout.addWidget(QLabel(tr("settings.section_scroll")))
@@ -125,7 +144,20 @@ class SettingsDialog(QDialog):
         self.open_log_folder_button.setToolTip(tr("settings.open_log_folder_tooltip"))
         self.open_log_folder_button.clicked.connect(open_log_folder)
         layout.addWidget(self.open_log_folder_button)
-        layout.addWidget(buttons)
+
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._scroll_area.setWidget(content)
+        outer = QVBoxLayout(self)
+        outer.addWidget(self._scroll_area, 1)
+        outer.addWidget(buttons)
+        # Fit the content when it fits the screen, otherwise cap the height (leave room for
+        # the title bar / dock) and let the scroll area take the rest.
+        screen = self.screen()
+        max_h = int(screen.availableGeometry().height() * 0.85) if screen else 700
+        want = content.sizeHint().height() + buttons.sizeHint().height() + 40
+        self.resize(max(self.sizeHint().width() + 24, 420), min(want, max_h))
 
     def _on_scroll_binding_changed(self, modifier: str) -> None:
         new_action = self._scroll_combos[modifier].currentData()
@@ -149,9 +181,11 @@ class SettingsDialog(QDialog):
         return replace(
             self._settings,
             auto_redraw=self.auto_redraw_check.isChecked(),
+            show_sampling_rate=self.show_sampling_rate_check.isChecked(),
             downsample_pixel_ratio=self.downsample_spin.value(),
             eager_load_limit_mb=self.eager_load_limit_spin.value(),
             log_retention_days=self.log_retention_spin.value(),
+            export_parallel_files=self.export_parallel_spin.value(),
             scroll_bindings=dict(self._scroll_bindings),
             shortcuts=shortcuts,
             language=self.language_combo.currentData(),

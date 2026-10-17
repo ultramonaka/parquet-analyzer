@@ -329,6 +329,10 @@ class PlotGridWidget(QWidget):
         # same class of bug fixed for WorkerHub — see data ch.37).
         # Deleting only once every job has actually finished sidesteps it entirely.
         # (Applies to the whole pane, which owns the plot.)
+        # retire() first: the removed plot must not start a job after this check (its range
+        # still moves, which would schedule a redraw) -- otherwise a job submitted after
+        # deleteLater() is delivered to a deleted plot and the busy count never drops.
+        plot.retire()
         if plot.pending_downsample_count() == 0:
             pane.deleteLater()
         else:
